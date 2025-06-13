@@ -122,11 +122,12 @@ func (ws *WebSocketService) SubscribeToRoom(clientID, roomName, event string) er
 		ws.stats.TotalRooms++
 		ws.stats.mutex.Unlock()
 	}
-	
-	// 检查房间是否已满
-	if len(room.Clients) >= ws.maxRoomUsers && !room.Clients[clientID] {
-		ws.roomsMutex.Unlock()
-		return fmt.Errorf("房间已满，最多支持%d个用户", ws.maxRoomUsers)
+		// 检查房间是否已满
+	if len(room.Clients) >= ws.maxRoomUsers {
+		if _, exists := room.Clients[clientID]; !exists {
+			ws.roomsMutex.Unlock()
+			return fmt.Errorf("房间已满，最多支持%d个用户", ws.maxRoomUsers)
+		}
 	}
 	
 	// 添加客户端到房间

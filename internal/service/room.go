@@ -12,7 +12,8 @@ type RoomService struct {
 
 func NewRoomService() *RoomService {
 	// 与前端完全一致的正则表达式：[\u4e00-\u9fa5a-zA-Z0-9 _-]+
-	pattern := regexp.MustCompile(`^[\u4e00-\u9fa5a-zA-Z0-9 _-]+$`)
+	// 在Go中需要使用\p{Han}表示中文字符，或者直接使用Unicode范围
+	pattern := regexp.MustCompile(`^[\p{Han}a-zA-Z0-9 _-]+$`)
 	return &RoomService{
 		namePattern: pattern,
 	}
