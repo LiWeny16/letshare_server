@@ -1,5 +1,12 @@
 server:
-  port: "8080"
+  port: "443"
+
+tls:
+  enabled: true
+  cert_file: "/etc/letsencrypt/live/ecs.letshare.fun/fullchain.pem"
+  key_file: "/etc/letsencrypt/live/ecs.letshare.fun/privkey.pem"
+  auto_cert: true
+  domain: "ecs.letshare.fun"
 
 jwt:
   secret: "letshare-jwt-secret-key-2024-production"
@@ -10,10 +17,11 @@ cors:
     - "https://letshare.fun"
     - "https://www.letshare.fun"
     - "https://cdn.letshare.fun"
+    - "https://ecs.letshare.fun"
 
 log:
   level: "info"
   max_entries: 200
 
 websocket:
-  max_room_users: 50 
+  max_room_users: 50

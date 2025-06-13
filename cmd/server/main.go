@@ -56,14 +56,32 @@ func main() {
 	r.GET("/health", healthHandler.Health)
 	r.GET("/metrics", healthHandler.Metrics)
 	r.GET("/ws", wsHandler.HandleWebSocket)
-	
-	// 启动服务器
+		// 启动服务器
 	logrus.WithField("port", cfg.Server.Port).Info("启动WebSocket服务器")
 	
 	// 优雅关闭
 	go func() {
-		if err := r.Run(":" + cfg.Server.Port); err != nil {
-			logrus.WithError(err).Fatal("服务器启动失败")
+		if cfg.TLS.Enabled {
+			// 检查证书文件是否存在
+			if _, err := os.Stat(cfg.TLS.CertFile); err == nil {
+				logrus.WithFields(logrus.Fields{
+					"port":   cfg.Server.Port,
+					"domain": cfg.TLS.Domain,
+				}).Info("启动 HTTPS/WSS 服务器")
+				if err := r.RunTLS(":"+cfg.Server.Port, cfg.TLS.CertFile, cfg.TLS.KeyFile); err != nil {
+					logrus.WithError(err).Fatal("HTTPS 服务器启动失败")
+				}
+			} else {
+				logrus.WithError(err).Warn("SSL证书文件不存在，降级为HTTP模式")
+				if err := r.Run(":" + cfg.Server.Port); err != nil {
+					logrus.WithError(err).Fatal("服务器启动失败")
+				}
+			}
+		} else {
+			logrus.Info("启动 HTTP/WS 服务器")
+			if err := r.Run(":" + cfg.Server.Port); err != nil {
+				logrus.WithError(err).Fatal("服务器启动失败")
+			}
 		}
 	}()
 	

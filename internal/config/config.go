@@ -9,16 +9,25 @@ import (
 )
 
 type Config struct {
-	Mode   string `mapstructure:"mode"`
-	Server Server `mapstructure:"server"`
-	JWT    JWT    `mapstructure:"jwt"`
-	CORS   CORS   `mapstructure:"cors"`
-	Log    Log    `mapstructure:"log"`
+	Mode      string    `mapstructure:"mode"`
+	Server    Server    `mapstructure:"server"`
+	TLS       TLS       `mapstructure:"tls"`
+	JWT       JWT       `mapstructure:"jwt"`
+	CORS      CORS      `mapstructure:"cors"`
+	Log       Log       `mapstructure:"log"`
 	WebSocket WebSocket `mapstructure:"websocket"`
 }
 
 type Server struct {
 	Port string `mapstructure:"port"`
+}
+
+type TLS struct {
+	Enabled  bool   `mapstructure:"enabled"`
+	CertFile string `mapstructure:"cert_file"`
+	KeyFile  string `mapstructure:"key_file"`
+	AutoCert bool   `mapstructure:"auto_cert"`
+	Domain   string `mapstructure:"domain"`
 }
 
 type JWT struct {
@@ -73,6 +82,11 @@ func Load() *Config {
 
 func setDefaults() {
 	viper.SetDefault("server.port", "8080")
+	viper.SetDefault("tls.enabled", false)
+	viper.SetDefault("tls.cert_file", "/etc/letsencrypt/live/ecs.letshare.fun/fullchain.pem")
+	viper.SetDefault("tls.key_file", "/etc/letsencrypt/live/ecs.letshare.fun/privkey.pem")
+	viper.SetDefault("tls.auto_cert", true)
+	viper.SetDefault("tls.domain", "ecs.letshare.fun")
 	viper.SetDefault("jwt.secret", "letshare-jwt-secret-key-2024")
 	viper.SetDefault("jwt.expiration_hours", 720) // 30天
 	viper.SetDefault("cors.allowed_origins", []string{
@@ -85,4 +99,4 @@ func setDefaults() {
 	viper.SetDefault("log.level", "info")
 	viper.SetDefault("log.max_entries", 200)
 	viper.SetDefault("websocket.max_room_users", 50)
-} 
+}
