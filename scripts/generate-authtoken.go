@@ -5,10 +5,20 @@ import (
 	"letshare-server/internal/service"
 	"log"
 	"os"
+	
+	"github.com/joho/godotenv"
 )
 
 func main() {
 	fmt.Println("=== LetShare AuthToken 生成器 ===")
+	
+	// 加载.env文件
+	if err := godotenv.Load(); err != nil {
+		fmt.Printf("警告: 无法加载.env文件: %v\n", err)
+		fmt.Println("将使用系统环境变量或默认值")
+	} else {
+		fmt.Println("✅ 成功加载.env文件")
+	}
 	
 	// 检查环境变量
 	secretKey := os.Getenv("SERVER_AUTH_SECRET")
