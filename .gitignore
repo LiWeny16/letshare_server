@@ -1,0 +1,55 @@
+# Go 相关
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+
+# 构建目录
+/bin/
+/dist/
+
+# 日志文件
+/logs/
+*.log
+
+# 配置文件（敏感信息）
+.env
+.env.local
+.env.production
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Docker
+.dockerignore
+
+# 临时文件
+*.tmp
+*.temp
+
+# 证书文件
+*.pem
+*.key
+*.crt
+*.csr
+
+# 备份文件
+*.bak
+*.backup 

@@ -1,0 +1,19 @@
+server:
+  port: "8080"
+
+jwt:
+  secret: "letshare-jwt-secret-key-2024-production"
+  expiration_hours: 720 # 30天
+
+cors:
+  allowed_origins:
+    - "https://letshare.fun"
+    - "https://www.letshare.fun"
+    - "https://cdn.letshare.fun"
+
+log:
+  level: "info"
+  max_entries: 200
+
+websocket:
+  max_room_users: 50 
