@@ -12,7 +12,6 @@ type Config struct {
 	Mode      string    `mapstructure:"mode"`
 	Server    Server    `mapstructure:"server"`
 	TLS       TLS       `mapstructure:"tls"`
-	JWT       JWT       `mapstructure:"jwt"`
 	CORS      CORS      `mapstructure:"cors"`
 	Log       Log       `mapstructure:"log"`
 	WebSocket WebSocket `mapstructure:"websocket"`
@@ -28,11 +27,6 @@ type TLS struct {
 	KeyFile  string `mapstructure:"key_file"`
 	AutoCert bool   `mapstructure:"auto_cert"`
 	Domain   string `mapstructure:"domain"`
-}
-
-type JWT struct {
-	Secret          string `mapstructure:"secret"`
-	ExpirationHours int    `mapstructure:"expiration_hours"`
 }
 
 type CORS struct {
@@ -87,8 +81,6 @@ func setDefaults() {
 	viper.SetDefault("tls.key_file", "/etc/letsencrypt/live/ecs.letshare.fun/privkey.pem")
 	viper.SetDefault("tls.auto_cert", true)
 	viper.SetDefault("tls.domain", "ecs.letshare.fun")
-	viper.SetDefault("jwt.secret", "letshare-jwt-secret-key-2024")
-	viper.SetDefault("jwt.expiration_hours", 720) // 30天
 	viper.SetDefault("cors.allowed_origins", []string{
 		"https://letshare.fun",
 		"https://www.letshare.fun",

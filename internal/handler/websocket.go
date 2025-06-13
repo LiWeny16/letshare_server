@@ -23,14 +23,14 @@ var upgrader = websocket.Upgrader{
 }
 
 type WebSocketHandler struct {
-	wsService  *service.WebSocketService
-	jwtService *service.JWTService
+	wsService   *service.WebSocketService
+	authService *service.AuthService
 }
 
-func NewWebSocketHandler(wsService *service.WebSocketService, jwtService *service.JWTService) *WebSocketHandler {
+func NewWebSocketHandler(wsService *service.WebSocketService, authService *service.AuthService) *WebSocketHandler {
 	return &WebSocketHandler{
-		wsService:  wsService,
-		jwtService: jwtService,
+		wsService:   wsService,
+		authService: authService,
 	}
 }
 
@@ -43,10 +43,9 @@ func (h *WebSocketHandler) HandleWebSocket(c *gin.Context) {
 		return
 	}
 	
-	// 验证JWT token
-	claims, err := h.jwtService.ValidateToken(token)
-	if err != nil {
-		logrus.WithError(err).Error("JWT验证失败")
+	// 验证AuthToken
+	if err := h.authService.ValidateAuthToken(token); err != nil {
+		logrus.WithError(err).Error("AuthToken验证失败")
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "token验证失败: " + err.Error()})
 		return
 	}
@@ -61,9 +60,9 @@ func (h *WebSocketHandler) HandleWebSocket(c *gin.Context) {
 	
 	// 创建客户端
 	clientID := uuid.New().String()
-	client := model.NewClient(clientID, claims.UserID, conn)
-	client.Metadata["user_type"] = claims.UserType
-	client.Metadata["room_id"] = claims.RoomID
+	// 由于不再需要JWT的用户信息，使用客户端ID作为用户ID
+	client := model.NewClient(clientID, clientID, conn)
+	client.Metadata["authenticated"] = true
 	
 	// 添加到服务
 	h.wsService.AddClient(client)

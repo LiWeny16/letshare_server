@@ -50,15 +50,6 @@ type Room struct {
 	UpdatedAt time.Time          `json:"updated_at"`
 }
 
-// JWTClaims JWT载荷
-type JWTClaims struct {
-	UserID   string `json:"user_id"`
-	UserType string `json:"user_type,omitempty"`
-	RoomID   string `json:"room_id,omitempty"`
-	IssuedAt int64  `json:"iat"`
-	ExpiresAt int64 `json:"exp"`
-}
-
 // NewWebSocketMessage 创建新的WebSocket消息
 func NewWebSocketMessage(msgType, channel, event string, data interface{}) *WebSocketMessage {
 	msg := &WebSocketMessage{

@@ -29,7 +29,7 @@ func main() {
 	
 	// 创建服务
 	wsService := service.NewWebSocketService(cfg.WebSocket.MaxRoomUsers)
-	jwtService := service.NewJWTService(cfg.JWT.Secret, cfg.JWT.ExpirationHours)
+	authService := service.NewAuthService()
 	
 	// 创建路由
 	r := gin.New()
@@ -49,7 +49,7 @@ func main() {
 	r.Use(cors.New(corsConfig))
 	
 	// 创建处理器
-	wsHandler := handler.NewWebSocketHandler(wsService, jwtService)
+	wsHandler := handler.NewWebSocketHandler(wsService, authService)
 	healthHandler := handler.NewHealthHandler(wsService)
 	
 	// 路由
