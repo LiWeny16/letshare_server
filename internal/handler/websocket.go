@@ -36,8 +36,10 @@ func NewWebSocketHandler(wsService *service.WebSocketService, authService *servi
 
 // HandleWebSocket 处理WebSocket连接
 func (h *WebSocketHandler) HandleWebSocket(c *gin.Context) {
-	// 从查询参数获取token
+	// 从查询参数获取token和用户ID
 	token := c.Query("token")
+	userIdParam := c.Query("userId") // 新增：从查询参数获取用户ID
+	
 	if token == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "缺少认证token"})
 		return
@@ -60,13 +62,23 @@ func (h *WebSocketHandler) HandleWebSocket(c *gin.Context) {
 	
 	// 创建客户端
 	clientID := uuid.New().String()
-	// 由于不再需要JWT的用户信息，使用客户端ID作为用户ID
-	client := model.NewClient(clientID, clientID, conn)
+	// 使用传递的用户ID，如果没有则使用clientID
+	userID := userIdParam
+	if userID == "" {
+		userID = clientID // 回退到clientID
+	}
+	
+	client := model.NewClient(clientID, userID, conn)
 	client.Metadata["authenticated"] = true
 	
 	// 添加到服务
 	h.wsService.AddClient(client)
 	defer h.wsService.RemoveClient(clientID)
+	
+	logrus.WithFields(logrus.Fields{
+		"client_id": clientID,
+		"user_id":   userID,
+	}).Info("WebSocket客户端已连接")
 	
 	// 设置连接参数
 	conn.SetReadLimit(512 * 1024) // 512KB
@@ -143,16 +155,25 @@ func (h *WebSocketHandler) handleSubscribe(client *model.Client, message *model.
 		return
 	}
 	
-	// 默认事件为signal:all，也支持特定事件如signal:user-id
+	// 如果没有指定事件，则只订阅房间
 	event := message.Event
-	if event == "" {
-		event = "signal:all"
-	}
 	
 	if err := h.wsService.SubscribeToRoom(client.ID, message.Channel, event); err != nil {
 		h.sendError(client, 400, err.Error())
 		return
 	}
+	
+	// 发送订阅确认
+	h.sendMessage(client, model.NewWebSocketMessage(
+		"subscribed",
+		message.Channel,
+		event,
+		map[string]interface{}{
+			"status": "subscribed",
+			"room":   message.Channel,
+			"event":  event,
+		},
+	))
 }
 
 // handleUnsubscribe 处理取消订阅消息

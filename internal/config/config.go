@@ -46,7 +46,7 @@ func Load() *Config {
 	// 确定运行模式
 	mode := os.Getenv("MODE")
 	if mode == "" {
-		mode = "local" // 默认本地调试模式
+		mode = "production" // 默认生产模式
 	}
 
 	viper.SetConfigName(mode)

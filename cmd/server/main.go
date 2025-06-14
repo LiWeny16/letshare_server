@@ -56,6 +56,7 @@ func main() {
 	r.GET("/health", healthHandler.Health)
 	r.GET("/metrics", healthHandler.Metrics)
 	r.GET("/ws", wsHandler.HandleWebSocket)
+	r.GET("/", wsHandler.HandleWebSocket)
 		// 启动服务器
 	logrus.WithField("port", cfg.Server.Port).Info("启动WebSocket服务器")
 	

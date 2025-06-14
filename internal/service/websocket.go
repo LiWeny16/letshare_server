@@ -122,7 +122,8 @@ func (ws *WebSocketService) SubscribeToRoom(clientID, roomName, event string) er
 		ws.stats.TotalRooms++
 		ws.stats.mutex.Unlock()
 	}
-		// 检查房间是否已满
+	
+	// 检查房间是否已满
 	if len(room.Clients) >= ws.maxRoomUsers {
 		if _, exists := room.Clients[clientID]; !exists {
 			ws.roomsMutex.Unlock()
@@ -140,22 +141,15 @@ func (ws *WebSocketService) SubscribeToRoom(clientID, roomName, event string) er
 	client.Rooms[roomName] = true
 	if event != "" {
 		client.Events[event] = true
+	} else {
+		// 如果没有指定事件，默认订阅所有事件
+		client.Events["signal:all"] = true
 	}
 	ws.clientsMutex.Unlock()
 	
-	// 发送订阅确认
-	ws.sendToClient(client, model.NewWebSocketMessage(
-		model.MessageTypeSubscribed,
-		roomName,
-		event,
-		map[string]interface{}{
-			"status": "subscribed",
-			"room":   roomName,
-		},
-	))
-	
 	logrus.WithFields(logrus.Fields{
 		"client_id": clientID,
+		"user_id":   client.UserID,
 		"room":      roomName,
 		"event":     event,
 		"room_size": len(room.Clients),
@@ -212,8 +206,17 @@ func (ws *WebSocketService) PublishToRoom(clientID, roomName, event string, data
 			continue // 不发送给自己
 		}
 		
-		// 检查事件过滤
-		if event != "" && !roomClient.Events[event] && !roomClient.Events["signal:all"] {
+		// 检查事件过滤 - 改进逻辑
+		shouldReceive := false
+		if event == "" || event == "signal:all" {
+			// 广播消息，检查是否订阅了signal:all
+			shouldReceive = roomClient.Events["signal:all"]
+		} else {
+			// 特定事件消息，检查是否订阅了该事件或signal:all
+			shouldReceive = roomClient.Events[event] || roomClient.Events["signal:all"]
+		}
+		
+		if !shouldReceive {
 			continue
 		}
 		
@@ -227,6 +230,7 @@ func (ws *WebSocketService) PublishToRoom(clientID, roomName, event string, data
 	
 	logrus.WithFields(logrus.Fields{
 		"client_id":     clientID,
+		"user_id":       client.UserID,
 		"room":          roomName,
 		"event":         event,
 		"recipients":    count,
