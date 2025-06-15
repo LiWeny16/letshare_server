@@ -33,21 +33,21 @@ type ErrorInfo struct {
 
 // Client 表示WebSocket客户端
 type Client struct {
-	ID          string                 `json:"id"`
-	UserID      string                 `json:"user_id"`
-	Connection  interface{}            `json:"-"` // WebSocket连接
-	Rooms       map[string]bool        `json:"rooms"`
-	Events      map[string]bool        `json:"events"` // 订阅的事件
-	LastPing    time.Time             `json:"last_ping"`
-	Metadata    map[string]interface{} `json:"metadata"`
+	ID         string                 `json:"id"`
+	UserID     string                 `json:"user_id"`
+	Connection interface{}            `json:"-"` // WebSocket连接
+	Rooms      map[string]bool        `json:"rooms"`
+	Events     map[string]bool        `json:"events"` // 订阅的事件
+	LastPing   time.Time              `json:"last_ping"`
+	Metadata   map[string]interface{} `json:"metadata"`
 }
 
 // Room 表示房间
 type Room struct {
-	Name      string             `json:"name"`
-	Clients   map[string]*Client `json:"clients"`
-	CreatedAt time.Time          `json:"created_at"`
-	UpdatedAt time.Time          `json:"updated_at"`
+	Name      string          `json:"name"`
+	ClientIDs map[string]bool `json:"client_ids"` // 存储客户端ID而不是指针，避免循环引用
+	CreatedAt time.Time       `json:"created_at"`
+	UpdatedAt time.Time       `json:"updated_at"`
 }
 
 // NewWebSocketMessage 创建新的WebSocket消息
@@ -58,13 +58,13 @@ func NewWebSocketMessage(msgType, channel, event string, data interface{}) *WebS
 		Event:     event,
 		Timestamp: time.Now().UnixMilli(),
 	}
-	
+
 	if data != nil {
 		if dataBytes, err := json.Marshal(data); err == nil {
 			msg.Data = dataBytes
 		}
 	}
-	
+
 	return msg
 }
 
@@ -97,8 +97,8 @@ func NewClient(id, userID string, conn interface{}) *Client {
 func NewRoom(name string) *Room {
 	return &Room{
 		Name:      name,
-		Clients:   make(map[string]*Client),
+		ClientIDs: make(map[string]bool), // 改为存储客户端ID
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}
-} 
+}

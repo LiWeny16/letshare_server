@@ -39,27 +39,26 @@ func (h *WebSocketHandler) HandleWebSocket(c *gin.Context) {
 	// 从查询参数获取token和用户ID
 	token := c.Query("token")
 	userIdParam := c.Query("userId") // 新增：从查询参数获取用户ID
-	
+
 	if token == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "缺少认证token"})
 		return
 	}
-	
+
 	// 验证AuthToken
 	if err := h.authService.ValidateAuthToken(token); err != nil {
 		logrus.WithError(err).Error("AuthToken验证失败")
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "token验证失败: " + err.Error()})
 		return
 	}
-	
+
 	// 升级为WebSocket连接
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		logrus.WithError(err).Error("WebSocket升级失败")
 		return
 	}
-	defer conn.Close()
-	
+
 	// 创建客户端
 	clientID := uuid.New().String()
 	// 使用传递的用户ID，如果没有则使用clientID
@@ -67,19 +66,39 @@ func (h *WebSocketHandler) HandleWebSocket(c *gin.Context) {
 	if userID == "" {
 		userID = clientID // 回退到clientID
 	}
-	
+
 	client := model.NewClient(clientID, userID, conn)
 	client.Metadata["authenticated"] = true
-	
+
 	// 添加到服务
 	h.wsService.AddClient(client)
-	defer h.wsService.RemoveClient(clientID)
-	
+
 	logrus.WithFields(logrus.Fields{
 		"client_id": clientID,
 		"user_id":   userID,
 	}).Info("WebSocket客户端已连接")
-	
+
+	// 使用defer确保资源清理，即使发生panic也能执行
+	defer func() {
+		// 恢复panic，防止整个服务崩溃
+		if r := recover(); r != nil {
+			logrus.WithFields(logrus.Fields{
+				"client_id": clientID,
+				"panic":     r,
+			}).Error("WebSocket处理发生panic")
+		}
+
+		// 确保连接被关闭
+		if conn != nil {
+			conn.Close()
+		}
+
+		// 从服务中移除客户端（这会清理所有相关资源）
+		h.wsService.RemoveClient(clientID)
+
+		logrus.WithField("client_id", clientID).Info("WebSocket连接已清理")
+	}()
+
 	// 设置连接参数
 	conn.SetReadLimit(512 * 1024) // 512KB
 	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
@@ -88,17 +107,32 @@ func (h *WebSocketHandler) HandleWebSocket(c *gin.Context) {
 		client.LastPing = time.Now()
 		return nil
 	})
-	
+
 	// 启动ping定时器
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-	
-	// 处理消息
-	go h.handleMessages(client, conn)
-	
+
+	// 启动消息处理goroutine
+	done := make(chan struct{})
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logrus.WithFields(logrus.Fields{
+					"client_id": clientID,
+					"panic":     r,
+				}).Error("消息处理goroutine发生panic")
+			}
+			close(done)
+		}()
+		h.handleMessages(client, conn)
+	}()
+
 	// 保持连接和定期ping
 	for {
 		select {
+		case <-done:
+			// 消息处理goroutine结束，退出主循环
+			return
 		case <-ticker.C:
 			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				logrus.WithField("client_id", clientID).WithError(err).Error("发送ping失败")
@@ -118,10 +152,10 @@ func (h *WebSocketHandler) handleMessages(client *model.Client, conn *websocket.
 			}
 			break
 		}
-		
+
 		// 更新最后活跃时间
 		client.LastPing = time.Now()
-		
+
 		// 处理不同类型的消息
 		h.processMessage(client, &message)
 	}
@@ -135,7 +169,7 @@ func (h *WebSocketHandler) processMessage(client *model.Client, message *model.W
 		"channel":   message.Channel,
 		"event":     message.Event,
 	}).Debug("收到客户端消息")
-	
+
 	switch message.Type {
 	case model.MessageTypeSubscribe:
 		h.handleSubscribe(client, message)
@@ -154,15 +188,15 @@ func (h *WebSocketHandler) handleSubscribe(client *model.Client, message *model.
 		h.sendError(client, 400, "缺少频道名称")
 		return
 	}
-	
+
 	// 如果没有指定事件，则只订阅房间
 	event := message.Event
-	
+
 	if err := h.wsService.SubscribeToRoom(client.ID, message.Channel, event); err != nil {
 		h.sendError(client, 400, err.Error())
 		return
 	}
-	
+
 	// 发送订阅确认
 	h.sendMessage(client, model.NewWebSocketMessage(
 		"subscribed",
@@ -182,17 +216,17 @@ func (h *WebSocketHandler) handleUnsubscribe(client *model.Client, message *mode
 		h.sendError(client, 400, "缺少频道名称")
 		return
 	}
-	
+
 	event := message.Event
 	if event == "" {
 		event = "signal:all"
 	}
-	
+
 	if err := h.wsService.UnsubscribeFromRoom(client.ID, message.Channel, event); err != nil {
 		h.sendError(client, 400, err.Error())
 		return
 	}
-	
+
 	// 发送取消订阅确认
 	h.sendMessage(client, model.NewWebSocketMessage(
 		"unsubscribed",
@@ -211,25 +245,25 @@ func (h *WebSocketHandler) handlePublish(client *model.Client, message *model.We
 		h.sendError(client, 400, "缺少频道名称")
 		return
 	}
-	
+
 	event := message.Event
 	if event == "" {
 		event = "signal:all"
 	}
-	
+
 	// 验证消息数据
 	if message.Data == nil {
 		h.sendError(client, 400, "缺少消息数据")
 		return
 	}
-	
+
 	// 验证数据格式
 	var data map[string]interface{}
 	if err := json.Unmarshal(message.Data, &data); err != nil {
 		h.sendError(client, 400, "消息数据格式错误")
 		return
 	}
-	
+
 	// 确保包含必要的字段（from字段）
 	if _, exists := data["from"]; !exists {
 		data["from"] = client.UserID
@@ -237,7 +271,7 @@ func (h *WebSocketHandler) handlePublish(client *model.Client, message *model.We
 			message.Data = newData
 		}
 	}
-	
+
 	if err := h.wsService.PublishToRoom(client.ID, message.Channel, event, message.Data); err != nil {
 		h.sendError(client, 400, err.Error())
 		return
@@ -250,7 +284,7 @@ func (h *WebSocketHandler) sendMessage(client *model.Client, message *model.WebS
 	if !ok {
 		return
 	}
-	
+
 	if err := conn.WriteJSON(message); err != nil {
 		logrus.WithFields(logrus.Fields{
 			"client_id": client.ID,
@@ -266,7 +300,7 @@ func (h *WebSocketHandler) sendError(client *model.Client, code int, message str
 		"code":      code,
 		"message":   message,
 	}).Warn("发送错误消息")
-	
+
 	errorMsg := model.NewErrorMessage(code, message)
 	h.sendMessage(client, errorMsg)
-} 
+}
