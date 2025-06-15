@@ -8,6 +8,8 @@ import (
 	"letshare-server/pkg/logger"
 	"os"
 	"os/signal"
+	"regexp"
+	"strings"
 	"syscall"
 
 	"github.com/gin-contrib/cors"
@@ -45,23 +47,34 @@ func main() {
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "Upgrade", "Connection", "Sec-WebSocket-Key", "Sec-WebSocket-Version", "Sec-WebSocket-Protocol"},
 		AllowCredentials: true,
 		AllowOriginFunc: func(origin string) bool {
+			logrus.WithField("origin", origin).Debug("检查CORS来源")
+
 			// 检查配置文件中的允许来源
 			for _, allowedOrigin := range cfg.CORS.AllowedOrigins {
 				if origin == allowedOrigin {
+					logrus.WithField("origin", origin).Debug("CORS允许：配置文件匹配")
 					return true
 				}
 			}
 
 			// 检查是否是192.168.1.*网段
-			// 支持 http://192.168.1.* 和 https://192.168.1.*
-			if len(origin) > 0 {
-				// 检查 http://192.168.1.*:端口 格式
-				if (len(origin) >= 18 && origin[:18] == "http://192.168.1.") ||
-					(len(origin) >= 19 && origin[:19] == "https://192.168.1.") {
+			if origin != "" {
+				// 使用正则表达式匹配 http(s)://192.168.1.xxx:端口
+				pattern := `^https?://192\.168\.1\.\d{1,3}(:\d+)?/?$`
+				matched, err := regexp.MatchString(pattern, origin)
+				if err == nil && matched {
+					logrus.WithField("origin", origin).Debug("CORS允许：192.168.1.*网段匹配")
+					return true
+				}
+
+				// 额外检查：简单的字符串前缀匹配作为备用
+				if strings.HasPrefix(origin, "http://192.168.1.") || strings.HasPrefix(origin, "https://192.168.1.") {
+					logrus.WithField("origin", origin).Debug("CORS允许：192.168.1.*前缀匹配")
 					return true
 				}
 			}
 
+			logrus.WithField("origin", origin).Warn("CORS拒绝：未匹配任何规则")
 			return false
 		},
 	}
