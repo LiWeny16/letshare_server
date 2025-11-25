@@ -2,7 +2,7 @@ server:
   port: "443"
 
 tls:
-  enabled: false
+  enabled: true
   cert_file: "/etc/letsencrypt/live/ecs.letshare.fun/fullchain.pem"
   key_file: "/etc/letsencrypt/live/ecs.letshare.fun/privkey.pem"
   auto_cert: true
