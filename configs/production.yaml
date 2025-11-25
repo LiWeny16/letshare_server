@@ -28,3 +28,11 @@ log:
 
 websocket:
   max_room_users: 50
+
+file_transfer:
+  enabled: true
+  max_file_size: 524288000  # 500MB in bytes
+  chunk_size: 65536         # 64KB per chunk
+
+runtime:
+  gomaxprocs: 0  # 0 = use all available CPU cores

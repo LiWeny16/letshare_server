@@ -23,14 +23,16 @@ var upgrader = websocket.Upgrader{
 }
 
 type WebSocketHandler struct {
-	wsService   *service.WebSocketService
-	authService *service.AuthService
+	wsService           *service.WebSocketService
+	authService         *service.AuthService
+	fileTransferService *service.FileTransferService
 }
 
-func NewWebSocketHandler(wsService *service.WebSocketService, authService *service.AuthService) *WebSocketHandler {
+func NewWebSocketHandler(wsService *service.WebSocketService, authService *service.AuthService, fileTransferService *service.FileTransferService) *WebSocketHandler {
 	return &WebSocketHandler{
-		wsService:   wsService,
-		authService: authService,
+		wsService:           wsService,
+		authService:         authService,
+		fileTransferService: fileTransferService,
 	}
 }
 
@@ -134,21 +136,48 @@ func (h *WebSocketHandler) HandleWebSocket(c *gin.Context) {
 			// 消息处理goroutine结束，退出主循环
 			return
 		case <-ticker.C:
-			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				logrus.WithField("client_id", clientID).WithError(err).Error("发送ping失败")
+			// 检查连接是否仍然有效
+			if conn == nil {
 				return
 			}
+			// 使用defer recover防止panic
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						logrus.WithFields(logrus.Fields{
+							"client_id": clientID,
+							"panic":     r,
+						}).Warn("发送ping时发生panic")
+					}
+				}()
+
+				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					// 只在非预期错误时记录（忽略正常关闭）
+					if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+						logrus.WithField("client_id", clientID).Debug("连接已关闭，停止发送ping")
+					}
+					// 触发清理，不记录错误
+					done <- struct{}{}
+				}
+			}()
 		}
 	}
 }
 
-// handleMessages 处理客户端消息
+// handleMessages 处理客户端消息(同时支持JSON和二进制消息)
 func (h *WebSocketHandler) handleMessages(client *model.Client, conn *websocket.Conn) {
 	for {
-		var message model.WebSocketMessage
-		if err := conn.ReadJSON(&message); err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				logrus.WithField("client_id", client.ID).WithError(err).Error("WebSocket连接异常关闭")
+		messageType, messageData, err := conn.ReadMessage()
+		if err != nil {
+			// 区分正常关闭和异常关闭
+			if websocket.IsUnexpectedCloseError(err,
+				websocket.CloseNormalClosure,
+				websocket.CloseGoingAway,
+				websocket.CloseAbnormalClosure,
+				websocket.CloseNoStatusReceived) {
+				logrus.WithField("client_id", client.ID).WithError(err).Warn("WebSocket异常断开")
+			} else {
+				logrus.WithField("client_id", client.ID).Debug("WebSocket正常关闭")
 			}
 			break
 		}
@@ -156,8 +185,27 @@ func (h *WebSocketHandler) handleMessages(client *model.Client, conn *websocket.
 		// 更新最后活跃时间
 		client.LastPing = time.Now()
 
-		// 处理不同类型的消息
-		h.processMessage(client, &message)
+		// 根据消息类型处理
+		switch messageType {
+		case websocket.TextMessage:
+			// JSON消息
+			var message model.WebSocketMessage
+			if err := json.Unmarshal(messageData, &message); err != nil {
+				logrus.WithField("client_id", client.ID).WithError(err).Error("JSON解析失败")
+				continue
+			}
+			h.processMessage(client, &message)
+
+		case websocket.BinaryMessage:
+			// 二进制消息(文件传输)
+			h.processBinaryMessage(client, messageData)
+
+		default:
+			logrus.WithFields(logrus.Fields{
+				"client_id":    client.ID,
+				"message_type": messageType,
+			}).Warn("不支持的消息类型")
+		}
 	}
 }
 
@@ -177,6 +225,19 @@ func (h *WebSocketHandler) processMessage(client *model.Client, message *model.W
 		h.handleUnsubscribe(client, message)
 	case model.MessageTypePublish:
 		h.handlePublish(client, message)
+	// 文件传输相关消息
+	case model.MessageTypeFileTransferRequest:
+		h.handleFileTransferRequest(client, message)
+	case model.MessageTypeFileTransferAccept:
+		h.handleFileTransferAccept(client, message)
+	case model.MessageTypeFileTransferReject:
+		h.handleFileTransferReject(client, message)
+	case model.MessageTypeFileTransferStart:
+		h.handleFileTransferStart(client, message)
+	case model.MessageTypeFileTransferEnd:
+		h.handleFileTransferEnd(client, message)
+	case model.MessageTypeFileTransferCancel:
+		h.handleFileTransferCancel(client, message)
 	default:
 		h.sendError(client, 400, "不支持的消息类型: "+message.Type)
 	}
@@ -303,4 +364,373 @@ func (h *WebSocketHandler) sendError(client *model.Client, code int, message str
 
 	errorMsg := model.NewErrorMessage(code, message)
 	h.sendMessage(client, errorMsg)
+}
+
+// processBinaryMessage 处理二进制消息(文件数据块)
+func (h *WebSocketHandler) processBinaryMessage(client *model.Client, data []byte) {
+	// 二进制消息格式: 前面是JSON元数据(固定长度或分隔符),后面是实际数据
+	// 这里我们假设客户端先发送JSON元数据,再发送二进制数据
+	// 因此在收到二进制消息时,我们需要先解析元数据
+
+	// 简化处理:假设前256字节是JSON元数据头,剩余是数据
+	if len(data) < 256 {
+		h.sendError(client, 400, "二进制消息格式错误")
+		return
+	}
+
+	// 解析元数据
+	var chunkMeta model.FileTransferChunk
+	if err := json.Unmarshal(data[:256], &chunkMeta); err != nil {
+		// 尝试查找JSON结束位置
+		for i := 0; i < len(data) && i < 1024; i++ {
+			if data[i] == '}' {
+				if err := json.Unmarshal(data[:i+1], &chunkMeta); err == nil {
+					// 成功解析,提取实际数据
+					chunkData := data[i+1:]
+					h.handleFileChunk(client, &chunkMeta, chunkData)
+					return
+				}
+			}
+		}
+		logrus.WithField("client_id", client.ID).WithError(err).Error("解析文件块元数据失败")
+		h.sendError(client, 400, "文件块元数据格式错误")
+		return
+	}
+
+	// 提取实际数据(跳过元数据部分)
+	chunkData := data[256:]
+	h.handleFileChunk(client, &chunkMeta, chunkData)
+}
+
+// handleFileChunk 处理文件数据块
+func (h *WebSocketHandler) handleFileChunk(client *model.Client, chunkMeta *model.FileTransferChunk, chunkData []byte) {
+	logrus.WithFields(logrus.Fields{
+		"client_id":   client.ID,
+		"transfer_id": chunkMeta.TransferID,
+		"chunk_index": chunkMeta.ChunkIndex,
+		"chunk_size":  len(chunkData),
+	}).Debug("收到文件数据块")
+
+	// 验证会话
+	session, err := h.fileTransferService.GetSession(chunkMeta.TransferID)
+	if err != nil {
+		h.sendError(client, 404, "传输会话不存在")
+		return
+	}
+
+	// 验证发送者
+	if session.FromUserID != client.UserID {
+		h.sendError(client, 403, "无权发送此传输的数据")
+		return
+	}
+
+	// 验证会话状态
+	if session.Status != "transferring" {
+		h.sendError(client, 400, "传输会话状态错误: "+session.Status)
+		return
+	}
+
+	// 转发数据块给接收者(零拷贝)
+	if err := h.fileTransferService.ForwardChunkToReceiver(chunkMeta.TransferID, chunkData, chunkMeta); err != nil {
+		logrus.WithError(err).Error("转发文件数据块失败")
+		h.sendError(client, 500, "转发失败: "+err.Error())
+
+		// 通知双方传输错误
+		h.notifyTransferError(session, "数据转发失败")
+		return
+	}
+}
+
+// handleFileTransferRequest 处理文件传输请求
+func (h *WebSocketHandler) handleFileTransferRequest(client *model.Client, message *model.WebSocketMessage) {
+	var request model.FileTransferRequest
+	if err := json.Unmarshal(message.Data, &request); err != nil {
+		h.sendError(client, 400, "请求数据格式错误")
+		return
+	}
+
+	// 设置发送者信息
+	request.FromUserID = client.UserID
+
+	// 创建传输会话
+	session, err := h.fileTransferService.CreateTransferSession(&request)
+	if err != nil {
+		h.sendError(client, 400, err.Error())
+		return
+	}
+
+	// 更新客户端ID
+	h.fileTransferService.UpdateSessionClients(session.TransferID, client.ID, "")
+
+	// 转发请求给接收者
+	requestMsg := model.NewWebSocketMessage(
+		model.MessageTypeFileTransferRequest,
+		request.RoomName,
+		"",
+		request,
+	)
+
+	if err := h.fileTransferService.SendMessageToUser(request.ToUserID, request.RoomName, requestMsg); err != nil {
+		h.sendError(client, 404, "找不到接收者")
+		h.fileTransferService.RemoveSession(session.TransferID)
+		return
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"transfer_id": session.TransferID,
+		"from":        request.FromUserID,
+		"to":          request.ToUserID,
+		"file":        request.FileName,
+	}).Info("文件传输请求已发送")
+}
+
+// handleFileTransferAccept 处理接受文件传输
+func (h *WebSocketHandler) handleFileTransferAccept(client *model.Client, message *model.WebSocketMessage) {
+	var data map[string]interface{}
+	if err := json.Unmarshal(message.Data, &data); err != nil {
+		h.sendError(client, 400, "数据格式错误")
+		return
+	}
+
+	transferID, ok := data["transfer_id"].(string)
+	if !ok {
+		h.sendError(client, 400, "缺少transfer_id")
+		return
+	}
+
+	session, err := h.fileTransferService.GetSession(transferID)
+	if err != nil {
+		h.sendError(client, 404, "传输会话不存在")
+		return
+	}
+
+	// 验证接收者
+	if session.ToUserID != client.UserID {
+		h.sendError(client, 403, "无权接受此传输")
+		return
+	}
+
+	// 更新会话状态
+	h.fileTransferService.UpdateSessionStatus(transferID, "accepted")
+	h.fileTransferService.UpdateSessionClients(transferID, session.FromClientID, client.ID)
+
+	// 通知发送者
+	acceptMsg := model.NewWebSocketMessage(
+		model.MessageTypeFileTransferAccept,
+		session.RoomName,
+		"",
+		map[string]interface{}{
+			"transfer_id": transferID,
+		},
+	)
+
+	h.fileTransferService.SendMessageToUser(session.FromUserID, session.RoomName, acceptMsg)
+
+	logrus.WithField("transfer_id", transferID).Info("文件传输已接受")
+}
+
+// handleFileTransferReject 处理拒绝文件传输
+func (h *WebSocketHandler) handleFileTransferReject(client *model.Client, message *model.WebSocketMessage) {
+	var data map[string]interface{}
+	if err := json.Unmarshal(message.Data, &data); err != nil {
+		h.sendError(client, 400, "数据格式错误")
+		return
+	}
+
+	transferID, ok := data["transfer_id"].(string)
+	if !ok {
+		h.sendError(client, 400, "缺少transfer_id")
+		return
+	}
+
+	session, err := h.fileTransferService.GetSession(transferID)
+	if err != nil {
+		h.sendError(client, 404, "传输会话不存在")
+		return
+	}
+
+	// 更新会话状态
+	h.fileTransferService.UpdateSessionStatus(transferID, "rejected")
+
+	// 通知发送者
+	rejectMsg := model.NewWebSocketMessage(
+		model.MessageTypeFileTransferReject,
+		session.RoomName,
+		"",
+		map[string]interface{}{
+			"transfer_id": transferID,
+			"reason":      data["reason"],
+		},
+	)
+
+	h.fileTransferService.SendMessageToUser(session.FromUserID, session.RoomName, rejectMsg)
+
+	// 清理会话
+	h.fileTransferService.RemoveSession(transferID)
+
+	logrus.WithField("transfer_id", transferID).Info("文件传输已拒绝")
+}
+
+// handleFileTransferStart 处理开始文件传输
+func (h *WebSocketHandler) handleFileTransferStart(client *model.Client, message *model.WebSocketMessage) {
+	var data map[string]interface{}
+	if err := json.Unmarshal(message.Data, &data); err != nil {
+		h.sendError(client, 400, "数据格式错误")
+		return
+	}
+
+	transferID, ok := data["transfer_id"].(string)
+	if !ok {
+		h.sendError(client, 400, "缺少transfer_id")
+		return
+	}
+
+	session, err := h.fileTransferService.GetSession(transferID)
+	if err != nil {
+		h.sendError(client, 404, "传输会话不存在")
+		return
+	}
+
+	// 验证发送者
+	if session.FromUserID != client.UserID {
+		h.sendError(client, 403, "无权开始此传输")
+		return
+	}
+
+	// 更新会话状态
+	h.fileTransferService.UpdateSessionStatus(transferID, "transferring")
+
+	// 通知接收者
+	startMsg := model.NewWebSocketMessage(
+		model.MessageTypeFileTransferStart,
+		session.RoomName,
+		"",
+		map[string]interface{}{
+			"transfer_id":  transferID,
+			"file_name":    session.FileName,
+			"file_size":    session.FileSize,
+			"total_chunks": session.TotalChunks,
+		},
+	)
+
+	h.fileTransferService.SendMessageToUser(session.ToUserID, session.RoomName, startMsg)
+
+	logrus.WithField("transfer_id", transferID).Info("文件传输已开始")
+}
+
+// handleFileTransferEnd 处理文件传输完成
+func (h *WebSocketHandler) handleFileTransferEnd(client *model.Client, message *model.WebSocketMessage) {
+	var data map[string]interface{}
+	if err := json.Unmarshal(message.Data, &data); err != nil {
+		h.sendError(client, 400, "数据格式错误")
+		return
+	}
+
+	transferID, ok := data["transfer_id"].(string)
+	if !ok {
+		h.sendError(client, 400, "缺少transfer_id")
+		return
+	}
+
+	session, err := h.fileTransferService.GetSession(transferID)
+	if err != nil {
+		h.sendError(client, 404, "传输会话不存在")
+		return
+	}
+
+	// 更新会话状态
+	h.fileTransferService.UpdateSessionStatus(transferID, "completed")
+
+	// 通知双方
+	endMsg := model.NewWebSocketMessage(
+		model.MessageTypeFileTransferEnd,
+		session.RoomName,
+		"",
+		map[string]interface{}{
+			"transfer_id": transferID,
+			"file_name":   session.FileName,
+			"file_size":   session.FileSize,
+		},
+	)
+
+	h.fileTransferService.SendMessageToUser(session.FromUserID, session.RoomName, endMsg)
+	h.fileTransferService.SendMessageToUser(session.ToUserID, session.RoomName, endMsg)
+
+	// 延迟清理会话
+	go func() {
+		time.Sleep(30 * time.Second)
+		h.fileTransferService.RemoveSession(transferID)
+	}()
+
+	logrus.WithFields(logrus.Fields{
+		"transfer_id": transferID,
+		"file_name":   session.FileName,
+		"file_size":   session.FileSize,
+		"duration":    time.Since(session.StartTime).String(),
+	}).Info("文件传输已完成")
+}
+
+// handleFileTransferCancel 处理取消文件传输
+func (h *WebSocketHandler) handleFileTransferCancel(client *model.Client, message *model.WebSocketMessage) {
+	var data map[string]interface{}
+	if err := json.Unmarshal(message.Data, &data); err != nil {
+		h.sendError(client, 400, "数据格式错误")
+		return
+	}
+
+	transferID, ok := data["transfer_id"].(string)
+	if !ok {
+		h.sendError(client, 400, "缺少transfer_id")
+		return
+	}
+
+	session, err := h.fileTransferService.GetSession(transferID)
+	if err != nil {
+		h.sendError(client, 404, "传输会话不存在")
+		return
+	}
+
+	// 更新会话状态
+	h.fileTransferService.UpdateSessionStatus(transferID, "cancelled")
+
+	// 通知对方
+	cancelMsg := model.NewWebSocketMessage(
+		model.MessageTypeFileTransferCancel,
+		session.RoomName,
+		"",
+		map[string]interface{}{
+			"transfer_id": transferID,
+			"reason":      data["reason"],
+		},
+	)
+
+	// 通知发送者和接收者
+	if client.UserID == session.FromUserID {
+		h.fileTransferService.SendMessageToUser(session.ToUserID, session.RoomName, cancelMsg)
+	} else {
+		h.fileTransferService.SendMessageToUser(session.FromUserID, session.RoomName, cancelMsg)
+	}
+
+	// 清理会话
+	h.fileTransferService.RemoveSession(transferID)
+
+	logrus.WithField("transfer_id", transferID).Info("文件传输已取消")
+}
+
+// notifyTransferError 通知传输错误
+func (h *WebSocketHandler) notifyTransferError(session *model.FileTransferSession, errMsg string) {
+	h.fileTransferService.UpdateSessionStatus(session.TransferID, "error")
+
+	errorMsg := model.NewWebSocketMessage(
+		model.MessageTypeFileTransferError,
+		session.RoomName,
+		"",
+		map[string]interface{}{
+			"transfer_id": session.TransferID,
+			"error":       errMsg,
+		},
+	)
+
+	h.fileTransferService.SendMessageToUser(session.FromUserID, session.RoomName, errorMsg)
+	h.fileTransferService.SendMessageToUser(session.ToUserID, session.RoomName, errorMsg)
 }

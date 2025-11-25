@@ -1,0 +1,38 @@
+server:
+  port: "8080"
+
+tls:
+  enabled: false
+  cert_file: ""
+  key_file: ""
+  auto_cert: false
+  domain: ""
+
+jwt:
+  secret: "letshare-jwt-secret-key-2024-local"
+  expiration_hours: 168 # 7天
+
+cors:
+  allowed_origins:
+    - "http://localhost:3000"
+    - "http://localhost:5173"
+    - "http://127.0.0.1:3000"
+    - "http://127.0.0.1:5173"
+    - "http://192.168.1.106:5173"
+    - "http://192.168.1.13:5173"
+
+log:
+  level: "debug"  # 本地测试使用debug级别
+  max_entries: 500
+
+websocket:
+  max_room_users: 10
+
+file_transfer:
+  enabled: true
+  max_file_size: 524288000  # 500MB
+  chunk_size: 65536         # 64KB
+
+runtime:
+  gomaxprocs: 0  # 使用所有CPU核心
+

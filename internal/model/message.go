@@ -13,6 +13,16 @@ const (
 	MessageTypeSubscribed  = "subscribed"
 	MessageTypeMessage     = "message"
 	MessageTypeError       = "error"
+	// 文件传输相关消息类型
+	MessageTypeFileTransferRequest  = "file:transfer:request"  // 发起文件传输请求
+	MessageTypeFileTransferAccept   = "file:transfer:accept"   // 接受文件传输
+	MessageTypeFileTransferReject   = "file:transfer:reject"   // 拒绝文件传输
+	MessageTypeFileTransferStart    = "file:transfer:start"    // 开始传输
+	MessageTypeFileTransferChunk    = "file:transfer:chunk"    // 传输数据块(二进制)
+	MessageTypeFileTransferEnd      = "file:transfer:end"      // 传输完成
+	MessageTypeFileTransferCancel   = "file:transfer:cancel"   // 取消传输
+	MessageTypeFileTransferError    = "file:transfer:error"    // 传输错误
+	MessageTypeFileTransferProgress = "file:transfer:progress" // 传输进度
 )
 
 // WebSocketMessage 表示WebSocket消息（兼容Ably格式）
@@ -101,4 +111,54 @@ func NewRoom(name string) *Room {
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}
+}
+
+// FileTransferRequest 文件传输请求信息
+type FileTransferRequest struct {
+	TransferID  string `json:"transfer_id"`  // 传输会话ID
+	FileName    string `json:"file_name"`    // 文件名
+	FileSize    int64  `json:"file_size"`    // 文件大小(字节)
+	FileType    string `json:"file_type"`    // 文件MIME类型
+	ChunkSize   int    `json:"chunk_size"`   // 分块大小(字节)
+	TotalChunks int    `json:"total_chunks"` // 总块数
+	FromUserID  string `json:"from_user_id"` // 发送者用户ID
+	ToUserID    string `json:"to_user_id"`   // 接收者用户ID
+	RoomName    string `json:"room_name"`    // 房间名称
+}
+
+// FileTransferChunk 文件数据块(用于二进制消息的元数据)
+type FileTransferChunk struct {
+	TransferID  string `json:"transfer_id"`  // 传输会话ID
+	ChunkIndex  int    `json:"chunk_index"`  // 块索引(从0开始)
+	ChunkSize   int    `json:"chunk_size"`   // 本块大小
+	TotalChunks int    `json:"total_chunks"` // 总块数
+	// 实际数据在二进制消息中,不在JSON中
+}
+
+// FileTransferProgress 文件传输进度
+type FileTransferProgress struct {
+	TransferID       string  `json:"transfer_id"`
+	ChunkIndex       int     `json:"chunk_index"`
+	TotalChunks      int     `json:"total_chunks"`
+	BytesTransferred int64   `json:"bytes_transferred"`
+	TotalBytes       int64   `json:"total_bytes"`
+	Percentage       float64 `json:"percentage"`
+}
+
+// FileTransferSession 文件传输会话
+type FileTransferSession struct {
+	TransferID   string
+	FromClientID string
+	ToClientID   string
+	FromUserID   string
+	ToUserID     string
+	RoomName     string
+	FileName     string
+	FileSize     int64
+	FileType     string
+	ChunkSize    int
+	TotalChunks  int
+	StartTime    time.Time
+	LastActivity time.Time
+	Status       string // "pending", "accepted", "transferring", "completed", "cancelled", "error"
 }

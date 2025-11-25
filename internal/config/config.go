@@ -9,12 +9,14 @@ import (
 )
 
 type Config struct {
-	Mode      string    `mapstructure:"mode"`
-	Server    Server    `mapstructure:"server"`
-	TLS       TLS       `mapstructure:"tls"`
-	CORS      CORS      `mapstructure:"cors"`
-	Log       Log       `mapstructure:"log"`
-	WebSocket WebSocket `mapstructure:"websocket"`
+	Mode         string       `mapstructure:"mode"`
+	Server       Server       `mapstructure:"server"`
+	TLS          TLS          `mapstructure:"tls"`
+	CORS         CORS         `mapstructure:"cors"`
+	Log          Log          `mapstructure:"log"`
+	WebSocket    WebSocket    `mapstructure:"websocket"`
+	FileTransfer FileTransfer `mapstructure:"file_transfer"`
+	Runtime      Runtime      `mapstructure:"runtime"`
 }
 
 type Server struct {
@@ -40,6 +42,16 @@ type Log struct {
 
 type WebSocket struct {
 	MaxRoomUsers int `mapstructure:"max_room_users"`
+}
+
+type FileTransfer struct {
+	MaxFileSize int64 `mapstructure:"max_file_size"` // 最大文件大小(字节)
+	ChunkSize   int   `mapstructure:"chunk_size"`    // 分块大小(字节)
+	Enabled     bool  `mapstructure:"enabled"`       // 是否启用文件传输
+}
+
+type Runtime struct {
+	GOMAXPROCS int `mapstructure:"gomaxprocs"` // 最大CPU核心数,0表示使用所有核心
 }
 
 func Load() *Config {
@@ -76,6 +88,13 @@ func Load() *Config {
 
 func setDefaults() {
 	viper.SetDefault("server.port", "8080")
+	viper.SetDefault("websocket.max_room_users", 10)
+	viper.SetDefault("file_transfer.enabled", true)
+	viper.SetDefault("file_transfer.max_file_size", 524288000) // 500MB
+	viper.SetDefault("file_transfer.chunk_size", 65536)        // 64KB
+	viper.SetDefault("runtime.gomaxprocs", 0)                  // 使用所有核心
+	viper.SetDefault("log.level", "info")
+	viper.SetDefault("log.max_entries", 10000)
 	viper.SetDefault("tls.enabled", false)
 	viper.SetDefault("tls.cert_file", "/etc/letsencrypt/live/ecs.letshare.fun/fullchain.pem")
 	viper.SetDefault("tls.key_file", "/etc/letsencrypt/live/ecs.letshare.fun/privkey.pem")

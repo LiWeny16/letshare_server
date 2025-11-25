@@ -262,16 +262,29 @@ func (ws *WebSocketService) PublishToRoom(clientID, roomName, event string, data
 func (ws *WebSocketService) sendToClient(client *model.Client, message *model.WebSocketMessage) {
 	conn, ok := client.Connection.(*websocket.Conn)
 	if !ok {
-		logrus.WithField("client_id", client.ID).Error("WebSocket连接类型错误")
+		logrus.WithField("client_id", client.ID).Debug("连接已失效")
 		return
 	}
 
-	if err := conn.WriteJSON(message); err != nil {
-		logrus.WithFields(logrus.Fields{
-			"client_id": client.ID,
-			"error":     err.Error(),
-		}).Error("发送消息失败")
+	// 使用defer recover防止panic
+	defer func() {
+		if r := recover(); r != nil {
+			logrus.WithFields(logrus.Fields{
+				"client_id": client.ID,
+				"panic":     r,
+			}).Warn("发送消息时发生panic")
+			ws.RemoveClient(client.ID)
+		}
+	}()
 
+	if err := conn.WriteJSON(message); err != nil {
+		// 只在非正常关闭时记录警告
+		if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+			logrus.WithFields(logrus.Fields{
+				"client_id": client.ID,
+				"error":     err.Error(),
+			}).Debug("发送消息失败，连接可能已关闭")
+		}
 		// 连接出错，移除客户端
 		ws.RemoveClient(client.ID)
 	}

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"runtime"
 	"strings"
 	"syscall"
 
@@ -21,6 +22,15 @@ func main() {
 	// 初始化配置
 	cfg := config.Load()
 
+	// 设置GOMAXPROCS以充分利用多核CPU
+	if cfg.Runtime.GOMAXPROCS > 0 {
+		runtime.GOMAXPROCS(cfg.Runtime.GOMAXPROCS)
+		logrus.WithField("gomaxprocs", cfg.Runtime.GOMAXPROCS).Info("设置最大CPU核心数")
+	} else {
+		maxProcs := runtime.GOMAXPROCS(0)
+		logrus.WithField("gomaxprocs", maxProcs).Info("使用所有可用CPU核心")
+	}
+
 	// 初始化日志
 	logger.Init(cfg.Log.Level, cfg.Log.MaxEntries)
 
@@ -32,6 +42,22 @@ func main() {
 	// 创建服务
 	wsService := service.NewWebSocketService(cfg.WebSocket.MaxRoomUsers)
 	authService := service.NewAuthService()
+	
+	// 创建文件传输服务
+	var fileTransferService *service.FileTransferService
+	if cfg.FileTransfer.Enabled {
+		fileTransferService = service.NewFileTransferService(
+			wsService,
+			cfg.FileTransfer.MaxFileSize,
+			cfg.FileTransfer.ChunkSize,
+		)
+		logrus.WithFields(logrus.Fields{
+			"max_file_size_mb": cfg.FileTransfer.MaxFileSize / (1024 * 1024),
+			"chunk_size_kb":    cfg.FileTransfer.ChunkSize / 1024,
+		}).Info("文件传输服务已启用")
+	} else {
+		logrus.Info("文件传输服务未启用")
+	}
 
 	// 创建路由
 	r := gin.New()
@@ -81,7 +107,7 @@ func main() {
 	r.Use(cors.New(corsConfig))
 
 	// 创建处理器
-	wsHandler := handler.NewWebSocketHandler(wsService, authService)
+	wsHandler := handler.NewWebSocketHandler(wsService, authService, fileTransferService)
 	healthHandler := handler.NewHealthHandler(wsService)
 
 	// 路由
