@@ -277,6 +277,9 @@ func (ws *WebSocketService) sendToClient(client *model.Client, message *model.We
 		}
 	}()
 
+	client.ConnMutex.Lock()
+	defer client.ConnMutex.Unlock()
+
 	if err := conn.WriteJSON(message); err != nil {
 		// 只在非正常关闭时记录警告
 		if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {

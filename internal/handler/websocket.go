@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"encoding/json"
 	"letshare-server/internal/model"
 	"letshare-server/internal/service"
@@ -150,6 +151,9 @@ func (h *WebSocketHandler) HandleWebSocket(c *gin.Context) {
 						}).Warn("发送ping时发生panic")
 					}
 				}()
+
+				client.ConnMutex.Lock()
+				defer client.ConnMutex.Unlock()
 
 				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 					// 只在非预期错误时记录（忽略正常关闭）
@@ -346,6 +350,9 @@ func (h *WebSocketHandler) sendMessage(client *model.Client, message *model.WebS
 		return
 	}
 
+	client.ConnMutex.Lock()
+	defer client.ConnMutex.Unlock()
+
 	if err := conn.WriteJSON(message); err != nil {
 		logrus.WithFields(logrus.Fields{
 			"client_id": client.ID,
@@ -378,20 +385,10 @@ func (h *WebSocketHandler) processBinaryMessage(client *model.Client, data []byt
 		return
 	}
 
-	// 解析元数据
+	// 解析元数据（前256字节，去除padding的0）
 	var chunkMeta model.FileTransferChunk
-	if err := json.Unmarshal(data[:256], &chunkMeta); err != nil {
-		// 尝试查找JSON结束位置
-		for i := 0; i < len(data) && i < 1024; i++ {
-			if data[i] == '}' {
-				if err := json.Unmarshal(data[:i+1], &chunkMeta); err == nil {
-					// 成功解析,提取实际数据
-					chunkData := data[i+1:]
-					h.handleFileChunk(client, &chunkMeta, chunkData)
-					return
-				}
-			}
-		}
+	metaBytes := bytes.TrimRight(data[:256], "\x00")
+	if err := json.Unmarshal(metaBytes, &chunkMeta); err != nil {
 		logrus.WithField("client_id", client.ID).WithError(err).Error("解析文件块元数据失败")
 		h.sendError(client, 400, "文件块元数据格式错误")
 		return

@@ -2,6 +2,7 @@ package model
 
 import (
 	"encoding/json"
+	"sync" // Added sync
 	"time"
 )
 
@@ -46,6 +47,7 @@ type Client struct {
 	ID         string                 `json:"id"`
 	UserID     string                 `json:"user_id"`
 	Connection interface{}            `json:"-"` // WebSocket连接
+	ConnMutex  sync.Mutex             `json:"-"` // 保护连接写入
 	Rooms      map[string]bool        `json:"rooms"`
 	Events     map[string]bool        `json:"events"` // 订阅的事件
 	LastPing   time.Time              `json:"last_ping"`

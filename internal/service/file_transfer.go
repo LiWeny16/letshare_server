@@ -182,6 +182,9 @@ func (fts *FileTransferService) ForwardChunkToReceiver(transferID string, chunkD
 		return fmt.Errorf("无效的WebSocket连接")
 	}
 
+	receiverClient.ConnMutex.Lock()
+	defer receiverClient.ConnMutex.Unlock()
+
 	// 先发送JSON元数据
 	if err := conn.WriteJSON(metaMsg); err != nil {
 		return fmt.Errorf("发送块元数据失败: %w", err)
@@ -230,6 +233,9 @@ func (fts *FileTransferService) SendMessageToUser(userID, roomName string, messa
 	if !ok {
 		return fmt.Errorf("无效的WebSocket连接")
 	}
+
+	client.ConnMutex.Lock()
+	defer client.ConnMutex.Unlock()
 
 	if err := conn.WriteJSON(message); err != nil {
 		return fmt.Errorf("发送消息失败: %w", err)
