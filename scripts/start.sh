@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# LetShare 服务器启动脚本
+# LetShare 服务器启动脚本（用于本地开发/调试，不用于 systemd 生产部署）
 
 set -e
 
@@ -35,6 +35,7 @@ check_docker() {
 # 显示帮助信息
 show_help() {
     echo "LetShare 服务器启动脚本"
+    echo "说明: 此脚本用于本地开发/调试；生产环境推荐使用 ./scripts/build.sh 和 ./scripts/deploy.sh 配合 systemd。"
     echo ""
     echo "用法: $0 [选项]"
     echo ""

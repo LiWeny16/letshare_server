@@ -21,6 +21,7 @@ cors:
     - "https://www.letshare.fun"
     - "https://cdn.letshare.fun"
     - "https://ecs.letshare.fun"
+    - "https://md.bigonion.cn"
 
 log:
   level: "info"

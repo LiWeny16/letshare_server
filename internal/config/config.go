@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/joho/godotenv"
 	"github.com/spf13/viper"
 )
 
@@ -17,6 +18,7 @@ type Config struct {
 	WebSocket    WebSocket    `mapstructure:"websocket"`
 	FileTransfer FileTransfer `mapstructure:"file_transfer"`
 	Runtime      Runtime      `mapstructure:"runtime"`
+	GLM          GLM          `mapstructure:"glm"`
 }
 
 type Server struct {
@@ -54,7 +56,17 @@ type Runtime struct {
 	GOMAXPROCS int `mapstructure:"gomaxprocs"` // 最大CPU核心数,0表示使用所有核心
 }
 
+type GLM struct {
+	APIKey      string `mapstructure:"api_key"`
+	ModelOpus   string `mapstructure:"model_opus"`
+	ModelSonnet string `mapstructure:"model_sonnet"`
+	ModelVision string `mapstructure:"model_vision"`
+	BaseURL     string `mapstructure:"base_url"`
+}
+
 func Load() *Config {
+	_ = godotenv.Load()
+
 	// 确定运行模式
 	mode := os.Getenv("MODE")
 	if mode == "" {
@@ -93,6 +105,11 @@ func setDefaults() {
 	viper.SetDefault("file_transfer.max_file_size", 524288000) // 500MB
 	viper.SetDefault("file_transfer.chunk_size", 65536)        // 64KB
 	viper.SetDefault("runtime.gomaxprocs", 0)                  // 使用所有核心
+	viper.SetDefault("glm.base_url", "https://open.bigmodel.cn/api/paas/v4")
+	viper.SetDefault("glm.model_opus", os.Getenv("GLM_MODEL_OPUS"))
+	viper.SetDefault("glm.model_sonnet", os.Getenv("GLM_MODEL_SONNET"))
+	viper.SetDefault("glm.model_vision", os.Getenv("GLM_MODEL_VISION"))
+	viper.SetDefault("glm.api_key", os.Getenv("GLM_API_KEY"))
 	viper.SetDefault("log.level", "info")
 	viper.SetDefault("log.max_entries", 10000)
 	viper.SetDefault("tls.enabled", false)

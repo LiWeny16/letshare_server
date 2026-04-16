@@ -42,7 +42,7 @@ func main() {
 	// 创建服务
 	wsService := service.NewWebSocketService(cfg.WebSocket.MaxRoomUsers)
 	authService := service.NewAuthService()
-	
+
 	// 创建文件传输服务
 	var fileTransferService *service.FileTransferService
 	if cfg.FileTransfer.Enabled {
@@ -85,15 +85,20 @@ func main() {
 
 			// 检查是否是192.168.1.*网段
 			if origin != "" {
-				// 使用正则表达式匹配 http(s)://192.168.1.xxx:端口
+				localhostPattern := `^https?://(localhost|127\.0\.0\.1)(:\d+)?/?$`
+				matched, err := regexp.MatchString(localhostPattern, origin)
+				if err == nil && matched {
+					logrus.WithField("origin", origin).Debug("CORS允许：localhost匹配")
+					return true
+				}
+
 				pattern := `^https?://192\.168\.1\.\d{1,3}(:\d+)?/?$`
-				matched, err := regexp.MatchString(pattern, origin)
+				matched, err = regexp.MatchString(pattern, origin)
 				if err == nil && matched {
 					logrus.WithField("origin", origin).Debug("CORS允许：192.168.1.*网段匹配")
 					return true
 				}
 
-				// 额外检查：简单的字符串前缀匹配作为备用
 				if strings.HasPrefix(origin, "http://192.168.1.") || strings.HasPrefix(origin, "https://192.168.1.") {
 					logrus.WithField("origin", origin).Debug("CORS允许：192.168.1.*前缀匹配")
 					return true
@@ -109,12 +114,14 @@ func main() {
 	// 创建处理器
 	wsHandler := handler.NewWebSocketHandler(wsService, authService, fileTransferService)
 	healthHandler := handler.NewHealthHandler(wsService)
+	glmHandler := handler.NewGLMHandler(cfg.GLM)
 
 	// 路由
 	r.GET("/health", healthHandler.Health)
 	r.GET("/metrics", healthHandler.Metrics)
 	r.GET("/ws", wsHandler.HandleWebSocket)
 	r.GET("/", wsHandler.HandleWebSocket)
+	r.Any("/api/glm/*path", glmHandler.Proxy)
 	// 启动服务器
 	logrus.WithField("port", cfg.Server.Port).Info("启动WebSocket服务器")
 
