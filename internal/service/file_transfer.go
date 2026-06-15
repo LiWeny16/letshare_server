@@ -13,20 +13,24 @@ import (
 
 // FileTransferService 文件传输服务
 type FileTransferService struct {
-	sessions      map[string]*model.FileTransferSession // transferID -> session
-	sessionsMutex sync.RWMutex
-	wsService     *WebSocketService
-	maxFileSize   int64 // 最大文件大小
-	chunkSize     int   // 默认分块大小
+	sessions       map[string]*model.FileTransferSession // transferID -> session
+	sessionsMutex  sync.RWMutex
+	wsService      *WebSocketService
+	maxFileSize    int64  // 最大文件大小(管理员模式)
+	chunkSize      int    // 默认分块大小
+	basicSizeLimit int64  // 基础大小限制,超过需要管理员密码
+	adminPassword  string // 管理员密码
 }
 
 // NewFileTransferService 创建文件传输服务
-func NewFileTransferService(wsService *WebSocketService, maxFileSize int64, chunkSize int) *FileTransferService {
+func NewFileTransferService(wsService *WebSocketService, maxFileSize int64, chunkSize int, basicSizeLimit int64, adminPassword string) *FileTransferService {
 	fts := &FileTransferService{
-		sessions:    make(map[string]*model.FileTransferSession),
-		wsService:   wsService,
-		maxFileSize: maxFileSize,
-		chunkSize:   chunkSize,
+		sessions:       make(map[string]*model.FileTransferSession),
+		wsService:      wsService,
+		maxFileSize:    maxFileSize,
+		chunkSize:      chunkSize,
+		basicSizeLimit: basicSizeLimit,
+		adminPassword:  adminPassword,
 	}
 
 	// 启动会话清理
@@ -37,7 +41,18 @@ func NewFileTransferService(wsService *WebSocketService, maxFileSize int64, chun
 
 // CreateTransferSession 创建文件传输会话
 func (fts *FileTransferService) CreateTransferSession(request *model.FileTransferRequest) (*model.FileTransferSession, error) {
-	// 验证文件大小
+	// 验证文件大小 — 两阶段检查: ≤50MB 自由传输, >50MB 需要管理员密码
+	if request.FileSize > fts.basicSizeLimit {
+		if request.AdminPass == "" {
+			return nil, fmt.Errorf("文件大小 %.2f MB 超过 %.0f MB 限制,需要管理员密码",
+				float64(request.FileSize)/(1024*1024), float64(fts.basicSizeLimit)/(1024*1024))
+		}
+		if request.AdminPass != fts.adminPassword {
+			return nil, fmt.Errorf("管理员密码错误")
+		}
+	}
+
+	// 验证绝对上限
 	if request.FileSize > fts.maxFileSize {
 		return nil, fmt.Errorf("文件大小超过限制: %d MB", fts.maxFileSize/(1024*1024))
 	}
@@ -331,8 +346,10 @@ func (fts *FileTransferService) GetStats() map[string]interface{} {
 		statusCount[session.Status]++
 	}
 
-	return map[string]interface{}{
+	stats := map[string]interface{}{
 		"total_sessions": len(fts.sessions),
 		"status_count":   statusCount,
 	}
+
+	return stats
 }

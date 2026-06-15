@@ -32,8 +32,10 @@ websocket:
 
 file_transfer:
   enabled: true
-  max_file_size: 524288000  # 500MB in bytes
+  max_file_size: 524288000  # 500MB in bytes (管理员模式)
   chunk_size: 65536         # 64KB per chunk
+  admin_password: ""                   # 管理员密码(由环境变量 ADMIN_PASSWORD 设置)
+  basic_size_limit: 52428800       # 50MB 基础限制,超过需要管理员密码
 
 runtime:
   gomaxprocs: 0  # 0 = use all available CPU cores

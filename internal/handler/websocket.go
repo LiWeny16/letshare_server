@@ -408,6 +408,7 @@ func (h *WebSocketHandler) handleFileChunk(client *model.Client, chunkMeta *mode
 		"chunk_size":  len(chunkData),
 	}).Debug("收到文件数据块")
 
+	// 服务器中继转发逻辑
 	// 验证会话
 	session, err := h.fileTransferService.GetSession(chunkMeta.TransferID)
 	if err != nil {

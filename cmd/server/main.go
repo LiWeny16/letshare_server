@@ -50,10 +50,14 @@ func main() {
 			wsService,
 			cfg.FileTransfer.MaxFileSize,
 			cfg.FileTransfer.ChunkSize,
+			cfg.FileTransfer.BasicSizeLimit,
+			cfg.FileTransfer.AdminPassword,
 		)
 		logrus.WithFields(logrus.Fields{
-			"max_file_size_mb": cfg.FileTransfer.MaxFileSize / (1024 * 1024),
-			"chunk_size_kb":    cfg.FileTransfer.ChunkSize / 1024,
+			"max_file_size_mb":    cfg.FileTransfer.MaxFileSize / (1024 * 1024),
+			"basic_size_limit_mb": cfg.FileTransfer.BasicSizeLimit / (1024 * 1024),
+			"chunk_size_kb":       cfg.FileTransfer.ChunkSize / 1024,
+			"admin_password_set":  cfg.FileTransfer.AdminPassword != "",
 		}).Info("文件传输服务已启用")
 	} else {
 		logrus.Info("文件传输服务未启用")

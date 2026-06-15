@@ -47,9 +47,11 @@ type WebSocket struct {
 }
 
 type FileTransfer struct {
-	MaxFileSize int64 `mapstructure:"max_file_size"` // 最大文件大小(字节)
-	ChunkSize   int   `mapstructure:"chunk_size"`    // 分块大小(字节)
-	Enabled     bool  `mapstructure:"enabled"`       // 是否启用文件传输
+	MaxFileSize    int64  `mapstructure:"max_file_size"`     // 最大文件大小(字节) - 管理员模式
+	ChunkSize      int    `mapstructure:"chunk_size"`        // 分块大小(字节)
+	Enabled        bool   `mapstructure:"enabled"`           // 是否启用文件传输
+	AdminPassword  string `mapstructure:"admin_password"`    // 管理员密码(超过BasicSizeLimit时必需)
+	BasicSizeLimit int64  `mapstructure:"basic_size_limit"`  // 基础大小限制(字节),默认50MB,超过需要管理员密码
 }
 
 type Runtime struct {
@@ -95,6 +97,12 @@ func Load() *Config {
 	}
 
 	cfg.Mode = mode
+
+	// 显式检查 ADMIN_PASSWORD 环境变量(覆盖配置文件)
+	if adminPass := os.Getenv("ADMIN_PASSWORD"); adminPass != "" {
+		cfg.FileTransfer.AdminPassword = adminPass
+	}
+
 	return &cfg
 }
 
@@ -104,6 +112,8 @@ func setDefaults() {
 	viper.SetDefault("file_transfer.enabled", true)
 	viper.SetDefault("file_transfer.max_file_size", 524288000) // 500MB
 	viper.SetDefault("file_transfer.chunk_size", 65536)        // 64KB
+	viper.SetDefault("file_transfer.admin_password", "")                 // 必须通过环境变量 ADMIN_PASSWORD 设置
+	viper.SetDefault("file_transfer.basic_size_limit", 52428800)       // 50MB基础限制
 	viper.SetDefault("runtime.gomaxprocs", 0)                  // 使用所有核心
 	viper.SetDefault("glm.base_url", "https://open.bigmodel.cn/api/paas/v4")
 	viper.SetDefault("glm.model_opus", os.Getenv("GLM_MODEL_OPUS"))

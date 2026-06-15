@@ -52,4 +52,5 @@ Thumbs.db
 
 # 备份文件
 *.bak
-*.backup 
+*.backup 50mb_test.dat
+50mb_plus1.dat
