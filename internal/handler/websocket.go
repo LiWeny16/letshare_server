@@ -6,6 +6,7 @@ import (
 	"letshare-server/internal/model"
 	"letshare-server/internal/service"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -14,13 +15,18 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// wsWriteBufferPool 共享写缓冲池，50个连接共用而非各自占 64KB
+var wsWriteBufferPool = &sync.Pool{}
+
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		// CORS检查在中间件中处理，这里允许所有来源
 		return true
 	},
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
+	// 64KB 读缓冲 — 匹配文件传输分块大小, 减少 syscall
+	ReadBufferSize: 65536,
+	// 写缓冲使用共享池，避免每连接固定分配 64KB
+	WriteBufferPool: wsWriteBufferPool,
 }
 
 type WebSocketHandler struct {

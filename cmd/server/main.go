@@ -6,6 +6,7 @@ import (
 	"letshare-server/internal/middleware"
 	"letshare-server/internal/service"
 	"letshare-server/pkg/logger"
+	"net/http"
 	"os"
 	"os/signal"
 	"regexp"
@@ -138,6 +139,17 @@ func main() {
 					"port":   cfg.Server.Port,
 					"domain": cfg.TLS.Domain,
 				}).Info("启动 HTTPS/WSS 服务器")
+				// HTTP→HTTPS 301 重定向，监听 80 端口
+				go func() {
+					redirect := func(w http.ResponseWriter, req *http.Request) {
+						target := "https://" + req.Host + req.URL.RequestURI()
+						http.Redirect(w, req, target, http.StatusMovedPermanently)
+					}
+					logrus.Info("启动 HTTP→HTTPS 重定向 :80")
+					if err := http.ListenAndServe(":80", http.HandlerFunc(redirect)); err != nil {
+						logrus.WithError(err).Warn("HTTP重定向服务停止")
+					}
+				}()
 				if err := r.RunTLS(":"+cfg.Server.Port, cfg.TLS.CertFile, cfg.TLS.KeyFile); err != nil {
 					logrus.WithError(err).Fatal("HTTPS 服务器启动失败")
 				}
