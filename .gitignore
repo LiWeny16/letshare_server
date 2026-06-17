@@ -54,3 +54,6 @@ Thumbs.db
 *.bak
 *.backup 50mb_test.dat
 50mb_plus1.dat
+
+# 交叉编译产物
+letshare-server-*
