@@ -21,6 +21,8 @@ const (
 	MessageTypeFileTransferStart    = "file:transfer:start"    // 开始传输
 	MessageTypeFileTransferChunk    = "file:transfer:chunk"    // 传输数据块(二进制)
 	MessageTypeFileTransferEnd      = "file:transfer:end"      // 传输完成
+	MessageTypeFileTransferComplete = "file:transfer:complete" // 接收方已完成文件组装
+	MessageTypeFileTransferResend   = "file:transfer:resend"   // 接收方请求重传缺失分片
 	MessageTypeFileTransferCancel   = "file:transfer:cancel"   // 取消传输
 	MessageTypeFileTransferError    = "file:transfer:error"    // 传输错误
 	MessageTypeFileTransferProgress = "file:transfer:progress" // 传输进度
@@ -117,16 +119,16 @@ func NewRoom(name string) *Room {
 
 // FileTransferRequest 文件传输请求信息
 type FileTransferRequest struct {
-	TransferID  string `json:"transfer_id"`            // 传输会话ID
-	FileName    string `json:"file_name"`              // 文件名
-	FileSize    int64  `json:"file_size"`              // 文件大小(字节)
-	FileType    string `json:"file_type"`              // 文件MIME类型
-	ChunkSize   int    `json:"chunk_size"`             // 分块大小(字节)
-	TotalChunks int    `json:"total_chunks"`           // 总块数
-	FromUserID  string `json:"from_user_id"`           // 发送者用户ID
-	ToUserID    string `json:"to_user_id"`             // 接收者用户ID
-	RoomName    string `json:"room_name"`              // 房间名称
-	AdminPass   string `json:"admin_pass,omitempty"`   // 管理员密码(超过基础限制时必需)
+	TransferID  string `json:"transfer_id"`          // 传输会话ID
+	FileName    string `json:"file_name"`            // 文件名
+	FileSize    int64  `json:"file_size"`            // 文件大小(字节)
+	FileType    string `json:"file_type"`            // 文件MIME类型
+	ChunkSize   int    `json:"chunk_size"`           // 分块大小(字节)
+	TotalChunks int    `json:"total_chunks"`         // 总块数
+	FromUserID  string `json:"from_user_id"`         // 发送者用户ID
+	ToUserID    string `json:"to_user_id"`           // 接收者用户ID
+	RoomName    string `json:"room_name"`            // 房间名称
+	AdminPass   string `json:"admin_pass,omitempty"` // 管理员密码(超过基础限制时必需)
 }
 
 // FileTransferChunk 文件数据块(用于二进制消息的元数据)

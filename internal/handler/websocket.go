@@ -246,6 +246,10 @@ func (h *WebSocketHandler) processMessage(client *model.Client, message *model.W
 		h.handleFileTransferStart(client, message)
 	case model.MessageTypeFileTransferEnd:
 		h.handleFileTransferEnd(client, message)
+	case model.MessageTypeFileTransferComplete:
+		h.handleFileTransferComplete(client, message)
+	case model.MessageTypeFileTransferResend:
+		h.handleFileTransferResend(client, message)
 	case model.MessageTypeFileTransferCancel:
 		h.handleFileTransferCancel(client, message)
 	default:
@@ -400,13 +404,13 @@ func (h *WebSocketHandler) processBinaryMessage(client *model.Client, data []byt
 		return
 	}
 
-	// 提取实际数据(跳过元数据部分)
+	// 提取实际数据(跳过元数据部分)，但转发时保留完整帧，接收端可直接按 transfer_id 定位会话
 	chunkData := data[256:]
-	h.handleFileChunk(client, &chunkMeta, chunkData)
+	h.handleFileChunk(client, &chunkMeta, chunkData, data)
 }
 
 // handleFileChunk 处理文件数据块
-func (h *WebSocketHandler) handleFileChunk(client *model.Client, chunkMeta *model.FileTransferChunk, chunkData []byte) {
+func (h *WebSocketHandler) handleFileChunk(client *model.Client, chunkMeta *model.FileTransferChunk, chunkData []byte, framedData []byte) {
 	logrus.WithFields(logrus.Fields{
 		"client_id":   client.ID,
 		"transfer_id": chunkMeta.TransferID,
@@ -435,7 +439,7 @@ func (h *WebSocketHandler) handleFileChunk(client *model.Client, chunkMeta *mode
 	}
 
 	// 转发数据块给接收者(零拷贝)
-	if err := h.fileTransferService.ForwardChunkToReceiver(chunkMeta.TransferID, chunkData, chunkMeta); err != nil {
+	if err := h.fileTransferService.ForwardChunkToReceiver(chunkMeta.TransferID, framedData, len(chunkData), chunkMeta); err != nil {
 		logrus.WithError(err).Error("转发文件数据块失败")
 		h.sendError(client, 500, "转发失败: "+err.Error())
 
@@ -642,10 +646,15 @@ func (h *WebSocketHandler) handleFileTransferEnd(client *model.Client, message *
 		return
 	}
 
-	// 更新会话状态
-	h.fileTransferService.UpdateSessionStatus(transferID, "completed")
+	// 验证发送者。END 只表示发送端已经发完字节，不能代表接收端已经组装成功。
+	if session.FromUserID != client.UserID {
+		h.sendError(client, 403, "无权结束此传输")
+		return
+	}
 
-	// 通知双方
+	h.fileTransferService.UpdateSessionStatus(transferID, "ending")
+
+	// 只通知接收者进入收尾校验；发送者必须等待接收方 COMPLETE。
 	endMsg := model.NewWebSocketMessage(
 		model.MessageTypeFileTransferEnd,
 		session.RoomName,
@@ -657,8 +666,55 @@ func (h *WebSocketHandler) handleFileTransferEnd(client *model.Client, message *
 		},
 	)
 
-	h.fileTransferService.SendMessageToUser(session.FromUserID, session.RoomName, endMsg)
 	h.fileTransferService.SendMessageToUser(session.ToUserID, session.RoomName, endMsg)
+
+	logrus.WithFields(logrus.Fields{
+		"transfer_id": transferID,
+		"file_name":   session.FileName,
+		"file_size":   session.FileSize,
+		"duration":    time.Since(session.StartTime).String(),
+	}).Info("文件传输发送端已结束，等待接收端确认")
+}
+
+// handleFileTransferComplete 处理接收方完成确认
+func (h *WebSocketHandler) handleFileTransferComplete(client *model.Client, message *model.WebSocketMessage) {
+	var data map[string]interface{}
+	if err := json.Unmarshal(message.Data, &data); err != nil {
+		h.sendError(client, 400, "数据格式错误")
+		return
+	}
+
+	transferID, ok := data["transfer_id"].(string)
+	if !ok {
+		h.sendError(client, 400, "缺少transfer_id")
+		return
+	}
+
+	session, err := h.fileTransferService.GetSession(transferID)
+	if err != nil {
+		h.sendError(client, 404, "传输会话不存在")
+		return
+	}
+
+	if session.ToUserID != client.UserID {
+		h.sendError(client, 403, "无权确认此传输")
+		return
+	}
+
+	h.fileTransferService.UpdateSessionStatus(transferID, "completed")
+
+	completeMsg := model.NewWebSocketMessage(
+		model.MessageTypeFileTransferComplete,
+		session.RoomName,
+		"",
+		map[string]interface{}{
+			"transfer_id": transferID,
+			"file_name":   session.FileName,
+			"file_size":   session.FileSize,
+		},
+	)
+
+	h.fileTransferService.SendMessageToUser(session.FromUserID, session.RoomName, completeMsg)
 
 	// 延迟清理会话
 	go func() {
@@ -671,7 +727,59 @@ func (h *WebSocketHandler) handleFileTransferEnd(client *model.Client, message *
 		"file_name":   session.FileName,
 		"file_size":   session.FileSize,
 		"duration":    time.Since(session.StartTime).String(),
-	}).Info("文件传输已完成")
+	}).Info("文件传输已由接收端确认完成")
+}
+
+// handleFileTransferResend 处理接收方请求重传缺失分片
+func (h *WebSocketHandler) handleFileTransferResend(client *model.Client, message *model.WebSocketMessage) {
+	var data map[string]interface{}
+	if err := json.Unmarshal(message.Data, &data); err != nil {
+		h.sendError(client, 400, "数据格式错误")
+		return
+	}
+
+	transferID, ok := data["transfer_id"].(string)
+	if !ok || transferID == "" {
+		h.sendError(client, 400, "缺少transfer_id")
+		return
+	}
+
+	session, err := h.fileTransferService.GetSession(transferID)
+	if err != nil {
+		h.sendError(client, 404, "传输会话不存在")
+		return
+	}
+
+	if session.ToUserID != client.UserID {
+		h.sendError(client, 403, "无权请求此传输重传")
+		return
+	}
+
+	if session.Status == "completed" || session.Status == "cancelled" || session.Status == "error" {
+		h.sendError(client, 400, "传输会话状态错误: "+session.Status)
+		return
+	}
+
+	// 重传请求到达后允许发送端继续发送缺失分片。
+	h.fileTransferService.UpdateSessionStatus(transferID, "transferring")
+
+	resendMsg := model.NewWebSocketMessage(
+		model.MessageTypeFileTransferResend,
+		session.RoomName,
+		"",
+		data,
+	)
+
+	if err := h.fileTransferService.SendMessageToUser(session.FromUserID, session.RoomName, resendMsg); err != nil {
+		h.sendError(client, 404, "找不到发送者")
+		return
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"transfer_id": transferID,
+		"from":        session.ToUserID,
+		"to":          session.FromUserID,
+	}).Info("已转发文件分片重传请求")
 }
 
 // handleFileTransferCancel 处理取消文件传输

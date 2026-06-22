@@ -31,6 +31,7 @@ const (
 	MessageTypeFileTransferStart    = "file:transfer:start"
 	MessageTypeFileTransferChunk    = "file:transfer:chunk"
 	MessageTypeFileTransferEnd      = "file:transfer:end"
+	MessageTypeFileTransferComplete = "file:transfer:complete"
 	MessageTypeFileTransferProgress = "file:transfer:progress"
 )
 
@@ -576,4 +577,3 @@ func main() {
 	<-interrupt
 	log.Println("\n正在关闭连接...")
 }
-

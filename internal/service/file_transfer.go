@@ -72,6 +72,9 @@ func (fts *FileTransferService) CreateTransferSession(request *model.FileTransfe
 	if request.FileSize%int64(request.ChunkSize) != 0 {
 		totalChunks++
 	}
+	if totalChunks == 0 {
+		totalChunks = 1
+	}
 	request.TotalChunks = totalChunks
 
 	// 创建会话
@@ -166,8 +169,8 @@ func (fts *FileTransferService) RemoveSession(transferID string) {
 	logrus.WithField("transfer_id", transferID).Info("移除文件传输会话")
 }
 
-// ForwardChunkToReceiver 转发数据块给接收者(零拷贝转发)
-func (fts *FileTransferService) ForwardChunkToReceiver(transferID string, chunkData []byte, chunkMeta *model.FileTransferChunk) error {
+// ForwardChunkToReceiver 转发数据块给接收者(保留前端二进制帧头，接收端可直接按 transfer_id 定位)
+func (fts *FileTransferService) ForwardChunkToReceiver(transferID string, framedChunkData []byte, chunkDataSize int, chunkMeta *model.FileTransferChunk) error {
 	session, err := fts.GetSession(transferID)
 	if err != nil {
 		return err
@@ -184,14 +187,6 @@ func (fts *FileTransferService) ForwardChunkToReceiver(transferID string, chunkD
 		return fmt.Errorf("找不到接收者: %w", err)
 	}
 
-	// 发送元数据(JSON格式)
-	metaMsg := model.NewWebSocketMessage(
-		model.MessageTypeFileTransferChunk,
-		session.RoomName,
-		"",
-		chunkMeta,
-	)
-
 	conn, ok := receiverClient.Connection.(*websocket.Conn)
 	if !ok {
 		return fmt.Errorf("无效的WebSocket连接")
@@ -200,13 +195,8 @@ func (fts *FileTransferService) ForwardChunkToReceiver(transferID string, chunkD
 	receiverClient.ConnMutex.Lock()
 	defer receiverClient.ConnMutex.Unlock()
 
-	// 先发送JSON元数据
-	if err := conn.WriteJSON(metaMsg); err != nil {
-		return fmt.Errorf("发送块元数据失败: %w", err)
-	}
-
-	// 再发送二进制数据(零拷贝转发)
-	if err := conn.WriteMessage(websocket.BinaryMessage, chunkData); err != nil {
+	// 发送带帧头的二进制数据，避免接收端依赖“上一条元数据属于下一条二进制”的状态配对
+	if err := conn.WriteMessage(websocket.BinaryMessage, framedChunkData); err != nil {
 		return fmt.Errorf("转发数据块失败: %w", err)
 	}
 
@@ -216,13 +206,18 @@ func (fts *FileTransferService) ForwardChunkToReceiver(transferID string, chunkD
 		bytesTransferred = session.FileSize
 	}
 
+	percentage := 100.0
+	if session.FileSize > 0 {
+		percentage = float64(bytesTransferred) / float64(session.FileSize) * 100
+	}
+
 	progress := &model.FileTransferProgress{
 		TransferID:       transferID,
 		ChunkIndex:       chunkMeta.ChunkIndex,
 		TotalChunks:      chunkMeta.TotalChunks,
 		BytesTransferred: bytesTransferred,
 		TotalBytes:       session.FileSize,
-		Percentage:       float64(bytesTransferred) / float64(session.FileSize) * 100,
+		Percentage:       percentage,
 	}
 
 	fts.sendProgressUpdate(session, progress)
@@ -230,7 +225,7 @@ func (fts *FileTransferService) ForwardChunkToReceiver(transferID string, chunkD
 	logrus.WithFields(logrus.Fields{
 		"transfer_id": transferID,
 		"chunk_index": chunkMeta.ChunkIndex,
-		"chunk_size":  len(chunkData),
+		"chunk_size":  chunkDataSize,
 		"progress":    fmt.Sprintf("%.2f%%", progress.Percentage),
 	}).Debug("转发文件数据块")
 
