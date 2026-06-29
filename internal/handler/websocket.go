@@ -536,7 +536,7 @@ func (h *WebSocketHandler) handleFileTransferAccept(client *model.Client, messag
 	}
 
 	// 更新会话状态
-	h.fileTransferService.UpdateSessionStatus(transferID, "accepted")
+	h.fileTransferService.UpdateSessionStatus(transferID, "pending", "accepted")
 	h.fileTransferService.UpdateSessionClients(transferID, session.FromClientID, client.ID)
 
 	// 通知发送者
@@ -581,7 +581,7 @@ func (h *WebSocketHandler) handleFileTransferReject(client *model.Client, messag
 	}
 
 	// 更新会话状态
-	h.fileTransferService.UpdateSessionStatus(transferID, "rejected")
+	h.fileTransferService.UpdateSessionStatus(transferID, "pending", "rejected")
 
 	// 通知发送者
 	rejectMsg := model.NewWebSocketMessage(
@@ -635,7 +635,7 @@ func (h *WebSocketHandler) handleFileTransferStart(client *model.Client, message
 	}
 
 	// 更新会话状态
-	h.fileTransferService.UpdateSessionStatus(transferID, "transferring")
+	h.fileTransferService.UpdateSessionStatus(transferID, session.Status, "transferring")
 
 	// 通知接收者
 	startMsg := model.NewWebSocketMessage(
@@ -687,7 +687,7 @@ func (h *WebSocketHandler) handleFileTransferEnd(client *model.Client, message *
 		return
 	}
 
-	h.fileTransferService.UpdateSessionStatus(transferID, "ending")
+	h.fileTransferService.UpdateSessionStatus(transferID, session.Status, "ending")
 
 	// 只通知接收者进入收尾校验；发送者必须等待接收方 COMPLETE。
 	endMsg := model.NewWebSocketMessage(
@@ -742,7 +742,7 @@ func (h *WebSocketHandler) handleFileTransferComplete(client *model.Client, mess
 		return
 	}
 
-	h.fileTransferService.UpdateSessionStatus(transferID, "completed")
+	h.fileTransferService.UpdateSessionStatus(transferID, "ending", "completed")
 
 	completeMsg := model.NewWebSocketMessage(
 		model.MessageTypeFileTransferComplete,
@@ -803,7 +803,7 @@ func (h *WebSocketHandler) handleFileTransferResend(client *model.Client, messag
 	}
 
 	// 重传请求到达后进入 resending 恢复模式，等待发送端确认后回到 transferring。
-	h.fileTransferService.UpdateSessionStatus(transferID, "resending")
+	h.fileTransferService.UpdateSessionStatus(transferID, "ending", "resending")
 
 	resendMsg := model.NewWebSocketMessage(
 		model.MessageTypeFileTransferResend,
@@ -813,6 +813,11 @@ func (h *WebSocketHandler) handleFileTransferResend(client *model.Client, messag
 	)
 
 	if err := h.fileTransferService.SendMessageToUser(session.FromUserID, session.RoomName, resendMsg); err != nil {
+		h.fileTransferService.UpdateSessionStatus(transferID, "", "error")
+		go func() {
+			time.Sleep(5 * time.Second)
+			h.fileTransferService.RemoveSession(transferID)
+		}()
 		h.sendError(client, 404, "找不到发送者")
 		return
 	}
@@ -851,7 +856,7 @@ func (h *WebSocketHandler) handleFileTransferCancel(client *model.Client, messag
 	}
 
 	// 更新会话状态
-	h.fileTransferService.UpdateSessionStatus(transferID, "cancelled")
+	h.fileTransferService.UpdateSessionStatus(transferID, session.Status, "cancelled")
 
 	// 通知对方
 	cancelMsg := model.NewWebSocketMessage(
@@ -879,7 +884,7 @@ func (h *WebSocketHandler) handleFileTransferCancel(client *model.Client, messag
 
 // notifyTransferError 通知传输错误
 func (h *WebSocketHandler) notifyTransferError(session *model.FileTransferSession, errMsg string) {
-	h.fileTransferService.UpdateSessionStatus(session.TransferID, "error")
+	h.fileTransferService.UpdateSessionStatus(session.TransferID, "", "error")
 
 	errorMsg := model.NewWebSocketMessage(
 		model.MessageTypeFileTransferError,

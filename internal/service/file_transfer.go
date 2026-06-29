@@ -123,7 +123,8 @@ func (fts *FileTransferService) GetSession(transferID string) (*model.FileTransf
 }
 
 // UpdateSessionStatus 更新会话状态
-func (fts *FileTransferService) UpdateSessionStatus(transferID, status string) error {
+// expectedStatus 为空时跳过 CAS 检查（best-effort），否则仅在当前状态匹配时才更新
+func (fts *FileTransferService) UpdateSessionStatus(transferID, expectedStatus, newStatus string) error {
 	fts.sessionsMutex.Lock()
 	defer fts.sessionsMutex.Unlock()
 
@@ -132,12 +133,16 @@ func (fts *FileTransferService) UpdateSessionStatus(transferID, status string) e
 		return fmt.Errorf("传输会话不存在: %s", transferID)
 	}
 
-	session.Status = status
+	if expectedStatus != "" && session.Status != expectedStatus {
+		return fmt.Errorf("传输会话状态已变更: 期望 %s, 实际 %s", expectedStatus, session.Status)
+	}
+
+	session.Status = newStatus
 	session.LastActivity = time.Now()
 
 	logrus.WithFields(logrus.Fields{
 		"transfer_id": transferID,
-		"status":      status,
+		"status":      newStatus,
 	}).Debug("更新传输会话状态")
 
 	return nil
@@ -159,53 +164,68 @@ func (fts *FileTransferService) UpdateSessionClients(transferID, fromClientID, t
 	return nil
 }
 
-// HandleClientDisconnect 处理客户端断开连接，清理该客户端作为发送方的活跃传输会话
+// HandleClientDisconnect 处理客户端断开连接，清理该客户端作为发送方或接收方的活跃传输会话
 func (fts *FileTransferService) HandleClientDisconnect(clientID string) {
 	// 先收集受影响的会话信息，避免锁内发送消息
 	type sessionInfo struct {
-		transferID string
-		roomName   string
-		toUserID   string
+		transferID   string
+		roomName     string
+		notifyUserID string
+		errorText    string
+		logText      string
 	}
 
 	fts.sessionsMutex.Lock()
 	var affectedSessions []sessionInfo
 	for transferID, session := range fts.sessions {
+		// 只处理非终端状态的会话
+		if session.Status == "completed" || session.Status == "cancelled" ||
+			session.Status == "error" || session.Status == "rejected" {
+			continue
+		}
+
 		if session.FromClientID == clientID {
-			// 只处理非终端状态的会话
-			if session.Status != "completed" && session.Status != "cancelled" &&
-				session.Status != "error" && session.Status != "rejected" {
-				session.Status = "error"
-				session.LastActivity = time.Now()
-				affectedSessions = append(affectedSessions, sessionInfo{
-					transferID: transferID,
-					roomName:   session.RoomName,
-					toUserID:   session.ToUserID,
-				})
-			}
+			session.Status = "error"
+			session.LastActivity = time.Now()
+			affectedSessions = append(affectedSessions, sessionInfo{
+				transferID:   transferID,
+				roomName:     session.RoomName,
+				notifyUserID: session.ToUserID,
+				errorText:    "发送者已断开连接",
+				logText:      "发送者断开，已通知接收者并标记传输错误",
+			})
+		} else if session.ToClientID == clientID {
+			session.Status = "error"
+			session.LastActivity = time.Now()
+			affectedSessions = append(affectedSessions, sessionInfo{
+				transferID:   transferID,
+				roomName:     session.RoomName,
+				notifyUserID: session.FromUserID,
+				errorText:    "接收者已断开连接",
+				logText:      "接收者断开，已通知发送者并标记传输错误",
+			})
 		}
 	}
 	fts.sessionsMutex.Unlock()
 
 	for _, s := range affectedSessions {
-		// 通知接收者发送方已断开
 		errorMsg := model.NewWebSocketMessage(
 			model.MessageTypeFileTransferError,
 			s.roomName,
 			"",
 			map[string]interface{}{
 				"transfer_id": s.transferID,
-				"error":       "发送者已断开连接",
+				"error":       s.errorText,
 			},
 		)
-		fts.SendMessageToUser(s.toUserID, s.roomName, errorMsg)
+		fts.SendMessageToUser(s.notifyUserID, s.roomName, errorMsg)
 
 		logrus.WithFields(logrus.Fields{
 			"transfer_id": s.transferID,
 			"client_id":   clientID,
-		}).Info("发送者断开，已通知接收者并标记传输错误")
+		}).Info(s.logText)
 
-		// 延迟清理会话，给接收者时间处理错误消息
+		// 延迟清理会话，给对方时间处理错误消息
 		go func(tid string) {
 			time.Sleep(5 * time.Second)
 			fts.RemoveSession(tid)
