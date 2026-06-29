@@ -165,5 +165,5 @@ type FileTransferSession struct {
 	TotalChunks  int
 	StartTime    time.Time
 	LastActivity time.Time
-	Status       string // "pending", "accepted", "transferring", "completed", "cancelled", "error"
+	Status       string // "pending", "accepted", "rejected", "transferring", "resending", "ending", "completed", "cancelled", "error"
 }

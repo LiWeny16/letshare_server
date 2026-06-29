@@ -159,6 +159,60 @@ func (fts *FileTransferService) UpdateSessionClients(transferID, fromClientID, t
 	return nil
 }
 
+// HandleClientDisconnect 处理客户端断开连接，清理该客户端作为发送方的活跃传输会话
+func (fts *FileTransferService) HandleClientDisconnect(clientID string) {
+	// 先收集受影响的会话信息，避免锁内发送消息
+	type sessionInfo struct {
+		transferID string
+		roomName   string
+		toUserID   string
+	}
+
+	fts.sessionsMutex.Lock()
+	var affectedSessions []sessionInfo
+	for transferID, session := range fts.sessions {
+		if session.FromClientID == clientID {
+			// 只处理非终端状态的会话
+			if session.Status != "completed" && session.Status != "cancelled" &&
+				session.Status != "error" && session.Status != "rejected" {
+				session.Status = "error"
+				session.LastActivity = time.Now()
+				affectedSessions = append(affectedSessions, sessionInfo{
+					transferID: transferID,
+					roomName:   session.RoomName,
+					toUserID:   session.ToUserID,
+				})
+			}
+		}
+	}
+	fts.sessionsMutex.Unlock()
+
+	for _, s := range affectedSessions {
+		// 通知接收者发送方已断开
+		errorMsg := model.NewWebSocketMessage(
+			model.MessageTypeFileTransferError,
+			s.roomName,
+			"",
+			map[string]interface{}{
+				"transfer_id": s.transferID,
+				"error":       "发送者已断开连接",
+			},
+		)
+		fts.SendMessageToUser(s.toUserID, s.roomName, errorMsg)
+
+		logrus.WithFields(logrus.Fields{
+			"transfer_id": s.transferID,
+			"client_id":   clientID,
+		}).Info("发送者断开，已通知接收者并标记传输错误")
+
+		// 延迟清理会话，给接收者时间处理错误消息
+		go func(tid string) {
+			time.Sleep(5 * time.Second)
+			fts.RemoveSession(tid)
+		}(s.transferID)
+	}
+}
+
 // RemoveSession 移除传输会话
 func (fts *FileTransferService) RemoveSession(transferID string) {
 	fts.sessionsMutex.Lock()
@@ -306,23 +360,52 @@ func (fts *FileTransferService) startSessionCleanup() {
 
 // cleanupStaleSessions 清理过期会话
 func (fts *FileTransferService) cleanupStaleSessions() {
-	fts.sessionsMutex.Lock()
-	defer fts.sessionsMutex.Unlock()
-
 	timeout := 10 * time.Minute
 	now := time.Now()
-	var staleTransferIDs []string
 
+	// 收集过期会话信息（避免锁内发送消息）
+	type staleInfo struct {
+		transferID string
+		roomName   string
+		fromUserID string
+		toUserID   string
+	}
+
+	fts.sessionsMutex.Lock()
+	var staleSessions []staleInfo
 	for transferID, session := range fts.sessions {
 		// 清理超过10分钟无活动的会话
 		if now.Sub(session.LastActivity) > timeout {
-			staleTransferIDs = append(staleTransferIDs, transferID)
+			staleSessions = append(staleSessions, staleInfo{
+				transferID: transferID,
+				roomName:   session.RoomName,
+				fromUserID: session.FromUserID,
+				toUserID:   session.ToUserID,
+			})
 		}
 	}
+	fts.sessionsMutex.Unlock()
 
-	for _, transferID := range staleTransferIDs {
-		delete(fts.sessions, transferID)
-		logrus.WithField("transfer_id", transferID).Info("清理过期传输会话")
+	for _, s := range staleSessions {
+		// 通知客户端会话已过期
+		errorMsg := model.NewWebSocketMessage(
+			model.MessageTypeFileTransferError,
+			s.roomName,
+			"",
+			map[string]interface{}{
+				"transfer_id": s.transferID,
+				"error":       "传输会话超时",
+			},
+		)
+		fts.SendMessageToUser(s.fromUserID, s.roomName, errorMsg)
+		fts.SendMessageToUser(s.toUserID, s.roomName, errorMsg)
+
+		// 删除会话
+		fts.sessionsMutex.Lock()
+		delete(fts.sessions, s.transferID)
+		fts.sessionsMutex.Unlock()
+
+		logrus.WithField("transfer_id", s.transferID).Info("清理过期传输会话")
 	}
 }
 

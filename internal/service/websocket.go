@@ -13,12 +13,13 @@ import (
 )
 
 type WebSocketService struct {
-	clients      map[string]*model.Client // clientID -> Client
-	rooms        map[string]*model.Room   // roomName -> Room
-	clientsMutex sync.RWMutex
-	roomsMutex   sync.RWMutex
-	maxRoomUsers int
-	roomService  *RoomService
+	clients            map[string]*model.Client // clientID -> Client
+	rooms              map[string]*model.Room   // roomName -> Room
+	clientsMutex       sync.RWMutex
+	roomsMutex         sync.RWMutex
+	maxRoomUsers       int
+	roomService        *RoomService
+	onClientDisconnect func(clientID string) // 客户端断开时的回调钩子
 }
 
 func NewWebSocketService(maxRoomUsers int) *WebSocketService {
@@ -33,6 +34,11 @@ func NewWebSocketService(maxRoomUsers int) *WebSocketService {
 	go ws.startMaintenance()
 
 	return ws
+}
+
+// SetOnClientDisconnect 注册客户端断开连接的回调钩子
+func (ws *WebSocketService) SetOnClientDisconnect(handler func(clientID string)) {
+	ws.onClientDisconnect = handler
 }
 
 // AddClient 添加新客户端
@@ -91,6 +97,11 @@ func (ws *WebSocketService) cleanupClientResources(client *model.Client) {
 	client.Events = nil
 	client.Connection = nil
 	client.Metadata = nil
+
+	// 通知文件传输等下游服务：该客户端已断开
+	if ws.onClientDisconnect != nil {
+		ws.onClientDisconnect(client.ID)
+	}
 }
 
 // GetClient 获取客户端

@@ -40,11 +40,18 @@ type WebSocketHandler struct {
 }
 
 func NewWebSocketHandler(wsService *service.WebSocketService, authService *service.AuthService, fileTransferService *service.FileTransferService) *WebSocketHandler {
-	return &WebSocketHandler{
+	handler := &WebSocketHandler{
 		wsService:           wsService,
 		authService:         authService,
 		fileTransferService: fileTransferService,
 	}
+
+	// 注册客户端断开回调：当 WebSocket 客户端断开时，清理其作为发送方的文件传输会话
+	wsService.SetOnClientDisconnect(func(clientID string) {
+		fileTransferService.HandleClientDisconnect(clientID)
+	})
+
+	return handler
 }
 
 // HandleWebSocket 处理WebSocket连接
@@ -522,6 +529,12 @@ func (h *WebSocketHandler) handleFileTransferAccept(client *model.Client, messag
 		return
 	}
 
+	// 验证状态转换合法性
+	if session.Status != "pending" {
+		h.sendError(client, 400, "传输会话状态错误，无法接受: "+session.Status)
+		return
+	}
+
 	// 更新会话状态
 	h.fileTransferService.UpdateSessionStatus(transferID, "accepted")
 	h.fileTransferService.UpdateSessionClients(transferID, session.FromClientID, client.ID)
@@ -558,6 +571,12 @@ func (h *WebSocketHandler) handleFileTransferReject(client *model.Client, messag
 	session, err := h.fileTransferService.GetSession(transferID)
 	if err != nil {
 		h.sendError(client, 404, "传输会话不存在")
+		return
+	}
+
+	// 验证状态转换合法性
+	if session.Status != "pending" {
+		h.sendError(client, 400, "传输会话状态错误，无法拒绝: "+session.Status)
 		return
 	}
 
@@ -609,6 +628,12 @@ func (h *WebSocketHandler) handleFileTransferStart(client *model.Client, message
 		return
 	}
 
+	// 验证状态转换合法性
+	if session.Status != "accepted" && session.Status != "resending" {
+		h.sendError(client, 400, "传输会话状态错误，无法开始传输: "+session.Status)
+		return
+	}
+
 	// 更新会话状态
 	h.fileTransferService.UpdateSessionStatus(transferID, "transferring")
 
@@ -653,6 +678,12 @@ func (h *WebSocketHandler) handleFileTransferEnd(client *model.Client, message *
 	// 验证发送者。END 只表示发送端已经发完字节，不能代表接收端已经组装成功。
 	if session.FromUserID != client.UserID {
 		h.sendError(client, 403, "无权结束此传输")
+		return
+	}
+
+	// 验证状态转换合法性
+	if session.Status != "transferring" && session.Status != "resending" {
+		h.sendError(client, 400, "传输会话状态错误，无法结束传输: "+session.Status)
 		return
 	}
 
@@ -702,6 +733,12 @@ func (h *WebSocketHandler) handleFileTransferComplete(client *model.Client, mess
 
 	if session.ToUserID != client.UserID {
 		h.sendError(client, 403, "无权确认此传输")
+		return
+	}
+
+	// 验证状态转换合法性
+	if session.Status != "ending" {
+		h.sendError(client, 400, "传输会话状态错误，无法确认完成: "+session.Status)
 		return
 	}
 
@@ -759,13 +796,14 @@ func (h *WebSocketHandler) handleFileTransferResend(client *model.Client, messag
 		return
 	}
 
-	if session.Status == "completed" || session.Status == "cancelled" || session.Status == "error" {
-		h.sendError(client, 400, "传输会话状态错误: "+session.Status)
+	// 验证状态转换合法性 — 只允许从 ending 进入 resending 恢复模式
+	if session.Status != "ending" {
+		h.sendError(client, 400, "传输会话状态错误，无法请求重传: "+session.Status)
 		return
 	}
 
-	// 重传请求到达后允许发送端继续发送缺失分片。
-	h.fileTransferService.UpdateSessionStatus(transferID, "transferring")
+	// 重传请求到达后进入 resending 恢复模式，等待发送端确认后回到 transferring。
+	h.fileTransferService.UpdateSessionStatus(transferID, "resending")
 
 	resendMsg := model.NewWebSocketMessage(
 		model.MessageTypeFileTransferResend,
@@ -803,6 +841,12 @@ func (h *WebSocketHandler) handleFileTransferCancel(client *model.Client, messag
 	session, err := h.fileTransferService.GetSession(transferID)
 	if err != nil {
 		h.sendError(client, 404, "传输会话不存在")
+		return
+	}
+
+	// 验证状态转换合法性 — 终端状态不可取消
+	if session.Status == "completed" || session.Status == "cancelled" || session.Status == "error" || session.Status == "rejected" {
+		h.sendError(client, 400, "传输会话已结束，无法取消: "+session.Status)
 		return
 	}
 
@@ -849,4 +893,10 @@ func (h *WebSocketHandler) notifyTransferError(session *model.FileTransferSessio
 
 	h.fileTransferService.SendMessageToUser(session.FromUserID, session.RoomName, errorMsg)
 	h.fileTransferService.SendMessageToUser(session.ToUserID, session.RoomName, errorMsg)
+
+	// 延迟清理会话，给客户端时间处理错误消息
+	go func() {
+		time.Sleep(5 * time.Second)
+		h.fileTransferService.RemoveSession(session.TransferID)
+	}()
 }
