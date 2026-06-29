@@ -176,8 +176,12 @@ func (fts *FileTransferService) ForwardChunkToReceiver(transferID string, framed
 		return err
 	}
 
-	// 更新会话活动时间
+	// 更新会话活动时间，同时验证会话未被并发删除
 	fts.sessionsMutex.Lock()
+	if _, stillExists := fts.sessions[transferID]; !stillExists {
+		fts.sessionsMutex.Unlock()
+		return fmt.Errorf("传输会话已被取消: %s", transferID)
+	}
 	session.LastActivity = time.Now()
 	fts.sessionsMutex.Unlock()
 
@@ -192,15 +196,16 @@ func (fts *FileTransferService) ForwardChunkToReceiver(transferID string, framed
 		return fmt.Errorf("无效的WebSocket连接")
 	}
 
+	// 发送二进制帧给接收者。锁必须在此释放，
+	// 因为后续 sendProgressUpdate → sendToClient 会对同一接收方再次加锁。
 	receiverClient.ConnMutex.Lock()
-	defer receiverClient.ConnMutex.Unlock()
-
-	// 发送带帧头的二进制数据，避免接收端依赖“上一条元数据属于下一条二进制”的状态配对
-	if err := conn.WriteMessage(websocket.BinaryMessage, framedChunkData); err != nil {
-		return fmt.Errorf("转发数据块失败: %w", err)
+	writeErr := conn.WriteMessage(websocket.BinaryMessage, framedChunkData)
+	receiverClient.ConnMutex.Unlock()
+	if writeErr != nil {
+		return fmt.Errorf("转发数据块失败: %w", writeErr)
 	}
 
-	// 发送进度更新给发送者
+	// 发送进度更新给发送者（锁已释放，安全）
 	bytesTransferred := int64(chunkMeta.ChunkIndex+1) * int64(session.ChunkSize)
 	if bytesTransferred > session.FileSize {
 		bytesTransferred = session.FileSize

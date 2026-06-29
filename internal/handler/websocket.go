@@ -16,7 +16,11 @@ import (
 )
 
 // wsWriteBufferPool 共享写缓冲池，50个连接共用而非各自占 64KB
-var wsWriteBufferPool = &sync.Pool{}
+var wsWriteBufferPool = &sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 65536)
+	},
+}
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
@@ -122,7 +126,7 @@ func (h *WebSocketHandler) HandleWebSocket(c *gin.Context) {
 	defer ticker.Stop()
 
 	// 启动消息处理goroutine
-	done := make(chan struct{})
+	done := make(chan struct{}, 1)
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
