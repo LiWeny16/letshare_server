@@ -277,9 +277,6 @@ func (ws *WebSocketService) sendToClient(client *model.Client, message *model.We
 		return
 	}
 
-	// 使用 defer recover 防止 panic，同时确保 ConnMutex 始终被释放。
-	// RemoveClient 必须在锁外调用，因为 cleanupClientResources → conn.Close()
-	// 可能会尝试获取 gorilla/websocket 内部的 writeMu。
 	var writeErr error
 	func() {
 		client.ConnMutex.Lock()
@@ -293,18 +290,18 @@ func (ws *WebSocketService) sendToClient(client *model.Client, message *model.We
 				writeErr = fmt.Errorf("panic during write: %v", r)
 			}
 		}()
+		// 写超时：防阻塞，15s 容忍 3Mbps + 移动网络延迟
+		conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
 		writeErr = conn.WriteJSON(message)
 	}()
 
 	if writeErr != nil {
-		// 只在非正常关闭时记录警告
 		if !websocket.IsCloseError(writeErr, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 			logrus.WithFields(logrus.Fields{
 				"client_id": client.ID,
 				"error":     writeErr.Error(),
-			}).Debug("发送消息失败，连接可能已关闭")
+			}).Warn("发送消息失败，移除客户端")
 		}
-		// 连接出错，移除客户端
 		ws.RemoveClient(client.ID)
 	}
 }

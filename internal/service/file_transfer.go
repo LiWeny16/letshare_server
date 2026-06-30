@@ -333,15 +333,40 @@ func (fts *FileTransferService) SendMessageToUser(userID, roomName string, messa
 	return nil
 }
 
-// findClientByUserID 在房间中查找用户的客户端
+// findClientByUserID 在房间中查找用户的客户端(最多重试3次,移动网络下客户端可能延迟注册)
 func (fts *FileTransferService) findClientByUserID(userID, roomName string) (*model.Client, error) {
-	// 遍历所有客户端,查找匹配的用户ID和房间
-	fts.wsService.clientsMutex.RLock()
-	defer fts.wsService.clientsMutex.RUnlock()
+	for attempt := 0; attempt < 3; attempt++ {
+		fts.wsService.clientsMutex.RLock()
+		var found *model.Client
+		var clientsSnapshot []string
+		for _, client := range fts.wsService.clients {
+			if client.UserID == userID {
+				clientsSnapshot = append(clientsSnapshot, fmt.Sprintf("%s(rooms=%v,status=connected)", client.ID, client.Rooms))
+				if client.Rooms[roomName] {
+					found = client
+				}
+			}
+		}
+		fts.wsService.clientsMutex.RUnlock()
 
-	for _, client := range fts.wsService.clients {
-		if client.UserID == userID && client.Rooms[roomName] {
-			return client, nil
+		if found != nil {
+			return found, nil
+		}
+
+		if attempt < 2 {
+			logrus.WithFields(logrus.Fields{
+				"user_id":  userID,
+				"room":     roomName,
+				"attempt":  attempt + 1,
+				"clients":  clientsSnapshot,
+			}).Warn("找不到接收者，100ms后重试")
+			time.Sleep(100 * time.Millisecond)
+		} else {
+			logrus.WithFields(logrus.Fields{
+				"user_id": userID,
+				"room":    roomName,
+				"clients": clientsSnapshot,
+			}).Warn("找不到接收者(已重试3次)")
 		}
 	}
 

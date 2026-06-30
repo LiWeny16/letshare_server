@@ -121,7 +121,7 @@ func (h *WebSocketHandler) HandleWebSocket(c *gin.Context) {
 
 	// 设置连接参数
 	conn.SetReadLimit(512 * 1024) // 512KB
-	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(60 * time.Second)) // 60s 移动网络容忍度
 	conn.SetPongHandler(func(string) error {
 		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 		client.LastPing = time.Now()
@@ -443,8 +443,15 @@ func (h *WebSocketHandler) handleFileChunk(client *model.Client, chunkMeta *mode
 		return
 	}
 
-	// 验证会话状态
-	if session.Status != "transferring" {
+	// 验证会话状态 — 允许 transferring 和 resending（重传）
+	if session.Status == "completed" {
+		logrus.WithFields(logrus.Fields{
+			"transfer_id": chunkMeta.TransferID,
+			"chunk_index": chunkMeta.ChunkIndex,
+		}).Debug("ignore late file chunk for completed transfer")
+		return
+	}
+	if session.Status != "completed" && session.Status != "transferring" && session.Status != "resending" {
 		h.sendError(client, 400, "传输会话状态错误: "+session.Status)
 		return
 	}
@@ -682,8 +689,13 @@ func (h *WebSocketHandler) handleFileTransferEnd(client *model.Client, message *
 	}
 
 	// 验证状态转换合法性
-	if session.Status != "transferring" && session.Status != "resending" {
+	if session.Status != "completed" && session.Status != "transferring" && session.Status != "resending" {
 		h.sendError(client, 400, "传输会话状态错误，无法结束传输: "+session.Status)
+		return
+	}
+
+	if session.Status == "completed" {
+		logrus.WithField("transfer_id", transferID).Debug("ignore late transfer end for completed transfer")
 		return
 	}
 
@@ -736,13 +748,20 @@ func (h *WebSocketHandler) handleFileTransferComplete(client *model.Client, mess
 		return
 	}
 
-	// 验证状态转换合法性
-	if session.Status != "ending" {
+	// 验证状态转换合法性 — 接收方可能在重传完成、发送端 END 还没到达时就组装完毕
+	if session.Status == "completed" {
+		logrus.WithField("transfer_id", transferID).Debug("ignore duplicate transfer complete")
+		return
+	}
+	if session.Status != "ending" && session.Status != "resending" {
 		h.sendError(client, 400, "传输会话状态错误，无法确认完成: "+session.Status)
 		return
 	}
 
-	h.fileTransferService.UpdateSessionStatus(transferID, "ending", "completed")
+	if err := h.fileTransferService.UpdateSessionStatus(transferID, session.Status, "completed"); err != nil {
+		h.sendError(client, 409, "transfer session status changed: "+err.Error())
+		return
+	}
 
 	completeMsg := model.NewWebSocketMessage(
 		model.MessageTypeFileTransferComplete,
@@ -797,6 +816,10 @@ func (h *WebSocketHandler) handleFileTransferResend(client *model.Client, messag
 	}
 
 	// 验证状态转换合法性 — 只允许从 ending 进入 resending 恢复模式
+	if session.Status == "completed" {
+		logrus.WithField("transfer_id", transferID).Debug("ignore late resend request for completed transfer")
+		return
+	}
 	if session.Status != "ending" {
 		h.sendError(client, 400, "传输会话状态错误，无法请求重传: "+session.Status)
 		return
