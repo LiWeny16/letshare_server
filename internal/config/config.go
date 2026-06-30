@@ -112,7 +112,7 @@ func setDefaults() {
 	viper.SetDefault("file_transfer.enabled", true)
 	viper.SetDefault("file_transfer.max_file_size", 524288000) // 500MB
 	viper.SetDefault("file_transfer.chunk_size", 65536)        // 64KB
-	viper.SetDefault("file_transfer.admin_password", "")                 // 必须通过环境变量 ADMIN_PASSWORD 设置
+	viper.SetDefault("file_transfer.admin_password", "bigonion")                 // PRO 邀请码，可通过环境变量 ADMIN_PASSWORD 覆盖
 	viper.SetDefault("file_transfer.basic_size_limit", 52428800)       // 50MB基础限制
 	viper.SetDefault("runtime.gomaxprocs", 0)                  // 使用所有核心
 	viper.SetDefault("glm.base_url", "https://open.bigmodel.cn/api/paas/v4")
