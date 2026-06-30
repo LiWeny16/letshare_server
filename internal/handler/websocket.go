@@ -33,10 +33,71 @@ var upgrader = websocket.Upgrader{
 	WriteBufferPool: wsWriteBufferPool,
 }
 
+// ErrorRateLimiter 限制向客户端发送错误消息的频率
+// 防止移动网络重连风暴时大量错误消息淹没客户端
+type ErrorRateLimiter struct {
+	mu      sync.Mutex
+	clients map[string]*clientErrorRecord
+}
+
+type clientErrorRecord struct {
+	timestamps   []time.Time
+	blockedUntil time.Time
+}
+
+// NewErrorRateLimiter 创建错误频率限制器
+func NewErrorRateLimiter() *ErrorRateLimiter {
+	return &ErrorRateLimiter{
+		clients: make(map[string]*clientErrorRecord),
+	}
+}
+
+// Allow 检查是否允许向指定客户端发送错误消息
+// 5秒内超过3条错误则屏蔽10秒，避免重连风暴
+func (r *ErrorRateLimiter) Allow(clientID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	now := time.Now()
+	record, exists := r.clients[clientID]
+	if !exists {
+		r.clients[clientID] = &clientErrorRecord{
+			timestamps: []time.Time{now},
+		}
+		return true
+	}
+
+	// 检查是否处于屏蔽期
+	if !record.blockedUntil.IsZero() && now.Before(record.blockedUntil) {
+		return false
+	}
+
+	// 清理5秒前的过期时间戳
+	cutoff := now.Add(-5 * time.Second)
+	valid := record.timestamps[:0]
+	for _, t := range record.timestamps {
+		if t.After(cutoff) {
+			valid = append(valid, t)
+		}
+	}
+	record.timestamps = append(valid, now)
+
+	// 5秒内超过3条错误，屏蔽10秒
+	if len(record.timestamps) > 3 {
+		record.blockedUntil = now.Add(10 * time.Second)
+		record.timestamps = nil // 重置计数
+		logrus.WithField("client_id", clientID).Warn("错误消息频率过高，已屏蔽10秒")
+		return false
+	}
+
+	return true
+}
+
 type WebSocketHandler struct {
 	wsService           *service.WebSocketService
 	authService         *service.AuthService
 	fileTransferService *service.FileTransferService
+	errorRateLimiter    *ErrorRateLimiter
 }
 
 func NewWebSocketHandler(wsService *service.WebSocketService, authService *service.AuthService, fileTransferService *service.FileTransferService) *WebSocketHandler {
@@ -44,6 +105,7 @@ func NewWebSocketHandler(wsService *service.WebSocketService, authService *servi
 		wsService:           wsService,
 		authService:         authService,
 		fileTransferService: fileTransferService,
+		errorRateLimiter:    NewErrorRateLimiter(),
 	}
 
 	// 注册客户端断开回调：当 WebSocket 客户端断开时，清理其作为发送方的文件传输会话
@@ -264,6 +326,9 @@ func (h *WebSocketHandler) processMessage(client *model.Client, message *model.W
 		h.handleFileTransferResend(client, message)
 	case model.MessageTypeFileTransferCancel:
 		h.handleFileTransferCancel(client, message)
+	case model.MessageTypeFileTransferProgress:
+		// 进度消息仅由服务端向客户端推送，客户端不应主动发送
+		// 移动网络不稳定时客户端可能回显进度消息，静默跳过避免产生错误
 	default:
 		h.sendError(client, 400, "不支持的消息类型: "+message.Type)
 	}
@@ -385,6 +450,11 @@ func (h *WebSocketHandler) sendMessage(client *model.Client, message *model.WebS
 
 // sendError 发送错误消息（通用类型，用于订阅/发布等非文件传输场景）
 func (h *WebSocketHandler) sendError(client *model.Client, code int, message string) {
+	// 频率限制：防止重连风暴时大量错误淹没客户端
+	if h.errorRateLimiter != nil && !h.errorRateLimiter.Allow(client.ID) {
+		return
+	}
+
 	logrus.WithFields(logrus.Fields{
 		"client_id": client.ID,
 		"code":      code,
@@ -398,6 +468,11 @@ func (h *WebSocketHandler) sendError(client *model.Client, code int, message str
 // sendFileTransferError 发送文件传输错误消息（使用"file:transfer:error"类型，客户端可识别）
 // transferID 可选：如果已知 session 的 transfer_id 则填入，否则传空字符串
 func (h *WebSocketHandler) sendFileTransferError(client *model.Client, code int, message string, transferID string) {
+	// 频率限制：防止重连风暴时大量错误淹没客户端
+	if h.errorRateLimiter != nil && !h.errorRateLimiter.Allow(client.ID) {
+		return
+	}
+
 	logrus.WithFields(logrus.Fields{
 		"client_id": client.ID,
 		"code":      code,
@@ -463,13 +538,15 @@ func (h *WebSocketHandler) handleFileChunk(client *model.Client, chunkMeta *mode
 	// 验证会话
 	session, err := h.fileTransferService.GetSession(chunkMeta.TransferID)
 	if err != nil {
-		h.sendFileTransferError(client, 404, "传输会话不存在", "")
+		// CRITICAL: 必须带上 transfer_id，否则客户端收到无 transfer_id 的错误消息
+		// 会触发 "transfer id is required" 连锁错误，导致所有活跃传输被终止
+		h.sendFileTransferError(client, 404, "传输会话不存在", chunkMeta.TransferID)
 		return
 	}
 
 	// 验证发送者
 	if session.FromUserID != client.UserID {
-		h.sendFileTransferError(client, 403, "无权发送此传输的数据", "")
+		h.sendFileTransferError(client, 403, "无权发送此传输的数据", chunkMeta.TransferID)
 		return
 	}
 
@@ -482,14 +559,16 @@ func (h *WebSocketHandler) handleFileChunk(client *model.Client, chunkMeta *mode
 		return
 	}
 	if session.Status != "completed" && session.Status != "transferring" && session.Status != "resending" {
-		h.sendFileTransferError(client, 400, "传输会话状态错误: "+session.Status, "")
+		// CRITICAL: 大文件传输中如果接收方断开/会话超时，后续chunk会走到这里
+		// 必须带上 transfer_id，否则触发客户端连锁错误
+		h.sendFileTransferError(client, 400, "传输会话状态错误: "+session.Status, chunkMeta.TransferID)
 		return
 	}
 
 	// 转发数据块给接收者(零拷贝)
 	if err := h.fileTransferService.ForwardChunkToReceiver(chunkMeta.TransferID, framedData, len(chunkData), chunkMeta); err != nil {
 		logrus.WithError(err).Error("转发文件数据块失败")
-		h.sendFileTransferError(client, 500, "转发失败: "+err.Error(), "")
+		h.sendFileTransferError(client, 500, "转发失败: "+err.Error(), chunkMeta.TransferID)
 
 		// 通知双方传输错误
 		h.notifyTransferError(session, "数据转发失败")
@@ -530,7 +609,7 @@ func (h *WebSocketHandler) handleFileTransferRequest(client *model.Client, messa
 	)
 
 	if err := h.fileTransferService.SendMessageToUser(request.ToUserID, request.RoomName, requestMsg); err != nil {
-		h.sendFileTransferError(client, 404, "找不到接收者", "")
+		h.sendFileTransferError(client, 404, "找不到接收者", session.TransferID)
 		h.fileTransferService.RemoveSession(session.TransferID)
 		return
 	}
@@ -551,6 +630,12 @@ func (h *WebSocketHandler) handleFileTransferAccept(client *model.Client, messag
 		return
 	}
 
+	// 防御性检查：data为空对象时可能是客户端重连导致的异常消息，跳过处理
+	if len(data) == 0 {
+		logrus.WithField("client_id", client.ID).Debug("ACCEPT消息data字段为空，跳过处理")
+		return
+	}
+
 	transferID, ok := data["transfer_id"].(string)
 	if !ok {
 		h.sendFileTransferError(client, 400, "缺少transfer_id", "")
@@ -559,19 +644,19 @@ func (h *WebSocketHandler) handleFileTransferAccept(client *model.Client, messag
 
 	session, err := h.fileTransferService.GetSession(transferID)
 	if err != nil {
-		h.sendFileTransferError(client, 404, "传输会话不存在", "")
+		h.sendFileTransferError(client, 404, "传输会话不存在", transferID)
 		return
 	}
 
 	// 验证接收者
 	if session.ToUserID != client.UserID {
-		h.sendFileTransferError(client, 403, "无权接受此传输", "")
+		h.sendFileTransferError(client, 403, "无权接受此传输", transferID)
 		return
 	}
 
 	// 验证状态转换合法性
 	if session.Status != "pending" {
-		h.sendFileTransferError(client, 400, "传输会话状态错误，无法接受: "+session.Status, "")
+		h.sendFileTransferError(client, 400, "传输会话状态错误，无法接受: "+session.Status, transferID)
 		return
 	}
 
@@ -602,6 +687,12 @@ func (h *WebSocketHandler) handleFileTransferReject(client *model.Client, messag
 		return
 	}
 
+	// 防御性检查：data为空对象时可能是客户端重连导致的异常消息，跳过处理
+	if len(data) == 0 {
+		logrus.WithField("client_id", client.ID).Debug("REJECT消息data字段为空，跳过处理")
+		return
+	}
+
 	transferID, ok := data["transfer_id"].(string)
 	if !ok {
 		h.sendFileTransferError(client, 400, "缺少transfer_id", "")
@@ -610,13 +701,13 @@ func (h *WebSocketHandler) handleFileTransferReject(client *model.Client, messag
 
 	session, err := h.fileTransferService.GetSession(transferID)
 	if err != nil {
-		h.sendFileTransferError(client, 404, "传输会话不存在", "")
+		h.sendFileTransferError(client, 404, "传输会话不存在", transferID)
 		return
 	}
 
 	// 验证状态转换合法性
 	if session.Status != "pending" {
-		h.sendFileTransferError(client, 400, "传输会话状态错误，无法拒绝: "+session.Status, "")
+		h.sendFileTransferError(client, 400, "传输会话状态错误，无法拒绝: "+session.Status, transferID)
 		return
 	}
 
@@ -650,6 +741,12 @@ func (h *WebSocketHandler) handleFileTransferStart(client *model.Client, message
 		return
 	}
 
+	// 防御性检查：data为空对象时可能是客户端重连导致的异常消息，跳过处理
+	if len(data) == 0 {
+		logrus.WithField("client_id", client.ID).Debug("START消息data字段为空，跳过处理")
+		return
+	}
+
 	transferID, ok := data["transfer_id"].(string)
 	if !ok {
 		h.sendFileTransferError(client, 400, "缺少transfer_id", "")
@@ -658,19 +755,19 @@ func (h *WebSocketHandler) handleFileTransferStart(client *model.Client, message
 
 	session, err := h.fileTransferService.GetSession(transferID)
 	if err != nil {
-		h.sendFileTransferError(client, 404, "传输会话不存在", "")
+		h.sendFileTransferError(client, 404, "传输会话不存在", transferID)
 		return
 	}
 
 	// 验证发送者
 	if session.FromUserID != client.UserID {
-		h.sendFileTransferError(client, 403, "无权开始此传输", "")
+		h.sendFileTransferError(client, 403, "无权开始此传输", transferID)
 		return
 	}
 
 	// 验证状态转换合法性
 	if session.Status != "accepted" && session.Status != "resending" {
-		h.sendFileTransferError(client, 400, "传输会话状态错误，无法开始传输: "+session.Status, "")
+		h.sendFileTransferError(client, 400, "传输会话状态错误，无法开始传输: "+session.Status, transferID)
 		return
 	}
 
@@ -703,27 +800,38 @@ func (h *WebSocketHandler) handleFileTransferEnd(client *model.Client, message *
 		return
 	}
 
+	// 防御性检查：data为空对象时可能是客户端重连导致的异常消息，跳过处理
+	if len(data) == 0 {
+		logrus.WithField("client_id", client.ID).Debug("END消息data字段为空，跳过处理")
+		return
+	}
+
 	transferID, ok := data["transfer_id"].(string)
-	if !ok {
+	if !ok || transferID == "" {
+		// 记录data内容帮助排查移动端重连导致transfer_id丢失的问题
+		logrus.WithFields(logrus.Fields{
+			"client_id": client.ID,
+			"data_keys": getMapKeys(data),
+		}).Warn("END消息缺少transfer_id，可能是客户端重连导致data字段不完整")
 		h.sendFileTransferError(client, 400, "缺少transfer_id", "")
 		return
 	}
 
 	session, err := h.fileTransferService.GetSession(transferID)
 	if err != nil {
-		h.sendFileTransferError(client, 404, "传输会话不存在", "")
+		h.sendFileTransferError(client, 404, "传输会话不存在", transferID)
 		return
 	}
 
 	// 验证发送者。END 只表示发送端已经发完字节，不能代表接收端已经组装成功。
 	if session.FromUserID != client.UserID {
-		h.sendFileTransferError(client, 403, "无权结束此传输", "")
+		h.sendFileTransferError(client, 403, "无权结束此传输", transferID)
 		return
 	}
 
 	// 验证状态转换合法性
 	if session.Status != "completed" && session.Status != "transferring" && session.Status != "resending" {
-		h.sendFileTransferError(client, 400, "传输会话状态错误，无法结束传输: "+session.Status, "")
+		h.sendFileTransferError(client, 400, "传输会话状态错误，无法结束传输: "+session.Status, transferID)
 		return
 	}
 
@@ -760,24 +868,36 @@ func (h *WebSocketHandler) handleFileTransferEnd(client *model.Client, message *
 func (h *WebSocketHandler) handleFileTransferComplete(client *model.Client, message *model.WebSocketMessage) {
 	var data map[string]interface{}
 	if err := json.Unmarshal(message.Data, &data); err != nil {
-		h.sendFileTransferError(client, 400, "数据格式错误", "")
+		// data字段损坏，静默跳过——移动网络不稳定时常见，不应因无法解析而产生额外错误
+		logrus.WithField("client_id", client.ID).WithError(err).Debug("COMPLETE消息data解析失败，静默跳过")
+		return
+	}
+
+	// 防御性检查：data为空对象时可能是客户端重连导致的异常消息，跳过处理
+	if len(data) == 0 {
+		logrus.WithField("client_id", client.ID).Debug("COMPLETE消息data字段为空，跳过处理")
 		return
 	}
 
 	transferID, ok := data["transfer_id"].(string)
-	if !ok {
-		h.sendFileTransferError(client, 400, "缺少transfer_id", "")
+	if !ok || transferID == "" {
+		// 记录data内容帮助排查移动端重连导致transfer_id丢失的问题
+		// COMPLETE是通知性消息，缺少transfer_id时静默跳过，避免产生级联错误
+		logrus.WithFields(logrus.Fields{
+			"client_id": client.ID,
+			"data_keys": getMapKeys(data),
+		}).Debug("COMPLETE消息缺少transfer_id，静默跳过——可能是客户端重连或会话已清理")
 		return
 	}
 
 	session, err := h.fileTransferService.GetSession(transferID)
 	if err != nil {
-		h.sendFileTransferError(client, 404, "传输会话不存在", "")
+		h.sendFileTransferError(client, 404, "传输会话不存在", transferID)
 		return
 	}
 
 	if session.ToUserID != client.UserID {
-		h.sendFileTransferError(client, 403, "无权确认此传输", "")
+		h.sendFileTransferError(client, 403, "无权确认此传输", transferID)
 		return
 	}
 
@@ -787,12 +907,12 @@ func (h *WebSocketHandler) handleFileTransferComplete(client *model.Client, mess
 		return
 	}
 	if session.Status != "ending" && session.Status != "resending" {
-		h.sendFileTransferError(client, 400, "传输会话状态错误，无法确认完成: "+session.Status, "")
+		h.sendFileTransferError(client, 400, "传输会话状态错误，无法确认完成: "+session.Status, transferID)
 		return
 	}
 
 	if err := h.fileTransferService.UpdateSessionStatus(transferID, session.Status, "completed"); err != nil {
-		h.sendFileTransferError(client, 409, "transfer session status changed: "+err.Error(), "")
+		h.sendFileTransferError(client, 409, "transfer session status changed: "+err.Error(), transferID)
 		return
 	}
 
@@ -831,6 +951,12 @@ func (h *WebSocketHandler) handleFileTransferResend(client *model.Client, messag
 		return
 	}
 
+	// 防御性检查：data为空对象时可能是客户端重连导致的异常消息，跳过处理
+	if len(data) == 0 {
+		logrus.WithField("client_id", client.ID).Debug("RESEND消息data字段为空，跳过处理")
+		return
+	}
+
 	transferID, ok := data["transfer_id"].(string)
 	if !ok || transferID == "" {
 		h.sendFileTransferError(client, 400, "缺少transfer_id", "")
@@ -839,12 +965,12 @@ func (h *WebSocketHandler) handleFileTransferResend(client *model.Client, messag
 
 	session, err := h.fileTransferService.GetSession(transferID)
 	if err != nil {
-		h.sendFileTransferError(client, 404, "传输会话不存在", "")
+		h.sendFileTransferError(client, 404, "传输会话不存在", transferID)
 		return
 	}
 
 	if session.ToUserID != client.UserID {
-		h.sendFileTransferError(client, 403, "无权请求此传输重传", "")
+		h.sendFileTransferError(client, 403, "无权请求此传输重传", transferID)
 		return
 	}
 
@@ -854,7 +980,7 @@ func (h *WebSocketHandler) handleFileTransferResend(client *model.Client, messag
 		return
 	}
 	if session.Status != "transferring" && session.Status != "ending" {
-		h.sendFileTransferError(client, 400, "传输会话状态错误，无法请求重传: "+session.Status, "")
+		h.sendFileTransferError(client, 400, "传输会话状态错误，无法请求重传: "+session.Status, transferID)
 		return
 	}
 
@@ -875,7 +1001,7 @@ func (h *WebSocketHandler) handleFileTransferResend(client *model.Client, messag
 			time.Sleep(5 * time.Second)
 			h.fileTransferService.RemoveSession(transferID)
 		}()
-		h.sendFileTransferError(client, 404, "找不到发送者", "")
+		h.sendFileTransferError(client, 404, "找不到发送者", transferID)
 		return
 	}
 
@@ -890,25 +1016,37 @@ func (h *WebSocketHandler) handleFileTransferResend(client *model.Client, messag
 func (h *WebSocketHandler) handleFileTransferCancel(client *model.Client, message *model.WebSocketMessage) {
 	var data map[string]interface{}
 	if err := json.Unmarshal(message.Data, &data); err != nil {
-		h.sendFileTransferError(client, 400, "数据格式错误", "")
+		// data字段损坏，静默跳过——移动网络不稳定时常见，不应因无法解析而产生额外错误
+		logrus.WithField("client_id", client.ID).WithError(err).Debug("CANCEL消息data解析失败，静默跳过")
+		return
+	}
+
+	// 防御性检查：data为空对象时可能是客户端重连导致的异常消息，跳过处理
+	if len(data) == 0 {
+		logrus.WithField("client_id", client.ID).Debug("CANCEL消息data字段为空，跳过处理")
 		return
 	}
 
 	transferID, ok := data["transfer_id"].(string)
-	if !ok {
-		h.sendFileTransferError(client, 400, "缺少transfer_id", "")
+	if !ok || transferID == "" {
+		// CANCEL是通知性消息，缺少transfer_id时静默跳过
+		// 传输最终会通过客户端断连或超时清理
+		logrus.WithFields(logrus.Fields{
+			"client_id": client.ID,
+			"data_keys": getMapKeys(data),
+		}).Debug("CANCEL消息缺少transfer_id，静默跳过——传输最终将通过断连或超时清理")
 		return
 	}
 
 	session, err := h.fileTransferService.GetSession(transferID)
 	if err != nil {
-		h.sendFileTransferError(client, 404, "传输会话不存在", "")
+		h.sendFileTransferError(client, 404, "传输会话不存在", transferID)
 		return
 	}
 
 	// 验证状态转换合法性 — 终端状态不可取消
 	if session.Status == "completed" || session.Status == "cancelled" || session.Status == "error" || session.Status == "rejected" {
-		h.sendFileTransferError(client, 400, "传输会话已结束，无法取消: "+session.Status, "")
+		h.sendFileTransferError(client, 400, "传输会话已结束，无法取消: "+session.Status, transferID)
 		return
 	}
 
@@ -961,4 +1099,13 @@ func (h *WebSocketHandler) notifyTransferError(session *model.FileTransferSessio
 		time.Sleep(5 * time.Second)
 		h.fileTransferService.RemoveSession(session.TransferID)
 	}()
+}
+
+// getMapKeys 返回map的所有key，用于调试日志（如排查transfer_id丢失问题）
+func getMapKeys(data map[string]interface{}) []string {
+	keys := make([]string, 0, len(data))
+	for k := range data {
+		keys = append(keys, k)
+	}
+	return keys
 }
