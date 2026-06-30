@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
 )
 
@@ -265,18 +264,10 @@ func (fts *FileTransferService) ForwardChunkToReceiver(transferID string, framed
 		return fmt.Errorf("找不到接收者: %w", err)
 	}
 
-	conn, ok := receiverClient.Connection.(*websocket.Conn)
-	if !ok {
-		return fmt.Errorf("无效的WebSocket连接")
-	}
-
 	// 发送二进制帧给接收者。锁必须在此释放，
 	// 因为后续 sendProgressUpdate → sendToClient 会对同一接收方再次加锁。
-	receiverClient.ConnMutex.Lock()
-	writeErr := conn.WriteMessage(websocket.BinaryMessage, framedChunkData)
-	receiverClient.ConnMutex.Unlock()
-	if writeErr != nil {
-		return fmt.Errorf("转发数据块失败: %w", writeErr)
+	if err := fts.wsService.writeBinaryToClient(receiverClient, framedChunkData); err != nil {
+		return fmt.Errorf("转发数据块失败: %w", err)
 	}
 
 	// 发送进度更新给发送者（锁已释放，安全）
@@ -318,15 +309,7 @@ func (fts *FileTransferService) SendMessageToUser(userID, roomName string, messa
 		return err
 	}
 
-	conn, ok := client.Connection.(*websocket.Conn)
-	if !ok {
-		return fmt.Errorf("无效的WebSocket连接")
-	}
-
-	client.ConnMutex.Lock()
-	defer client.ConnMutex.Unlock()
-
-	if err := conn.WriteJSON(message); err != nil {
+	if err := fts.wsService.writeJSONToClient(client, message); err != nil {
 		return fmt.Errorf("发送消息失败: %w", err)
 	}
 
@@ -355,10 +338,10 @@ func (fts *FileTransferService) findClientByUserID(userID, roomName string) (*mo
 
 		if attempt < 2 {
 			logrus.WithFields(logrus.Fields{
-				"user_id":  userID,
-				"room":     roomName,
-				"attempt":  attempt + 1,
-				"clients":  clientsSnapshot,
+				"user_id": userID,
+				"room":    roomName,
+				"attempt": attempt + 1,
+				"clients": clientsSnapshot,
 			}).Warn("找不到接收者，100ms后重试")
 			time.Sleep(100 * time.Millisecond)
 		} else {

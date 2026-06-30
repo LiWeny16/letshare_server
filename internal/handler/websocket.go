@@ -120,7 +120,7 @@ func (h *WebSocketHandler) HandleWebSocket(c *gin.Context) {
 	}()
 
 	// 设置连接参数
-	conn.SetReadLimit(512 * 1024) // 512KB
+	conn.SetReadLimit(512 * 1024)                          // 512KB
 	conn.SetReadDeadline(time.Now().Add(60 * time.Second)) // 60s 移动网络容忍度
 	conn.SetPongHandler(func(string) error {
 		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
@@ -205,6 +205,7 @@ func (h *WebSocketHandler) handleMessages(client *model.Client, conn *websocket.
 
 		// 更新最后活跃时间
 		client.LastPing = time.Now()
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 
 		// 根据消息类型处理
 		switch messageType {

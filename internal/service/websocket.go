@@ -22,6 +22,8 @@ type WebSocketService struct {
 	onClientDisconnect func(clientID string) // 客户端断开时的回调钩子
 }
 
+const websocketWriteTimeout = 60 * time.Second
+
 func NewWebSocketService(maxRoomUsers int) *WebSocketService {
 	ws := &WebSocketService{
 		clients:      make(map[string]*model.Client),
@@ -269,18 +271,43 @@ func (ws *WebSocketService) PublishToRoom(clientID, roomName, event string, data
 	return nil
 }
 
-// sendToClient 发送消息给客户端
-func (ws *WebSocketService) sendToClient(client *model.Client, message *model.WebSocketMessage) {
+func (ws *WebSocketService) writeJSONToClient(client *model.Client, message *model.WebSocketMessage) error {
+	return ws.writeToClient(client, func(conn *websocket.Conn) error {
+		return conn.WriteJSON(message)
+	})
+}
+
+func (ws *WebSocketService) writeBinaryToClient(client *model.Client, data []byte) error {
+	return ws.writeToClient(client, func(conn *websocket.Conn) error {
+		return conn.WriteMessage(websocket.BinaryMessage, data)
+	})
+}
+
+func (ws *WebSocketService) writeToClient(client *model.Client, write func(*websocket.Conn) error) error {
 	conn, ok := client.Connection.(*websocket.Conn)
 	if !ok {
-		logrus.WithField("client_id", client.ID).Debug("连接已失效")
-		return
+		return fmt.Errorf("连接已失效")
 	}
 
+	client.ConnMutex.Lock()
+	defer client.ConnMutex.Unlock()
+
+	if err := conn.SetWriteDeadline(time.Now().Add(websocketWriteTimeout)); err != nil {
+		return err
+	}
+
+	writeErr := write(conn)
+	clearErr := conn.SetWriteDeadline(time.Time{})
+	if writeErr != nil {
+		return writeErr
+	}
+	return clearErr
+}
+
+// sendToClient 发送消息给客户端
+func (ws *WebSocketService) sendToClient(client *model.Client, message *model.WebSocketMessage) {
 	var writeErr error
 	func() {
-		client.ConnMutex.Lock()
-		defer client.ConnMutex.Unlock()
 		defer func() {
 			if r := recover(); r != nil {
 				logrus.WithFields(logrus.Fields{
@@ -290,9 +317,7 @@ func (ws *WebSocketService) sendToClient(client *model.Client, message *model.We
 				writeErr = fmt.Errorf("panic during write: %v", r)
 			}
 		}()
-		// 写超时：防阻塞，15s 容忍 3Mbps + 移动网络延迟
-		conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
-		writeErr = conn.WriteJSON(message)
+		writeErr = ws.writeJSONToClient(client, message)
 	}()
 
 	if writeErr != nil {
