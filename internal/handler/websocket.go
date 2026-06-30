@@ -396,19 +396,29 @@ func (h *WebSocketHandler) sendError(client *model.Client, code int, message str
 }
 
 // sendFileTransferError 发送文件传输错误消息（使用"file:transfer:error"类型，客户端可识别）
-func (h *WebSocketHandler) sendFileTransferError(client *model.Client, code int, message string) {
+// transferID 可选：如果已知 session 的 transfer_id 则填入，否则传空字符串
+func (h *WebSocketHandler) sendFileTransferError(client *model.Client, code int, message string, transferID string) {
 	logrus.WithFields(logrus.Fields{
 		"client_id": client.ID,
 		"code":      code,
 		"message":   message,
 	}).Warn("发送文件传输错误消息")
 
+	payload := map[string]interface{}{
+		"code":    code,
+		"message": message,
+	}
+	if transferID != "" {
+		payload["transfer_id"] = transferID
+		payload["error"] = message
+	}
+	data, _ := json.Marshal(payload)
+
 	errorMsg := &model.WebSocketMessage{
-		Type: model.MessageTypeFileTransferError,
-		Error: &model.ErrorInfo{
-			Code:    code,
-			Message: message,
-		},
+		Type:      model.MessageTypeFileTransferError,
+		Channel:   "",
+		Event:     "",
+		Data:      data,
 		Timestamp: time.Now().UnixMilli(),
 	}
 	h.sendMessage(client, errorMsg)
@@ -422,7 +432,7 @@ func (h *WebSocketHandler) processBinaryMessage(client *model.Client, data []byt
 
 	// 简化处理:假设前256字节是JSON元数据头,剩余是数据
 	if len(data) < 256 {
-		h.sendFileTransferError(client, 400, "二进制消息格式错误")
+		h.sendFileTransferError(client, 400, "二进制消息格式错误", "")
 		return
 	}
 
@@ -431,7 +441,7 @@ func (h *WebSocketHandler) processBinaryMessage(client *model.Client, data []byt
 	metaBytes := bytes.TrimRight(data[:256], "\x00")
 	if err := json.Unmarshal(metaBytes, &chunkMeta); err != nil {
 		logrus.WithField("client_id", client.ID).WithError(err).Error("解析文件块元数据失败")
-		h.sendFileTransferError(client, 400, "文件块元数据格式错误")
+		h.sendFileTransferError(client, 400, "文件块元数据格式错误", "")
 		return
 	}
 
@@ -453,13 +463,13 @@ func (h *WebSocketHandler) handleFileChunk(client *model.Client, chunkMeta *mode
 	// 验证会话
 	session, err := h.fileTransferService.GetSession(chunkMeta.TransferID)
 	if err != nil {
-		h.sendFileTransferError(client, 404, "传输会话不存在")
+		h.sendFileTransferError(client, 404, "传输会话不存在", "")
 		return
 	}
 
 	// 验证发送者
 	if session.FromUserID != client.UserID {
-		h.sendFileTransferError(client, 403, "无权发送此传输的数据")
+		h.sendFileTransferError(client, 403, "无权发送此传输的数据", "")
 		return
 	}
 
@@ -472,14 +482,14 @@ func (h *WebSocketHandler) handleFileChunk(client *model.Client, chunkMeta *mode
 		return
 	}
 	if session.Status != "completed" && session.Status != "transferring" && session.Status != "resending" {
-		h.sendFileTransferError(client, 400, "传输会话状态错误: "+session.Status)
+		h.sendFileTransferError(client, 400, "传输会话状态错误: "+session.Status, "")
 		return
 	}
 
 	// 转发数据块给接收者(零拷贝)
 	if err := h.fileTransferService.ForwardChunkToReceiver(chunkMeta.TransferID, framedData, len(chunkData), chunkMeta); err != nil {
 		logrus.WithError(err).Error("转发文件数据块失败")
-		h.sendFileTransferError(client, 500, "转发失败: "+err.Error())
+		h.sendFileTransferError(client, 500, "转发失败: "+err.Error(), "")
 
 		// 通知双方传输错误
 		h.notifyTransferError(session, "数据转发失败")
@@ -491,7 +501,7 @@ func (h *WebSocketHandler) handleFileChunk(client *model.Client, chunkMeta *mode
 func (h *WebSocketHandler) handleFileTransferRequest(client *model.Client, message *model.WebSocketMessage) {
 	var request model.FileTransferRequest
 	if err := json.Unmarshal(message.Data, &request); err != nil {
-		h.sendFileTransferError(client, 400, "请求数据格式错误")
+		h.sendFileTransferError(client, 400, "请求数据格式错误", "")
 		return
 	}
 
@@ -501,7 +511,7 @@ func (h *WebSocketHandler) handleFileTransferRequest(client *model.Client, messa
 	// 创建传输会话
 	session, err := h.fileTransferService.CreateTransferSession(&request)
 	if err != nil {
-		h.sendFileTransferError(client, 400, err.Error())
+		h.sendFileTransferError(client, 400, err.Error(), "")
 		return
 	}
 
@@ -520,7 +530,7 @@ func (h *WebSocketHandler) handleFileTransferRequest(client *model.Client, messa
 	)
 
 	if err := h.fileTransferService.SendMessageToUser(request.ToUserID, request.RoomName, requestMsg); err != nil {
-		h.sendFileTransferError(client, 404, "找不到接收者")
+		h.sendFileTransferError(client, 404, "找不到接收者", "")
 		h.fileTransferService.RemoveSession(session.TransferID)
 		return
 	}
@@ -537,31 +547,31 @@ func (h *WebSocketHandler) handleFileTransferRequest(client *model.Client, messa
 func (h *WebSocketHandler) handleFileTransferAccept(client *model.Client, message *model.WebSocketMessage) {
 	var data map[string]interface{}
 	if err := json.Unmarshal(message.Data, &data); err != nil {
-		h.sendFileTransferError(client, 400, "数据格式错误")
+		h.sendFileTransferError(client, 400, "数据格式错误", "")
 		return
 	}
 
 	transferID, ok := data["transfer_id"].(string)
 	if !ok {
-		h.sendFileTransferError(client, 400, "缺少transfer_id")
+		h.sendFileTransferError(client, 400, "缺少transfer_id", "")
 		return
 	}
 
 	session, err := h.fileTransferService.GetSession(transferID)
 	if err != nil {
-		h.sendFileTransferError(client, 404, "传输会话不存在")
+		h.sendFileTransferError(client, 404, "传输会话不存在", "")
 		return
 	}
 
 	// 验证接收者
 	if session.ToUserID != client.UserID {
-		h.sendFileTransferError(client, 403, "无权接受此传输")
+		h.sendFileTransferError(client, 403, "无权接受此传输", "")
 		return
 	}
 
 	// 验证状态转换合法性
 	if session.Status != "pending" {
-		h.sendFileTransferError(client, 400, "传输会话状态错误，无法接受: "+session.Status)
+		h.sendFileTransferError(client, 400, "传输会话状态错误，无法接受: "+session.Status, "")
 		return
 	}
 
@@ -588,25 +598,25 @@ func (h *WebSocketHandler) handleFileTransferAccept(client *model.Client, messag
 func (h *WebSocketHandler) handleFileTransferReject(client *model.Client, message *model.WebSocketMessage) {
 	var data map[string]interface{}
 	if err := json.Unmarshal(message.Data, &data); err != nil {
-		h.sendFileTransferError(client, 400, "数据格式错误")
+		h.sendFileTransferError(client, 400, "数据格式错误", "")
 		return
 	}
 
 	transferID, ok := data["transfer_id"].(string)
 	if !ok {
-		h.sendFileTransferError(client, 400, "缺少transfer_id")
+		h.sendFileTransferError(client, 400, "缺少transfer_id", "")
 		return
 	}
 
 	session, err := h.fileTransferService.GetSession(transferID)
 	if err != nil {
-		h.sendFileTransferError(client, 404, "传输会话不存在")
+		h.sendFileTransferError(client, 404, "传输会话不存在", "")
 		return
 	}
 
 	// 验证状态转换合法性
 	if session.Status != "pending" {
-		h.sendFileTransferError(client, 400, "传输会话状态错误，无法拒绝: "+session.Status)
+		h.sendFileTransferError(client, 400, "传输会话状态错误，无法拒绝: "+session.Status, "")
 		return
 	}
 
@@ -636,31 +646,31 @@ func (h *WebSocketHandler) handleFileTransferReject(client *model.Client, messag
 func (h *WebSocketHandler) handleFileTransferStart(client *model.Client, message *model.WebSocketMessage) {
 	var data map[string]interface{}
 	if err := json.Unmarshal(message.Data, &data); err != nil {
-		h.sendFileTransferError(client, 400, "数据格式错误")
+		h.sendFileTransferError(client, 400, "数据格式错误", "")
 		return
 	}
 
 	transferID, ok := data["transfer_id"].(string)
 	if !ok {
-		h.sendFileTransferError(client, 400, "缺少transfer_id")
+		h.sendFileTransferError(client, 400, "缺少transfer_id", "")
 		return
 	}
 
 	session, err := h.fileTransferService.GetSession(transferID)
 	if err != nil {
-		h.sendFileTransferError(client, 404, "传输会话不存在")
+		h.sendFileTransferError(client, 404, "传输会话不存在", "")
 		return
 	}
 
 	// 验证发送者
 	if session.FromUserID != client.UserID {
-		h.sendFileTransferError(client, 403, "无权开始此传输")
+		h.sendFileTransferError(client, 403, "无权开始此传输", "")
 		return
 	}
 
 	// 验证状态转换合法性
 	if session.Status != "accepted" && session.Status != "resending" {
-		h.sendFileTransferError(client, 400, "传输会话状态错误，无法开始传输: "+session.Status)
+		h.sendFileTransferError(client, 400, "传输会话状态错误，无法开始传输: "+session.Status, "")
 		return
 	}
 
@@ -689,31 +699,31 @@ func (h *WebSocketHandler) handleFileTransferStart(client *model.Client, message
 func (h *WebSocketHandler) handleFileTransferEnd(client *model.Client, message *model.WebSocketMessage) {
 	var data map[string]interface{}
 	if err := json.Unmarshal(message.Data, &data); err != nil {
-		h.sendFileTransferError(client, 400, "数据格式错误")
+		h.sendFileTransferError(client, 400, "数据格式错误", "")
 		return
 	}
 
 	transferID, ok := data["transfer_id"].(string)
 	if !ok {
-		h.sendFileTransferError(client, 400, "缺少transfer_id")
+		h.sendFileTransferError(client, 400, "缺少transfer_id", "")
 		return
 	}
 
 	session, err := h.fileTransferService.GetSession(transferID)
 	if err != nil {
-		h.sendFileTransferError(client, 404, "传输会话不存在")
+		h.sendFileTransferError(client, 404, "传输会话不存在", "")
 		return
 	}
 
 	// 验证发送者。END 只表示发送端已经发完字节，不能代表接收端已经组装成功。
 	if session.FromUserID != client.UserID {
-		h.sendFileTransferError(client, 403, "无权结束此传输")
+		h.sendFileTransferError(client, 403, "无权结束此传输", "")
 		return
 	}
 
 	// 验证状态转换合法性
 	if session.Status != "completed" && session.Status != "transferring" && session.Status != "resending" {
-		h.sendFileTransferError(client, 400, "传输会话状态错误，无法结束传输: "+session.Status)
+		h.sendFileTransferError(client, 400, "传输会话状态错误，无法结束传输: "+session.Status, "")
 		return
 	}
 
@@ -750,24 +760,24 @@ func (h *WebSocketHandler) handleFileTransferEnd(client *model.Client, message *
 func (h *WebSocketHandler) handleFileTransferComplete(client *model.Client, message *model.WebSocketMessage) {
 	var data map[string]interface{}
 	if err := json.Unmarshal(message.Data, &data); err != nil {
-		h.sendFileTransferError(client, 400, "数据格式错误")
+		h.sendFileTransferError(client, 400, "数据格式错误", "")
 		return
 	}
 
 	transferID, ok := data["transfer_id"].(string)
 	if !ok {
-		h.sendFileTransferError(client, 400, "缺少transfer_id")
+		h.sendFileTransferError(client, 400, "缺少transfer_id", "")
 		return
 	}
 
 	session, err := h.fileTransferService.GetSession(transferID)
 	if err != nil {
-		h.sendFileTransferError(client, 404, "传输会话不存在")
+		h.sendFileTransferError(client, 404, "传输会话不存在", "")
 		return
 	}
 
 	if session.ToUserID != client.UserID {
-		h.sendFileTransferError(client, 403, "无权确认此传输")
+		h.sendFileTransferError(client, 403, "无权确认此传输", "")
 		return
 	}
 
@@ -777,12 +787,12 @@ func (h *WebSocketHandler) handleFileTransferComplete(client *model.Client, mess
 		return
 	}
 	if session.Status != "ending" && session.Status != "resending" {
-		h.sendFileTransferError(client, 400, "传输会话状态错误，无法确认完成: "+session.Status)
+		h.sendFileTransferError(client, 400, "传输会话状态错误，无法确认完成: "+session.Status, "")
 		return
 	}
 
 	if err := h.fileTransferService.UpdateSessionStatus(transferID, session.Status, "completed"); err != nil {
-		h.sendFileTransferError(client, 409, "transfer session status changed: "+err.Error())
+		h.sendFileTransferError(client, 409, "transfer session status changed: "+err.Error(), "")
 		return
 	}
 
@@ -817,24 +827,24 @@ func (h *WebSocketHandler) handleFileTransferComplete(client *model.Client, mess
 func (h *WebSocketHandler) handleFileTransferResend(client *model.Client, message *model.WebSocketMessage) {
 	var data map[string]interface{}
 	if err := json.Unmarshal(message.Data, &data); err != nil {
-		h.sendFileTransferError(client, 400, "数据格式错误")
+		h.sendFileTransferError(client, 400, "数据格式错误", "")
 		return
 	}
 
 	transferID, ok := data["transfer_id"].(string)
 	if !ok || transferID == "" {
-		h.sendFileTransferError(client, 400, "缺少transfer_id")
+		h.sendFileTransferError(client, 400, "缺少transfer_id", "")
 		return
 	}
 
 	session, err := h.fileTransferService.GetSession(transferID)
 	if err != nil {
-		h.sendFileTransferError(client, 404, "传输会话不存在")
+		h.sendFileTransferError(client, 404, "传输会话不存在", "")
 		return
 	}
 
 	if session.ToUserID != client.UserID {
-		h.sendFileTransferError(client, 403, "无权请求此传输重传")
+		h.sendFileTransferError(client, 403, "无权请求此传输重传", "")
 		return
 	}
 
@@ -844,7 +854,7 @@ func (h *WebSocketHandler) handleFileTransferResend(client *model.Client, messag
 		return
 	}
 	if session.Status != "transferring" && session.Status != "ending" {
-		h.sendFileTransferError(client, 400, "传输会话状态错误，无法请求重传: "+session.Status)
+		h.sendFileTransferError(client, 400, "传输会话状态错误，无法请求重传: "+session.Status, "")
 		return
 	}
 
@@ -865,7 +875,7 @@ func (h *WebSocketHandler) handleFileTransferResend(client *model.Client, messag
 			time.Sleep(5 * time.Second)
 			h.fileTransferService.RemoveSession(transferID)
 		}()
-		h.sendFileTransferError(client, 404, "找不到发送者")
+		h.sendFileTransferError(client, 404, "找不到发送者", "")
 		return
 	}
 
@@ -880,25 +890,25 @@ func (h *WebSocketHandler) handleFileTransferResend(client *model.Client, messag
 func (h *WebSocketHandler) handleFileTransferCancel(client *model.Client, message *model.WebSocketMessage) {
 	var data map[string]interface{}
 	if err := json.Unmarshal(message.Data, &data); err != nil {
-		h.sendFileTransferError(client, 400, "数据格式错误")
+		h.sendFileTransferError(client, 400, "数据格式错误", "")
 		return
 	}
 
 	transferID, ok := data["transfer_id"].(string)
 	if !ok {
-		h.sendFileTransferError(client, 400, "缺少transfer_id")
+		h.sendFileTransferError(client, 400, "缺少transfer_id", "")
 		return
 	}
 
 	session, err := h.fileTransferService.GetSession(transferID)
 	if err != nil {
-		h.sendFileTransferError(client, 404, "传输会话不存在")
+		h.sendFileTransferError(client, 404, "传输会话不存在", "")
 		return
 	}
 
 	// 验证状态转换合法性 — 终端状态不可取消
 	if session.Status == "completed" || session.Status == "cancelled" || session.Status == "error" || session.Status == "rejected" {
-		h.sendFileTransferError(client, 400, "传输会话已结束，无法取消: "+session.Status)
+		h.sendFileTransferError(client, 400, "传输会话已结束，无法取消: "+session.Status, "")
 		return
 	}
 
