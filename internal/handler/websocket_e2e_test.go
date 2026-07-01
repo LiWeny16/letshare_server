@@ -287,11 +287,11 @@ func (ts *testServer) sendFileTransferMessage(client *model.Client, msg *model.W
 			ts.sendError(client, 403, "not receiver")
 			return
 		}
-		// Bug#2 fix: allow resending state
+		// COMPLETE may arrive after receiver assembly but before sender END.
 		if session.Status == "completed" {
 			return
 		}
-		if session.Status != "ending" && session.Status != "resending" {
+		if session.Status != "transferring" && session.Status != "ending" && session.Status != "resending" {
 			ts.sendError(client, 400, "bad status: "+session.Status)
 			return
 		}
@@ -644,6 +644,78 @@ func TestFileTransferE2E_ResendChunks(t *testing.T) {
 }
 
 // ---------- Test: Bug #2 — COMPLETE from resending state ----------
+func TestFileTransferE2E_CompleteFromTransferringBeforeSenderEnd(t *testing.T) {
+	ts := newTestServer(t)
+	defer ts.Close()
+
+	sender := dialTestClient(t, ts.srv, "sender-early-complete")
+	receiver := dialTestClient(t, ts.srv, "receiver-early-complete")
+	defer sender.Close()
+	defer receiver.Close()
+
+	subscribeRoom(t, sender, "CE")
+	subscribeRoom(t, receiver, "CE")
+
+	rcvCh := make(chan msgEnvelope, 16)
+	go func() {
+		for {
+			receiver.SetReadDeadline(time.Now().Add(5 * time.Second))
+			_, raw, err := receiver.ReadMessage()
+			if err != nil {
+				rcvCh <- msgEnvelope{err: err}
+				return
+			}
+			rcvCh <- msgEnvelope{raw: raw}
+		}
+	}()
+
+	tid := "tf-complete-from-transferring"
+
+	reqJSON, _ := json.Marshal(map[string]interface{}{
+		"transfer_id": tid, "file_name": "early-complete.bin", "file_size": 100,
+		"file_type": "application/octet-stream", "chunk_size": 100, "total_chunks": 1,
+		"from_user_id": "sender-early-complete", "to_user_id": "receiver-early-complete",
+		"room_name": "CE",
+	})
+	sender.WriteJSON(model.WebSocketMessage{Type: "file:transfer:request", Channel: "CE", Data: reqJSON})
+	<-rcvCh
+
+	accJSON, _ := json.Marshal(map[string]interface{}{"transfer_id": tid})
+	receiver.WriteJSON(model.WebSocketMessage{Type: "file:transfer:accept", Channel: "CE", Data: accJSON})
+	sender.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, _, err := sender.ReadMessage(); err != nil {
+		t.Fatalf("sender should receive accept: %v", err)
+	}
+
+	startJSON, _ := json.Marshal(map[string]interface{}{"transfer_id": tid})
+	sender.WriteJSON(model.WebSocketMessage{Type: "file:transfer:start", Channel: "CE", Data: startJSON})
+	<-rcvCh
+
+	completeJSON, _ := json.Marshal(map[string]interface{}{"transfer_id": tid})
+	receiver.WriteJSON(model.WebSocketMessage{Type: "file:transfer:complete", Channel: "CE", Data: completeJSON})
+
+	sender.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, raw, err := sender.ReadMessage()
+	if err != nil {
+		t.Fatalf("sender should receive complete even before END: %v", err)
+	}
+	var sm model.WebSocketMessage
+	if err := json.Unmarshal(raw, &sm); err != nil {
+		t.Fatalf("parse sender message: %v", err)
+	}
+	if sm.Type != "file:transfer:complete" {
+		t.Fatalf("COMPLETE from transferring should be forwarded, got %s data=%s", sm.Type, string(sm.Data))
+	}
+
+	session, err := ts.fts.GetSession(tid)
+	if err != nil {
+		t.Fatalf("completed transfer session should still be retained briefly: %v", err)
+	}
+	if session.Status != "completed" {
+		t.Fatalf("COMPLETE from transferring should mark session completed, got %s", session.Status)
+	}
+}
+
 func TestFileTransferE2E_CompleteFromResending(t *testing.T) {
 	ts := newTestServer(t)
 	defer ts.Close()

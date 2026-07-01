@@ -914,12 +914,12 @@ func (h *WebSocketHandler) handleFileTransferComplete(client *model.Client, mess
 		return
 	}
 
-	// 验证状态转换合法性 — 接收方可能在重传完成、发送端 END 还没到达时就组装完毕
+	// 验证状态转换合法性 — 接收方可能在发送端 END 到达前就已经组装完毕
 	if session.Status == "completed" {
 		logrus.WithField("transfer_id", transferID).Debug("ignore duplicate transfer complete")
 		return
 	}
-	if session.Status != "ending" && session.Status != "resending" {
+	if session.Status != "transferring" && session.Status != "ending" && session.Status != "resending" {
 		h.sendFileTransferError(client, 400, "传输会话状态错误，无法确认完成: "+session.Status, transferID)
 		return
 	}
