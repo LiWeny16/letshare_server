@@ -22,6 +22,7 @@ const (
 	MessageTypeFileTransferChunk    = "file:transfer:chunk"    // 传输数据块(二进制)
 	MessageTypeFileTransferEnd      = "file:transfer:end"      // 传输完成
 	MessageTypeFileTransferComplete = "file:transfer:complete" // 接收方已完成文件组装
+	MessageTypeFileTransferAck      = "file:transfer:ack"      // receiver has processed relay chunks
 	MessageTypeFileTransferResend   = "file:transfer:resend"   // 接收方请求重传缺失分片
 	MessageTypeFileTransferCancel   = "file:transfer:cancel"   // 取消传输
 	MessageTypeFileTransferError    = "file:transfer:error"    // 传输错误
@@ -129,6 +130,7 @@ type FileTransferRequest struct {
 	ToUserID    string `json:"to_user_id"`           // 接收者用户ID
 	RoomName    string `json:"room_name"`            // 房间名称
 	AdminPass   string `json:"admin_pass,omitempty"` // 管理员密码(超过基础限制时必需)
+	FlowControl string `json:"flow_control,omitempty"`
 }
 
 // FileTransferChunk 文件数据块(用于二进制消息的元数据)

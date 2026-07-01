@@ -322,6 +322,8 @@ func (h *WebSocketHandler) processMessage(client *model.Client, message *model.W
 		h.handleFileTransferEnd(client, message)
 	case model.MessageTypeFileTransferComplete:
 		h.handleFileTransferComplete(client, message)
+	case model.MessageTypeFileTransferAck:
+		h.handleFileTransferAck(client, message)
 	case model.MessageTypeFileTransferResend:
 		h.handleFileTransferResend(client, message)
 	case model.MessageTypeFileTransferCancel:
@@ -665,13 +667,24 @@ func (h *WebSocketHandler) handleFileTransferAccept(client *model.Client, messag
 	h.fileTransferService.UpdateSessionClients(transferID, session.FromClientID, client.ID)
 
 	// 通知发送者
+	acceptData := map[string]interface{}{
+		"transfer_id": transferID,
+	}
+	if flowControl, ok := data["flow_control"].(string); ok && flowControl != "" {
+		acceptData["flow_control"] = flowControl
+	}
+	if ackEveryChunks, ok := data["ack_every_chunks"].(float64); ok && ackEveryChunks > 0 {
+		acceptData["ack_every_chunks"] = int(ackEveryChunks)
+	}
+	if ackWindowChunks, ok := data["ack_window_chunks"].(float64); ok && ackWindowChunks > 0 {
+		acceptData["ack_window_chunks"] = int(ackWindowChunks)
+	}
+
 	acceptMsg := model.NewWebSocketMessage(
 		model.MessageTypeFileTransferAccept,
 		session.RoomName,
 		"",
-		map[string]interface{}{
-			"transfer_id": transferID,
-		},
+		acceptData,
 	)
 
 	h.fileTransferService.SendMessageToUser(session.FromUserID, session.RoomName, acceptMsg)
@@ -941,6 +954,52 @@ func (h *WebSocketHandler) handleFileTransferComplete(client *model.Client, mess
 		"file_size":   session.FileSize,
 		"duration":    time.Since(session.StartTime).String(),
 	}).Info("文件传输已由接收端确认完成")
+}
+
+// handleFileTransferAck forwards receiver-side chunk processing acknowledgements to the sender.
+func (h *WebSocketHandler) handleFileTransferAck(client *model.Client, message *model.WebSocketMessage) {
+	var data map[string]interface{}
+	if err := json.Unmarshal(message.Data, &data); err != nil {
+		logrus.WithField("client_id", client.ID).WithError(err).Debug("ACK message data parse failed")
+		return
+	}
+
+	transferID, ok := data["transfer_id"].(string)
+	if !ok || transferID == "" {
+		logrus.WithField("client_id", client.ID).Debug("ACK message missing transfer_id")
+		return
+	}
+
+	session, err := h.fileTransferService.GetSession(transferID)
+	if err != nil {
+		h.sendFileTransferError(client, 404, "传输会话不存在", transferID)
+		return
+	}
+
+	if session.ToUserID != client.UserID {
+		h.sendFileTransferError(client, 403, "无权确认此传输", transferID)
+		return
+	}
+
+	if session.Status != "transferring" && session.Status != "resending" && session.Status != "ending" {
+		logrus.WithFields(logrus.Fields{
+			"transfer_id": transferID,
+			"status":      session.Status,
+		}).Debug("ignore ACK for inactive transfer session")
+		return
+	}
+
+	ackMsg := model.NewWebSocketMessage(
+		model.MessageTypeFileTransferAck,
+		session.RoomName,
+		"",
+		data,
+	)
+
+	if err := h.fileTransferService.SendMessageToUser(session.FromUserID, session.RoomName, ackMsg); err != nil {
+		logrus.WithError(err).WithField("transfer_id", transferID).Warn("forward transfer ACK failed")
+		return
+	}
 }
 
 // handleFileTransferResend 处理接收方请求重传缺失分片
