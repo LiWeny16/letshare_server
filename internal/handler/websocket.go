@@ -590,7 +590,7 @@ func (h *WebSocketHandler) handleFileTransferRequest(client *model.Client, messa
 	// 创建传输会话
 	session, err := h.fileTransferService.CreateTransferSession(&request)
 	if err != nil {
-		h.sendFileTransferError(client, 400, err.Error(), "")
+		h.sendFileTransferError(client, 400, err.Error(), request.TransferID)
 		return
 	}
 
