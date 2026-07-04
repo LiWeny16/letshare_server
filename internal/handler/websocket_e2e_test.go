@@ -36,13 +36,13 @@ func newTestServer(t *testing.T) *testServer {
 
 	wsService := service.NewWebSocketService(10)
 	authService := service.NewAuthService()
-	fts := service.NewFileTransferService(wsService, 500*1024*1024, 65536, 50*1024*1024, "")
+	fts := service.NewFileTransferService(wsService, 3*1024*1024*1024, 65536)
 
 	wsService.SetOnClientDisconnect(func(clientID string) {
 		fts.HandleClientDisconnect(clientID)
 	})
 
-	handler := NewWebSocketHandler(wsService, authService, fts)
+	handler := NewWebSocketHandler(wsService, authService, fts, nil)
 
 	ts := &testServer{
 		wsService: wsService,
@@ -204,7 +204,7 @@ func (ts *testServer) sendFileTransferMessage(client *model.Client, msg *model.W
 		var req model.FileTransferRequest
 		json.Unmarshal(msg.Data, &req)
 		req.FromUserID = client.UserID
-		session, err := ts.fts.CreateTransferSession(&req)
+		session, err := ts.fts.CreateTransferSession(&req, false)
 		if err != nil {
 			ts.sendError(client, 400, err.Error())
 			return

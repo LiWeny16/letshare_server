@@ -97,14 +97,16 @@ type WebSocketHandler struct {
 	wsService           *service.WebSocketService
 	authService         *service.AuthService
 	fileTransferService *service.FileTransferService
+	jwtService          *service.JWTService
 	errorRateLimiter    *ErrorRateLimiter
 }
 
-func NewWebSocketHandler(wsService *service.WebSocketService, authService *service.AuthService, fileTransferService *service.FileTransferService) *WebSocketHandler {
+func NewWebSocketHandler(wsService *service.WebSocketService, authService *service.AuthService, fileTransferService *service.FileTransferService, jwtService *service.JWTService) *WebSocketHandler {
 	handler := &WebSocketHandler{
 		wsService:           wsService,
 		authService:         authService,
 		fileTransferService: fileTransferService,
+		jwtService:          jwtService,
 		errorRateLimiter:    NewErrorRateLimiter(),
 	}
 
@@ -151,6 +153,31 @@ func (h *WebSocketHandler) HandleWebSocket(c *gin.Context) {
 
 	client := model.NewClient(clientID, userID, conn)
 	client.Metadata["authenticated"] = true
+
+	// 验证可选 PRO token（JWT），设置 isPro 元数据
+	if proToken := c.Query("pro_token"); proToken != "" {
+		if claims, err := h.jwtService.ValidateToken(proToken); err == nil && claims.IsPro {
+			// 验证 subject 绑定：JWT 的 sub 必须匹配当前 userID
+			if claims.Subject == "" || claims.Subject != userID {
+				logrus.WithFields(logrus.Fields{
+					"client_id":      clientID,
+					"user_id":        userID,
+					"token_subject":  claims.Subject,
+				}).Warn("PRO token subject 不匹配，拒绝授予 PRO 状态")
+			} else {
+				client.Metadata["isPro"] = true
+				logrus.WithFields(logrus.Fields{
+					"client_id": clientID,
+					"user_id":   userID,
+				}).Debug("PRO token 验证成功")
+			}
+		} else if err != nil {
+			logrus.WithFields(logrus.Fields{
+				"client_id": clientID,
+				"error":     err.Error(),
+			}).Debug("PRO token 验证失败")
+		}
+	}
 
 	// 添加到服务
 	h.wsService.AddClient(client)
@@ -589,8 +616,11 @@ func (h *WebSocketHandler) handleFileTransferRequest(client *model.Client, messa
 	// 设置发送者信息
 	request.FromUserID = client.UserID
 
+	// 从客户端元数据读取 PRO 状态（WebSocket 握手时由 JWT 验证设置）
+	isPro, _ := client.Metadata["isPro"].(bool)
+
 	// 创建传输会话
-	session, err := h.fileTransferService.CreateTransferSession(&request)
+	session, err := h.fileTransferService.CreateTransferSession(&request, isPro)
 	if err != nil {
 		h.sendFileTransferError(client, 400, err.Error(), request.TransferID)
 		return
@@ -599,8 +629,7 @@ func (h *WebSocketHandler) handleFileTransferRequest(client *model.Client, messa
 	// 更新客户端ID
 	h.fileTransferService.UpdateSessionClients(session.TransferID, client.ID, "")
 
-	// 清除密码，不转发给接收端
-	request.AdminPass = ""
+	// IsPro 标记不需要转发给接收端，服务端校验后不再传递
 
 	// 转发请求给接收者
 	requestMsg := model.NewWebSocketMessage(

@@ -30,10 +30,9 @@ websocket:
 
 file_transfer:
   enabled: true
-  max_file_size: 524288000  # 500MB
-  chunk_size: 65536         # 64KB
-  admin_password: "bigonion"                   # 邀请码(由环境变量 ADMIN_PASSWORD 覆盖)
-  basic_size_limit: 52428800       # 50MB 基础限制
+  max_file_size: 3221225472  # 3GB PRO 统一上限
+  chunk_size: 65536          # 64KB
+  pro_invite_code: "bigonion"
 
 runtime:
   gomaxprocs: 0  # 使用所有CPU核心

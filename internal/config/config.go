@@ -19,6 +19,7 @@ type Config struct {
 	FileTransfer FileTransfer `mapstructure:"file_transfer"`
 	Runtime      Runtime      `mapstructure:"runtime"`
 	GLM          GLM          `mapstructure:"glm"`
+	JWT          JWT          `mapstructure:"jwt"`
 }
 
 type Server struct {
@@ -47,11 +48,15 @@ type WebSocket struct {
 }
 
 type FileTransfer struct {
-	MaxFileSize    int64  `mapstructure:"max_file_size"`     // 最大文件大小(字节) - 管理员模式
-	ChunkSize      int    `mapstructure:"chunk_size"`        // 分块大小(字节)
-	Enabled        bool   `mapstructure:"enabled"`           // 是否启用文件传输
-	AdminPassword  string `mapstructure:"admin_password"`    // 管理员密码(超过BasicSizeLimit时必需)
-	BasicSizeLimit int64  `mapstructure:"basic_size_limit"`  // 基础大小限制(字节),默认50MB,超过需要管理员密码
+	MaxFileSize   int64  `mapstructure:"max_file_size"`    // PRO 统一上限(字节), 默认 3GB
+	ChunkSize     int    `mapstructure:"chunk_size"`       // 分块大小(字节)
+	Enabled       bool   `mapstructure:"enabled"`          // 是否启用文件传输
+	ProInviteCode string `mapstructure:"pro_invite_code"`  // PRO 邀请码
+}
+
+type JWT struct {
+	Secret          string `mapstructure:"secret"`
+	ExpirationHours int    `mapstructure:"expiration_hours"`
 }
 
 type Runtime struct {
@@ -98,11 +103,6 @@ func Load() *Config {
 
 	cfg.Mode = mode
 
-	// 显式检查 ADMIN_PASSWORD 环境变量(覆盖配置文件)
-	if adminPass := os.Getenv("ADMIN_PASSWORD"); adminPass != "" {
-		cfg.FileTransfer.AdminPassword = adminPass
-	}
-
 	return &cfg
 }
 
@@ -110,18 +110,17 @@ func setDefaults() {
 	viper.SetDefault("server.port", "8080")
 	viper.SetDefault("websocket.max_room_users", 10)
 	viper.SetDefault("file_transfer.enabled", true)
-	viper.SetDefault("file_transfer.max_file_size", 524288000) // 500MB
-	viper.SetDefault("file_transfer.chunk_size", 65536)        // 64KB
-	viper.SetDefault("file_transfer.admin_password", "bigonion")                 // PRO 邀请码，可通过环境变量 ADMIN_PASSWORD 覆盖
-	viper.SetDefault("file_transfer.basic_size_limit", 52428800)       // 50MB基础限制
+	viper.SetDefault("file_transfer.max_file_size", 3221225472) // 3GB — PRO 统一上限
+	viper.SetDefault("file_transfer.chunk_size", 65536)         // 64KB
+	viper.SetDefault("file_transfer.pro_invite_code", "bigonion")
+	viper.SetDefault("jwt.secret", "letshare-jwt-secret-key-2024")
+	viper.SetDefault("jwt.expiration_hours", 720) // 30 天
 	viper.SetDefault("runtime.gomaxprocs", 0)                  // 使用所有核心
 	viper.SetDefault("glm.base_url", "https://open.bigmodel.cn/api/paas/v4")
 	viper.SetDefault("glm.model_opus", os.Getenv("GLM_MODEL_OPUS"))
 	viper.SetDefault("glm.model_sonnet", os.Getenv("GLM_MODEL_SONNET"))
 	viper.SetDefault("glm.model_vision", os.Getenv("GLM_MODEL_VISION"))
 	viper.SetDefault("glm.api_key", os.Getenv("GLM_API_KEY"))
-	viper.SetDefault("log.level", "info")
-	viper.SetDefault("log.max_entries", 10000)
 	viper.SetDefault("tls.enabled", false)
 	viper.SetDefault("tls.cert_file", "/etc/letsencrypt/live/ecs.letshare.fun/fullchain.pem")
 	viper.SetDefault("tls.key_file", "/etc/letsencrypt/live/ecs.letshare.fun/privkey.pem")

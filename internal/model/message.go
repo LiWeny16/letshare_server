@@ -129,8 +129,8 @@ type FileTransferRequest struct {
 	FromUserID  string `json:"from_user_id"`         // 发送者用户ID
 	ToUserID    string `json:"to_user_id"`           // 接收者用户ID
 	RoomName    string `json:"room_name"`            // 房间名称
-	AdminPass   string `json:"admin_pass,omitempty"` // 管理员密码(超过基础限制时必需)
 	FlowControl string `json:"flow_control,omitempty"`
+	// is_pro 由服务端根据 WebSocket 握手时的 JWT 判定，不从客户端请求中读取
 }
 
 // FileTransferChunk 文件数据块(用于二进制消息的元数据)

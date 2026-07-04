@@ -43,6 +43,7 @@ func main() {
 	// 创建服务
 	wsService := service.NewWebSocketService(cfg.WebSocket.MaxRoomUsers)
 	authService := service.NewAuthService()
+	jwtService := service.NewJWTService(cfg.JWT.Secret, cfg.JWT.ExpirationHours)
 
 	// 创建文件传输服务
 	var fileTransferService *service.FileTransferService
@@ -51,14 +52,10 @@ func main() {
 			wsService,
 			cfg.FileTransfer.MaxFileSize,
 			cfg.FileTransfer.ChunkSize,
-			cfg.FileTransfer.BasicSizeLimit,
-			cfg.FileTransfer.AdminPassword,
 		)
 		logrus.WithFields(logrus.Fields{
-			"max_file_size_mb":    cfg.FileTransfer.MaxFileSize / (1024 * 1024),
-			"basic_size_limit_mb": cfg.FileTransfer.BasicSizeLimit / (1024 * 1024),
-			"chunk_size_kb":       cfg.FileTransfer.ChunkSize / 1024,
-			"admin_password_set":  cfg.FileTransfer.AdminPassword != "",
+			"max_file_size_mb": cfg.FileTransfer.MaxFileSize / (1024 * 1024),
+			"chunk_size_kb":    cfg.FileTransfer.ChunkSize / 1024,
 		}).Info("文件传输服务已启用")
 	} else {
 		logrus.Info("文件传输服务未启用")
@@ -117,18 +114,22 @@ func main() {
 	r.Use(cors.New(corsConfig))
 
 	// 创建处理器
-	wsHandler := handler.NewWebSocketHandler(wsService, authService, fileTransferService)
+	wsHandler := handler.NewWebSocketHandler(wsService, authService, fileTransferService, jwtService)
 	healthHandler := handler.NewHealthHandler(wsService)
 	glmHandler := handler.NewGLMHandler(cfg.GLM)
 
 	// 路由
+	proHandler := handler.NewProHandler(jwtService, cfg.FileTransfer.ProInviteCode)
+
 	r.GET("/health", healthHandler.Health)
 	r.GET("/metrics", healthHandler.Metrics)
+	r.POST("/api/pro/activate", proHandler.Activate)
 	r.GET("/ws", wsHandler.HandleWebSocket)
 	r.GET("/", wsHandler.HandleWebSocket)
 	r.Any("/api/glm/*path", glmHandler.Proxy)
 	// 启动服务器
 	logrus.WithField("port", cfg.Server.Port).Info("启动WebSocket服务器")
+	logrus.WithField("pro_invite_code_set", cfg.FileTransfer.ProInviteCode != "").Info("PRO 邀请码已配置")
 
 	// 优雅关闭
 	go func() {

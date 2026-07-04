@@ -64,7 +64,7 @@ func newDeadlineTestClient(t *testing.T, ws *WebSocketService, clientID, userID,
 
 func TestSendMessageToUserRefreshesExpiredWriteDeadline(t *testing.T) {
 	ws := NewWebSocketService(10)
-	fts := NewFileTransferService(ws, 500*1024*1024, 65536, 50*1024*1024, "")
+	fts := NewFileTransferService(ws, 3*1024*1024*1024, 65536)
 	clientConn, serverConn := newDeadlineTestClient(t, ws, "receiver-client", "receiver-user", "room1")
 
 	if err := serverConn.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
@@ -93,7 +93,7 @@ func TestSendMessageToUserRefreshesExpiredWriteDeadline(t *testing.T) {
 
 func TestForwardChunkToReceiverRefreshesExpiredWriteDeadline(t *testing.T) {
 	ws := NewWebSocketService(10)
-	fts := NewFileTransferService(ws, 500*1024*1024, 65536, 50*1024*1024, "")
+	fts := NewFileTransferService(ws, 3*1024*1024*1024, 65536)
 	senderConn, _ := newDeadlineTestClient(t, ws, "sender-client", "sender-user", "room1")
 	receiverConn, receiverServerConn := newDeadlineTestClient(t, ws, "receiver-client", "receiver-user", "room1")
 
@@ -106,7 +106,7 @@ func TestForwardChunkToReceiverRefreshesExpiredWriteDeadline(t *testing.T) {
 		FromUserID: "sender-user",
 		ToUserID:   "receiver-user",
 		RoomName:   "room1",
-	})
+		}, false)
 	if err != nil {
 		t.Fatalf("create session: %v", err)
 	}
