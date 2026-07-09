@@ -80,9 +80,12 @@ func (ws *WebSocketService) RemoveClient(clientID string) {
 // cleanupClientResources 彻底清理客户端相关资源
 func (ws *WebSocketService) cleanupClientResources(client *model.Client) {
 	// 关闭WebSocket连接
+	client.ConnMutex.Lock()
 	if conn, ok := client.Connection.(*websocket.Conn); ok {
 		conn.Close()
 	}
+	client.Connection = nil
+	client.ConnMutex.Unlock()
 
 	// 从所有房间中移除客户端
 	roomsToCleanup := make([]string, 0, len(client.Rooms))
@@ -284,13 +287,13 @@ func (ws *WebSocketService) writeBinaryToClient(client *model.Client, data []byt
 }
 
 func (ws *WebSocketService) writeToClient(client *model.Client, write func(*websocket.Conn) error) error {
+	client.ConnMutex.Lock()
+	defer client.ConnMutex.Unlock()
+
 	conn, ok := client.Connection.(*websocket.Conn)
 	if !ok {
 		return fmt.Errorf("连接已失效")
 	}
-
-	client.ConnMutex.Lock()
-	defer client.ConnMutex.Unlock()
 
 	if err := conn.SetWriteDeadline(time.Now().Add(websocketWriteTimeout)); err != nil {
 		return err
