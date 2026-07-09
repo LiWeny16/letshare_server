@@ -103,6 +103,9 @@ func (fts *FileTransferService) CreateTransferSession(request *model.FileTransfe
 }
 
 // GetSession 获取传输会话
+// 返回会话的快照拷贝（指针指向副本）。sessionsMutex 只保护 sessions 这个 map，
+// 不保护单个 session 的字段；若直接返回 map 内部指针，调用方在锁外读取字段会与
+// UpdateSessionStatus 等在锁内写字段产生数据竞争。快照拷贝让锁外读变为安全。
 func (fts *FileTransferService) GetSession(transferID string) (*model.FileTransferSession, error) {
 	fts.sessionsMutex.RLock()
 	defer fts.sessionsMutex.RUnlock()
@@ -112,7 +115,8 @@ func (fts *FileTransferService) GetSession(transferID string) (*model.FileTransf
 		return nil, fmt.Errorf("传输会话不存在: %s", transferID)
 	}
 
-	return session, nil
+	snapshot := *session
+	return &snapshot, nil
 }
 
 // UpdateSessionStatus 更新会话状态
@@ -238,19 +242,18 @@ func (fts *FileTransferService) RemoveSession(transferID string) {
 
 // ForwardChunkToReceiver 转发数据块给接收者(保留前端二进制帧头，接收端可直接按 transfer_id 定位)
 func (fts *FileTransferService) ForwardChunkToReceiver(transferID string, framedChunkData []byte, chunkDataSize int, chunkMeta *model.FileTransferChunk) error {
-	session, err := fts.GetSession(transferID)
-	if err != nil {
-		return err
-	}
-
-	// 更新会话活动时间，同时验证会话未被并发删除
+	// 在锁内：校验会话存在 + 更新真实会话的 LastActivity + 取快照供锁外读取。
+	// 不复用 GetSession（它返回快照），因为这里需要写真实会话的活动时间。
 	fts.sessionsMutex.Lock()
-	if _, stillExists := fts.sessions[transferID]; !stillExists {
+	real, exists := fts.sessions[transferID]
+	if !exists {
 		fts.sessionsMutex.Unlock()
 		return fmt.Errorf("传输会话已被取消: %s", transferID)
 	}
-	session.LastActivity = time.Now()
+	real.LastActivity = time.Now()
+	snapshot := *real
 	fts.sessionsMutex.Unlock()
+	session := &snapshot
 
 	// 查找接收者客户端
 	receiverClient, err := fts.findClientByUserID(session.ToUserID, session.RoomName)
