@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"letshare-server/internal/model"
 	"letshare-server/pkg/logger"
+	"strings"
 	"sync"
 	"time"
 
@@ -324,11 +325,13 @@ func (ws *WebSocketService) sendToClient(client *model.Client, message *model.We
 	}()
 
 	if writeErr != nil {
-		if !websocket.IsCloseError(writeErr, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+		if !isConnClosedError(writeErr) {
 			logrus.WithFields(logrus.Fields{
 				"client_id": client.ID,
 				"error":     writeErr.Error(),
 			}).Warn("发送消息失败，移除客户端")
+		} else {
+			logrus.WithField("client_id", client.ID).Debug("连接已关闭，移除客户端")
 		}
 		ws.RemoveClient(client.ID)
 	}
@@ -455,4 +458,19 @@ func (ws *WebSocketService) GetStats() map[string]interface{} {
 		"active_connections": activeConnections,
 		"total_rooms":        totalRooms,
 	}
+}
+
+func isConnClosedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "close sent") ||
+		strings.Contains(msg, "use of closed network connection") ||
+		websocket.IsCloseError(err,
+			websocket.CloseNormalClosure,
+			websocket.CloseGoingAway,
+			websocket.CloseNoStatusReceived,
+			websocket.CloseAbnormalClosure,
+		)
 }

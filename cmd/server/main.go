@@ -6,6 +6,7 @@ import (
 	"letshare-server/internal/middleware"
 	"letshare-server/internal/service"
 	"letshare-server/pkg/logger"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -13,6 +14,7 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -133,38 +135,42 @@ func main() {
 
 	// 优雅关闭
 	go func() {
+		addr := ":" + cfg.Server.Port
+
 		if cfg.TLS.Enabled {
-			// 检查证书文件是否存在
 			if _, err := os.Stat(cfg.TLS.CertFile); err == nil {
-				logrus.WithFields(logrus.Fields{
-					"port":   cfg.Server.Port,
-					"domain": cfg.TLS.Domain,
-				}).Info("启动 HTTPS/WSS 服务器")
-				// HTTP→HTTPS 301 重定向，监听 80 端口
-				go func() {
-					redirect := func(w http.ResponseWriter, req *http.Request) {
-						target := "https://" + req.Host + req.URL.RequestURI()
-						http.Redirect(w, req, target, http.StatusMovedPermanently)
+				if _, err := os.Stat(cfg.TLS.KeyFile); err == nil {
+					logrus.WithFields(logrus.Fields{
+						"port":   cfg.Server.Port,
+						"domain": cfg.TLS.Domain,
+					}).Info("启动 HTTPS/WSS 服务器")
+					go func() {
+						redirect := func(w http.ResponseWriter, req *http.Request) {
+							target := "https://" + req.Host + req.URL.RequestURI()
+							http.Redirect(w, req, target, http.StatusMovedPermanently)
+						}
+						logrus.Info("启动 HTTP→HTTPS 重定向 :80")
+						if err := http.ListenAndServe(":80", http.HandlerFunc(redirect)); err != nil {
+							logrus.WithError(err).Warn("HTTP重定向服务停止")
+						}
+					}()
+					if err := r.RunTLS(addr, cfg.TLS.CertFile, cfg.TLS.KeyFile); err != nil {
+						logrus.WithError(err).WithField("port", cfg.Server.Port).
+							Fatal("HTTPS 服务器启动失败: " + formatBindError(err))
 					}
-					logrus.Info("启动 HTTP→HTTPS 重定向 :80")
-					if err := http.ListenAndServe(":80", http.HandlerFunc(redirect)); err != nil {
-						logrus.WithError(err).Warn("HTTP重定向服务停止")
-					}
-				}()
-				if err := r.RunTLS(":"+cfg.Server.Port, cfg.TLS.CertFile, cfg.TLS.KeyFile); err != nil {
-					logrus.WithError(err).Fatal("HTTPS 服务器启动失败")
+				} else {
+					logrus.WithError(err).WithField("key_file", cfg.TLS.KeyFile).
+						Warn("SSL密钥文件不可访问，降级为HTTP模式")
+					startWithRetry(r, addr)
 				}
 			} else {
-				logrus.WithError(err).Warn("SSL证书文件不存在，降级为HTTP模式")
-				if err := r.Run(":" + cfg.Server.Port); err != nil {
-					logrus.WithError(err).Fatal("服务器启动失败")
-				}
+				logrus.WithError(err).WithField("cert_file", cfg.TLS.CertFile).
+					Warn("SSL证书文件不存在，降级为HTTP模式")
+				startWithRetry(r, addr)
 			}
 		} else {
 			logrus.Info("启动 HTTP/WS 服务器")
-			if err := r.Run(":" + cfg.Server.Port); err != nil {
-				logrus.WithError(err).Fatal("服务器启动失败")
-			}
+			startWithRetry(r, addr)
 		}
 	}()
 
@@ -176,4 +182,43 @@ func main() {
 	logrus.Info("正在关闭服务器...")
 	wsService.Shutdown()
 	logrus.Info("服务器已关闭")
+}
+
+func startWithRetry(r *gin.Engine, addr string) {
+	maxRetries := 3
+	for i := 0; i < maxRetries; i++ {
+		if err := r.Run(addr); err != nil {
+			msg := formatBindError(err)
+			logrus.WithError(err).WithField("addr", addr).Errorf("启动失败: %s", msg)
+			if isAddrInUse(err) && i < maxRetries-1 {
+				wait := time.Duration(i+1) * time.Second
+				logrus.WithField("retry_in", wait.String()).Warn("端口被占用，等待后重试...")
+				time.Sleep(wait)
+				continue
+			}
+			logrus.Fatal("服务器启动失败: " + msg)
+		}
+		break
+	}
+}
+
+func isAddrInUse(err error) bool {
+	if opErr, ok := err.(*net.OpError); ok {
+		if sysErr, ok := opErr.Err.(*os.SyscallError); ok {
+			return strings.Contains(sysErr.Error(), "address already in use") ||
+				strings.Contains(sysErr.Error(), "Only one usage")
+		}
+		return strings.Contains(opErr.Error(), "address already in use") ||
+			strings.Contains(opErr.Error(), "Only one usage")
+	}
+	return strings.Contains(err.Error(), "address already in use") ||
+		strings.Contains(err.Error(), "bind") &&
+			strings.Contains(err.Error(), "already in use")
+}
+
+func formatBindError(err error) string {
+	if isAddrInUse(err) {
+		return "端口已被占用，请检查是否有其他进程正在使用该端口，或更换端口后重试"
+	}
+	return err.Error()
 }

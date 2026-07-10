@@ -6,6 +6,7 @@ import (
 	"letshare-server/internal/model"
 	"letshare-server/internal/service"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -261,14 +262,12 @@ func (h *WebSocketHandler) HandleWebSocket(c *gin.Context) {
 				client.ConnMutex.Lock()
 				defer client.ConnMutex.Unlock()
 
-				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-					// 只在非预期错误时记录（忽略正常关闭）
-					if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-						logrus.WithField("client_id", clientID).Debug("连接已关闭，停止发送ping")
-					}
-					// 触发清理，不记录错误
-					done <- struct{}{}
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				if !isConnClosedError(err) {
+					logrus.WithField("client_id", clientID).WithError(err).Warn("发送ping失败")
 				}
+				done <- struct{}{}
+			}
 			}()
 		}
 	}
@@ -470,10 +469,14 @@ func (h *WebSocketHandler) sendMessage(client *model.Client, message *model.WebS
 	defer client.ConnMutex.Unlock()
 
 	if err := conn.WriteJSON(message); err != nil {
-		logrus.WithFields(logrus.Fields{
-			"client_id": client.ID,
-			"error":     err.Error(),
-		}).Error("发送消息失败")
+		if isConnClosedError(err) {
+			logrus.WithField("client_id", client.ID).Debug("连接已关闭，跳过发送消息")
+		} else {
+			logrus.WithFields(logrus.Fields{
+				"client_id": client.ID,
+				"error":     err.Error(),
+			}).Error("发送消息失败")
+		}
 	}
 }
 
@@ -1196,4 +1199,19 @@ func getMapKeys(data map[string]interface{}) []string {
 		keys = append(keys, k)
 	}
 	return keys
+}
+
+func isConnClosedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "close sent") ||
+		strings.Contains(msg, "use of closed network connection") ||
+		websocket.IsCloseError(err,
+			websocket.CloseNormalClosure,
+			websocket.CloseGoingAway,
+			websocket.CloseNoStatusReceived,
+			websocket.CloseAbnormalClosure,
+		)
 }
