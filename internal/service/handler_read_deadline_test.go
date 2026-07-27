@@ -29,8 +29,8 @@ func TestHandlerRefreshesReadDeadlineAfterAnyClientMessage(t *testing.T) {
 		t.Fatal("handleMessages should update LastPing after successful reads")
 	}
 	afterActive := body[readIndex+activeIndex:]
-	deadlineIndex := strings.Index(afterActive, "conn.SetReadDeadline(time.Now().Add(60 * time.Second))")
+	deadlineIndex := strings.Index(afterActive, "conn.SetReadDeadline(time.Now().Add(websocketReadTimeout))")
 	if deadlineIndex < 0 || deadlineIndex > 200 {
-		t.Fatal("successful client messages should refresh the websocket read deadline")
+		t.Fatal("successful client messages should refresh the websocket read deadline with the 120s mobile/background tolerance")
 	}
 }

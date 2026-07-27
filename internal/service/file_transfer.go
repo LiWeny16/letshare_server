@@ -255,8 +255,14 @@ func (fts *FileTransferService) ForwardChunkToReceiver(transferID string, framed
 	fts.sessionsMutex.Unlock()
 	session := &snapshot
 
-	// 查找接收者客户端
-	receiverClient, err := fts.findClientByUserID(session.ToUserID, session.RoomName)
+	// H1 fix: 不允许向已终止的会话转发数据块
+	if session.Status == "completed" || session.Status == "cancelled" || session.Status == "error" || session.Status == "rejected" {
+		return fmt.Errorf("传输会话已终止: %s (status=%s)", transferID, session.Status)
+	}
+
+	// Prefer the client that accepted this transfer. Same-user stale sockets can
+	// remain briefly after mobile/browser reconnects and should not receive chunks.
+	receiverClient, err := fts.findClientForSession(session.ToClientID, session.ToUserID, session.RoomName)
 	if err != nil {
 		return fmt.Errorf("找不到接收者: %w", err)
 	}
@@ -264,7 +270,25 @@ func (fts *FileTransferService) ForwardChunkToReceiver(transferID string, framed
 	// 发送二进制帧给接收者。锁必须在此释放，
 	// 因为后续 sendProgressUpdate → sendToClient 会对同一接收方再次加锁。
 	if err := fts.wsService.writeBinaryToClient(receiverClient, framedChunkData); err != nil {
-		return fmt.Errorf("转发数据块失败: %w", err)
+		if !fts.wsService.removeClientIfClosedWrite(receiverClient, err) {
+			return fmt.Errorf("转发数据块失败: %w", err)
+		}
+
+		reboundClient, reboundErr := fts.findClientByUserID(session.ToUserID, session.RoomName)
+		if reboundErr != nil || reboundClient.ID == receiverClient.ID {
+			return fmt.Errorf("转发数据块失败: %w", err)
+		}
+		if retryErr := fts.wsService.writeBinaryToClient(reboundClient, framedChunkData); retryErr != nil {
+			fts.wsService.removeClientIfClosedWrite(reboundClient, retryErr)
+			return fmt.Errorf("转发数据块失败: %w", retryErr)
+		}
+		if updateErr := fts.UpdateSessionClients(session.TransferID, session.FromClientID, reboundClient.ID); updateErr != nil {
+			logrus.WithFields(logrus.Fields{
+				"transfer_id": session.TransferID,
+				"client_id":   reboundClient.ID,
+				"error":       updateErr.Error(),
+			}).Warn("更新重绑定接收者客户端失败")
+		}
 	}
 
 	// 发送进度更新给发送者（锁已释放，安全）
@@ -301,19 +325,47 @@ func (fts *FileTransferService) ForwardChunkToReceiver(transferID string, framed
 
 // SendMessageToUser 发送消息给指定用户
 func (fts *FileTransferService) SendMessageToUser(userID, roomName string, message *model.WebSocketMessage) error {
-	client, err := fts.findClientByUserID(userID, roomName)
-	if err != nil {
-		return err
+	var lastWriteErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		client, err := fts.findClientByUserID(userID, roomName)
+		if err != nil {
+			if lastWriteErr != nil {
+				return fmt.Errorf("发送消息失败: %w", lastWriteErr)
+			}
+			return err
+		}
+
+		if err := fts.wsService.writeJSONToClient(client, message); err != nil {
+			lastWriteErr = err
+			if fts.wsService.removeClientIfClosedWrite(client, err) {
+				continue
+			}
+			return fmt.Errorf("发送消息失败: %w", err)
+		}
+
+		return nil
 	}
 
-	if err := fts.wsService.writeJSONToClient(client, message); err != nil {
-		return fmt.Errorf("发送消息失败: %w", err)
-	}
-
-	return nil
+	return fmt.Errorf("发送消息失败: %w", lastWriteErr)
 }
 
-// findClientByUserID 在房间中查找用户的客户端(最多重试3次,移动网络下客户端可能延迟注册)
+// findClientForSession resolves the websocket bound to an accepted transfer before falling back to user lookup.
+func (fts *FileTransferService) findClientForSession(clientID, userID, roomName string) (*model.Client, error) {
+	if clientID != "" {
+		if client, exists := fts.wsService.GetClientInRoom(clientID, roomName); exists {
+			if client.UserID == userID {
+				return client, nil
+			}
+			logrus.WithFields(logrus.Fields{
+				"client_id": clientID,
+				"user_id":   userID,
+				"room":      roomName,
+			}).Warn("记录的传输客户端用户不匹配，回退按用户查找")
+		}
+	}
+	return fts.findClientByUserID(userID, roomName)
+}
+
 func (fts *FileTransferService) findClientByUserID(userID, roomName string) (*model.Client, error) {
 	for attempt := 0; attempt < 3; attempt++ {
 		fts.wsService.clientsMutex.RLock()
@@ -322,7 +374,7 @@ func (fts *FileTransferService) findClientByUserID(userID, roomName string) (*mo
 		for _, client := range fts.wsService.clients {
 			if client.UserID == userID {
 				clientsSnapshot = append(clientsSnapshot, fmt.Sprintf("%s(rooms=%v,status=connected)", client.ID, client.Rooms))
-				if client.Rooms[roomName] {
+				if client.Rooms[roomName] && (found == nil || client.LastPing.After(found.LastPing)) {
 					found = client
 				}
 			}

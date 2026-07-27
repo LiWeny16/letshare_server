@@ -3,8 +3,10 @@ package handler
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"letshare-server/internal/model"
 	"letshare-server/internal/service"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -33,6 +35,8 @@ var upgrader = websocket.Upgrader{
 	// 写缓冲使用共享池，避免每连接固定分配 64KB
 	WriteBufferPool: wsWriteBufferPool,
 }
+
+const websocketReadTimeout = 120 * time.Second
 
 // ErrorRateLimiter 限制向客户端发送错误消息的频率
 // 防止移动网络重连风暴时大量错误消息淹没客户端
@@ -161,9 +165,9 @@ func (h *WebSocketHandler) HandleWebSocket(c *gin.Context) {
 			// 验证 subject 绑定：JWT 的 sub 必须匹配当前 userID
 			if claims.Subject == "" || claims.Subject != userID {
 				logrus.WithFields(logrus.Fields{
-					"client_id":      clientID,
-					"user_id":        userID,
-					"token_subject":  claims.Subject,
+					"client_id":     clientID,
+					"user_id":       userID,
+					"token_subject": claims.Subject,
 				}).Warn("PRO token subject 不匹配，拒绝授予 PRO 状态")
 			} else {
 				client.Metadata["isPro"] = true
@@ -210,10 +214,10 @@ func (h *WebSocketHandler) HandleWebSocket(c *gin.Context) {
 	}()
 
 	// 设置连接参数
-	conn.SetReadLimit(512 * 1024)                          // 512KB
-	conn.SetReadDeadline(time.Now().Add(60 * time.Second)) // 60s 移动网络容忍度
+	conn.SetReadLimit(512 * 1024)                              // 512KB
+	conn.SetReadDeadline(time.Now().Add(websocketReadTimeout)) // Chrome 后台节流需宽容
 	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(websocketReadTimeout))
 		client.LastPing = time.Now()
 		return nil
 	})
@@ -232,7 +236,11 @@ func (h *WebSocketHandler) HandleWebSocket(c *gin.Context) {
 					"panic":     r,
 				}).Error("消息处理goroutine发生panic")
 			}
-			close(done)
+			// Signal the owner loop without risking a second close/send.
+			select {
+			case done <- struct{}{}:
+			default:
+			}
 		}()
 		h.handleMessages(client, conn)
 	}()
@@ -262,12 +270,15 @@ func (h *WebSocketHandler) HandleWebSocket(c *gin.Context) {
 				client.ConnMutex.Lock()
 				defer client.ConnMutex.Unlock()
 
-			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				if !isConnClosedError(err) {
-					logrus.WithField("client_id", clientID).WithError(err).Warn("发送ping失败")
+				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					if !isConnClosedError(err) {
+						logrus.WithField("client_id", clientID).WithError(err).Warn("发送ping失败")
+					}
+					select {
+					case done <- struct{}{}:
+					default:
+					}
 				}
-				done <- struct{}{}
-			}
 			}()
 		}
 	}
@@ -293,7 +304,7 @@ func (h *WebSocketHandler) handleMessages(client *model.Client, conn *websocket.
 
 		// 更新最后活跃时间
 		client.LastPing = time.Now()
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(websocketReadTimeout))
 
 		// 根据消息类型处理
 		switch messageType {
@@ -1182,8 +1193,20 @@ func (h *WebSocketHandler) notifyTransferError(session *model.FileTransferSessio
 		},
 	)
 
-	h.fileTransferService.SendMessageToUser(session.FromUserID, session.RoomName, errorMsg)
-	h.fileTransferService.SendMessageToUser(session.ToUserID, session.RoomName, errorMsg)
+	if err := h.fileTransferService.SendMessageToUser(session.FromUserID, session.RoomName, errorMsg); err != nil {
+		logrus.WithFields(logrus.Fields{
+			"transfer_id": session.TransferID,
+			"user_id":     session.FromUserID,
+			"error":       err.Error(),
+		}).Warn("通知发送方传输错误失败")
+	}
+	if err := h.fileTransferService.SendMessageToUser(session.ToUserID, session.RoomName, errorMsg); err != nil {
+		logrus.WithFields(logrus.Fields{
+			"transfer_id": session.TransferID,
+			"user_id":     session.ToUserID,
+			"error":       err.Error(),
+		}).Warn("通知接收方传输错误失败")
+	}
 
 	// 延迟清理会话，给客户端时间处理错误消息
 	go func() {
@@ -1205,9 +1228,19 @@ func isConnClosedError(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "close sent") ||
 		strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "forcibly closed") ||
+		strings.Contains(msg, "connection aborted") ||
+		strings.Contains(msg, "connection was aborted") ||
+		strings.Contains(msg, "i/o timeout") ||
 		websocket.IsCloseError(err,
 			websocket.CloseNormalClosure,
 			websocket.CloseGoingAway,

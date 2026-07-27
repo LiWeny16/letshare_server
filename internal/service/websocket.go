@@ -2,9 +2,11 @@ package service
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"letshare-server/internal/model"
 	"letshare-server/pkg/logger"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -116,6 +118,17 @@ func (ws *WebSocketService) GetClient(clientID string) (*model.Client, bool) {
 	defer ws.clientsMutex.RUnlock()
 	client, exists := ws.clients[clientID]
 	return client, exists
+}
+
+func (ws *WebSocketService) GetClientInRoom(clientID, roomName string) (*model.Client, bool) {
+	ws.clientsMutex.RLock()
+	defer ws.clientsMutex.RUnlock()
+
+	client, exists := ws.clients[clientID]
+	if !exists || client.Rooms == nil || !client.Rooms[roomName] {
+		return nil, false
+	}
+	return client, true
 }
 
 // SubscribeToRoom 订阅房间
@@ -325,16 +338,27 @@ func (ws *WebSocketService) sendToClient(client *model.Client, message *model.We
 	}()
 
 	if writeErr != nil {
-		if !isConnClosedError(writeErr) {
+		if !ws.removeClientIfClosedWrite(client, writeErr) {
 			logrus.WithFields(logrus.Fields{
 				"client_id": client.ID,
 				"error":     writeErr.Error(),
-			}).Warn("发送消息失败，移除客户端")
-		} else {
-			logrus.WithField("client_id", client.ID).Debug("连接已关闭，移除客户端")
+			}).Warn("发送消息失败，保留客户端（可能是临时错误）")
+			// 不在此处移除客户端——临时写错误不应触发断连
 		}
-		ws.RemoveClient(client.ID)
 	}
+}
+
+// removeClientIfClosedWrite removes websockets that can no longer be written.
+func (ws *WebSocketService) removeClientIfClosedWrite(client *model.Client, err error) bool {
+	if client == nil || !isConnClosedError(err) {
+		return false
+	}
+	logrus.WithFields(logrus.Fields{
+		"client_id": client.ID,
+		"error":     err.Error(),
+	}).Debug("连接已关闭或不可继续写入，移除客户端")
+	ws.RemoveClient(client.ID)
+	return true
 }
 
 // removeClientFromRoom 从房间中移除客户端
@@ -464,9 +488,19 @@ func isConnClosedError(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "close sent") ||
 		strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "forcibly closed") ||
+		strings.Contains(msg, "connection aborted") ||
+		strings.Contains(msg, "connection was aborted") ||
+		strings.Contains(msg, "i/o timeout") ||
 		websocket.IsCloseError(err,
 			websocket.CloseNormalClosure,
 			websocket.CloseGoingAway,
