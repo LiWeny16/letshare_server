@@ -61,6 +61,12 @@ func (ws *WebSocketService) AddClient(client *model.Client) {
 
 // RemoveClient 移除客户端 - 彻底清理所有引用
 func (ws *WebSocketService) RemoveClient(clientID string) {
+	// removeClient performs the cleanupClientResources call and notifies
+	// downstream transfer cleanup for real disconnects.
+	ws.removeClient(clientID, true, "disconnect")
+}
+
+func (ws *WebSocketService) removeClient(clientID string, notifyDisconnect bool, reason string) {
 	ws.clientsMutex.Lock()
 	client, exists := ws.clients[clientID]
 	if !exists {
@@ -74,14 +80,18 @@ func (ws *WebSocketService) RemoveClient(clientID string) {
 
 	// 彻底清理客户端资源
 	if client != nil {
-		ws.cleanupClientResources(client)
+		ws.cleanupClientResources(client, notifyDisconnect)
 	}
 
-	logrus.WithField("client_id", clientID).Info("客户端断开")
+	logrus.WithFields(logrus.Fields{
+		"client_id": clientID,
+		"reason":    reason,
+		"notify":    notifyDisconnect,
+	}).Info("客户端断开")
 }
 
 // cleanupClientResources 彻底清理客户端相关资源
-func (ws *WebSocketService) cleanupClientResources(client *model.Client) {
+func (ws *WebSocketService) cleanupClientResources(client *model.Client, notifyDisconnect bool) {
 	// 关闭WebSocket连接
 	client.ConnMutex.Lock()
 	if conn, ok := client.Connection.(*websocket.Conn); ok {
@@ -107,7 +117,7 @@ func (ws *WebSocketService) cleanupClientResources(client *model.Client) {
 	client.Metadata = nil
 
 	// 通知文件传输等下游服务：该客户端已断开
-	if ws.onClientDisconnect != nil {
+	if notifyDisconnect && ws.onClientDisconnect != nil {
 		ws.onClientDisconnect(client.ID)
 	}
 }
@@ -357,7 +367,9 @@ func (ws *WebSocketService) removeClientIfClosedWrite(client *model.Client, err 
 		"client_id": client.ID,
 		"error":     err.Error(),
 	}).Debug("连接已关闭或不可继续写入，移除客户端")
-	ws.RemoveClient(client.ID)
+	// A closed write only proves this websocket lease is dead. It must not
+	// terminalize file-transfer state when the same user has already rebound.
+	ws.removeClient(client.ID, false, "closed_write")
 	return true
 }
 

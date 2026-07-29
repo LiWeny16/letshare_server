@@ -1,9 +1,16 @@
 package service
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"letshare-server/internal/model"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,26 +19,60 @@ import (
 
 // FileTransferService 文件传输服务
 type FileTransferService struct {
-	sessions      map[string]*model.FileTransferSession // transferID -> session
-	sessionsMutex sync.RWMutex
-	wsService     *WebSocketService
-	maxFileSize   int64 // 最大文件大小(PRO 统一上限 3GB)
-	chunkSize     int   // 默认分块大小
+	sessions          map[string]*model.FileTransferSession // transferID -> session
+	sessionsMutex     sync.RWMutex
+	chunkLedgers      map[string]*transferChunkLedger
+	chunkLedgersMutex sync.RWMutex
+	wsService         *WebSocketService
+	maxFileSize       int64 // 最大文件大小(PRO 统一上限 3GB)
+	chunkSize         int   // 默认分块大小
+	spoolDir          string
+}
+
+var ErrRelayReceiverUnavailable = errors.New("relay receiver unavailable")
+
+const (
+	relaySpoolDirPerm  os.FileMode = 0o700
+	relaySpoolFilePerm os.FileMode = 0o600
+	relaySpoolDirEnv               = "LETSHARE_RELAY_SPOOL_DIR"
+)
+
+func IsRelayReceiverUnavailable(err error) bool {
+	return errors.Is(err, ErrRelayReceiverUnavailable)
+}
+
+type transferChunkLedger struct {
+	transferID    string
+	totalChunks   int
+	chunkSize     int
+	fileSize      int64
+	received      map[int]int
+	bytesReceived int64
+	updatedAt     time.Time
 }
 
 // NewFileTransferService 创建文件传输服务
 func NewFileTransferService(wsService *WebSocketService, maxFileSize int64, chunkSize int) *FileTransferService {
 	fts := &FileTransferService{
-		sessions:    make(map[string]*model.FileTransferSession),
-		wsService:   wsService,
-		maxFileSize: maxFileSize,
-		chunkSize:   chunkSize,
+		sessions:     make(map[string]*model.FileTransferSession),
+		chunkLedgers: make(map[string]*transferChunkLedger),
+		wsService:    wsService,
+		maxFileSize:  maxFileSize,
+		chunkSize:    chunkSize,
+		spoolDir:     defaultRelaySpoolDir(),
 	}
 
 	// 启动会话清理
 	go fts.startSessionCleanup()
 
 	return fts
+}
+
+func defaultRelaySpoolDir() string {
+	if configured := strings.TrimSpace(os.Getenv(relaySpoolDirEnv)); configured != "" {
+		return configured
+	}
+	return filepath.Join(os.TempDir(), "letshare-relay-spool")
 }
 
 // NonProSizeLimit 非 PRO 用户的文件大小上限
@@ -168,6 +209,11 @@ func (fts *FileTransferService) HandleClientDisconnect(clientID string) {
 		transferID   string
 		roomName     string
 		notifyUserID string
+		role         string
+		fromUserID   string
+		toUserID     string
+		fromClientID string
+		toClientID   string
 		errorText    string
 		logText      string
 	}
@@ -182,62 +228,341 @@ func (fts *FileTransferService) HandleClientDisconnect(clientID string) {
 		}
 
 		if session.FromClientID == clientID {
-			session.Status = "error"
+			session.Status = "interrupted"
 			session.LastActivity = time.Now()
 			affectedSessions = append(affectedSessions, sessionInfo{
 				transferID:   transferID,
 				roomName:     session.RoomName,
 				notifyUserID: session.ToUserID,
-				errorText:    "发送者已断开连接",
-				logText:      "发送者断开，已通知接收者并标记传输错误",
+				role:         "sender",
+				fromUserID:   session.FromUserID,
+				toUserID:     session.ToUserID,
+				fromClientID: session.FromClientID,
+				toClientID:   session.ToClientID,
+				errorText:    "发送者连接中断，等待恢复",
+				logText:      "发送者断开，已标记传输中断并保留恢复状态",
 			})
 		} else if session.ToClientID == clientID {
-			session.Status = "error"
+			session.Status = "interrupted"
 			session.LastActivity = time.Now()
 			affectedSessions = append(affectedSessions, sessionInfo{
 				transferID:   transferID,
 				roomName:     session.RoomName,
 				notifyUserID: session.FromUserID,
-				errorText:    "接收者已断开连接",
-				logText:      "接收者断开，已通知发送者并标记传输错误",
+				role:         "receiver",
+				fromUserID:   session.FromUserID,
+				toUserID:     session.ToUserID,
+				fromClientID: session.FromClientID,
+				toClientID:   session.ToClientID,
+				errorText:    "接收者连接中断，等待恢复",
+				logText:      "接收者断开，已标记传输中断并保留恢复状态",
 			})
 		}
 	}
 	fts.sessionsMutex.Unlock()
 
 	for _, s := range affectedSessions {
-		errorMsg := model.NewWebSocketMessage(
-			model.MessageTypeFileTransferError,
-			s.roomName,
-			"",
-			map[string]interface{}{
-				"transfer_id": s.transferID,
-				"error":       s.errorText,
-			},
-		)
-		fts.SendMessageToUser(s.notifyUserID, s.roomName, errorMsg)
+		if state, err := fts.GetResumeState(s.transferID, s.notifyUserID); err == nil {
+			resumeMsg := model.NewWebSocketMessage(
+				model.MessageTypeFileTransferResumeState,
+				s.roomName,
+				"",
+				state,
+			)
+			if sendErr := fts.SendMessageToUser(s.notifyUserID, s.roomName, resumeMsg); sendErr != nil {
+				logrus.WithFields(logrus.Fields{
+					"operation":   "relay.disconnect_resume_state",
+					"transfer_id": s.transferID,
+					"user_id":     s.notifyUserID,
+					"error":       sendErr.Error(),
+				}).Warn("send relay resume state after disconnect failed")
+			}
+		}
 
 		logrus.WithFields(logrus.Fields{
-			"transfer_id": s.transferID,
-			"client_id":   clientID,
-		}).Info(s.logText)
-
-		// 延迟清理会话，给对方时间处理错误消息
-		go func(tid string) {
-			time.Sleep(5 * time.Second)
-			fts.RemoveSession(tid)
-		}(s.transferID)
+			"operation":      "relay.client_disconnect",
+			"transfer_id":    s.transferID,
+			"client_id":      clientID,
+			"role":           s.role,
+			"from_user_id":   s.fromUserID,
+			"to_user_id":     s.toUserID,
+			"from_client_id": s.fromClientID,
+			"to_client_id":   s.toClientID,
+			"error":          s.errorText,
+		}).Error(s.logText)
 	}
 }
 
 // RemoveSession 移除传输会话
 func (fts *FileTransferService) RemoveSession(transferID string) {
 	fts.sessionsMutex.Lock()
-	defer fts.sessionsMutex.Unlock()
-
 	delete(fts.sessions, transferID)
+	fts.sessionsMutex.Unlock()
+
+	fts.removeChunkLedger(transferID)
 
 	logrus.WithField("transfer_id", transferID).Info("移除文件传输会话")
+}
+
+func (fts *FileTransferService) transferSpoolDir(transferID string) string {
+	sum := sha256.Sum256([]byte(transferID))
+	return filepath.Join(fts.spoolDir, hex.EncodeToString(sum[:]))
+}
+
+func (fts *FileTransferService) chunkSpoolPath(transferID string, chunkIndex int) string {
+	return filepath.Join(fts.transferSpoolDir(transferID), fmt.Sprintf("chunk_%08d.frame", chunkIndex))
+}
+
+func (fts *FileTransferService) ensurePrivateSpoolDir(transferID string) error {
+	if err := os.MkdirAll(fts.spoolDir, relaySpoolDirPerm); err != nil {
+		return fmt.Errorf("create relay spool root: %w", err)
+	}
+	if err := os.Chmod(fts.spoolDir, relaySpoolDirPerm); err != nil {
+		return fmt.Errorf("secure relay spool root: %w", err)
+	}
+
+	spoolDir := fts.transferSpoolDir(transferID)
+	if err := os.MkdirAll(spoolDir, relaySpoolDirPerm); err != nil {
+		return fmt.Errorf("create relay spool dir: %w", err)
+	}
+	if err := os.Chmod(spoolDir, relaySpoolDirPerm); err != nil {
+		return fmt.Errorf("secure relay spool dir: %w", err)
+	}
+	return nil
+}
+
+func (fts *FileTransferService) removeChunkLedger(transferID string) {
+	fts.chunkLedgersMutex.Lock()
+	delete(fts.chunkLedgers, transferID)
+	fts.chunkLedgersMutex.Unlock()
+
+	if err := os.RemoveAll(fts.transferSpoolDir(transferID)); err != nil {
+		logrus.WithFields(logrus.Fields{
+			"operation":   "relay.spool_cleanup",
+			"transfer_id": transferID,
+			"error":       err.Error(),
+		}).Warn("cleanup relay spool failed")
+	}
+}
+
+func (fts *FileTransferService) expectedChunkSize(session *model.FileTransferSession, chunkIndex int) int {
+	if session.TotalChunks <= 1 {
+		return int(session.FileSize)
+	}
+	if chunkIndex == session.TotalChunks-1 {
+		size := session.FileSize - int64(chunkIndex*session.ChunkSize)
+		if size < 0 {
+			return 0
+		}
+		return int(size)
+	}
+	return session.ChunkSize
+}
+
+func (fts *FileTransferService) recordChunkReceipt(
+	session *model.FileTransferSession,
+	chunkMeta *model.FileTransferChunk,
+	framedChunkData []byte,
+	chunkDataSize int,
+) (*model.FileTransferResumeState, error) {
+	if chunkMeta == nil {
+		return nil, errors.New("missing chunk metadata")
+	}
+	if chunkMeta.TransferID != session.TransferID {
+		return nil, fmt.Errorf("chunk transfer_id mismatch: %s != %s", chunkMeta.TransferID, session.TransferID)
+	}
+	if chunkMeta.ChunkIndex < 0 || chunkMeta.ChunkIndex >= session.TotalChunks {
+		return nil, fmt.Errorf("chunk index out of range: %d/%d", chunkMeta.ChunkIndex, session.TotalChunks)
+	}
+	if chunkMeta.TotalChunks != session.TotalChunks {
+		return nil, fmt.Errorf("chunk total mismatch: %d != %d", chunkMeta.TotalChunks, session.TotalChunks)
+	}
+	expectedSize := fts.expectedChunkSize(session, chunkMeta.ChunkIndex)
+	if chunkDataSize != expectedSize {
+		return nil, fmt.Errorf("chunk size mismatch: index=%d expected=%d actual=%d", chunkMeta.ChunkIndex, expectedSize, chunkDataSize)
+	}
+
+	fts.chunkLedgersMutex.Lock()
+	defer fts.chunkLedgersMutex.Unlock()
+
+	ledger, exists := fts.chunkLedgers[session.TransferID]
+	if !exists {
+		ledger = &transferChunkLedger{
+			transferID:  session.TransferID,
+			totalChunks: session.TotalChunks,
+			chunkSize:   session.ChunkSize,
+			fileSize:    session.FileSize,
+			received:    make(map[int]int),
+			updatedAt:   time.Now(),
+		}
+		fts.chunkLedgers[session.TransferID] = ledger
+	}
+
+	if _, duplicate := ledger.received[chunkMeta.ChunkIndex]; !duplicate {
+		if err := fts.ensurePrivateSpoolDir(session.TransferID); err != nil {
+			return nil, err
+		}
+		spoolPath := fts.chunkSpoolPath(session.TransferID, chunkMeta.ChunkIndex)
+		tmpPath := spoolPath + ".tmp"
+		if err := os.WriteFile(tmpPath, framedChunkData, relaySpoolFilePerm); err != nil {
+			return nil, fmt.Errorf("write relay spool chunk: %w", err)
+		}
+		if err := os.Chmod(tmpPath, relaySpoolFilePerm); err != nil {
+			_ = os.Remove(tmpPath)
+			return nil, fmt.Errorf("secure relay spool chunk: %w", err)
+		}
+		if err := os.Rename(tmpPath, spoolPath); err != nil {
+			_ = os.Remove(tmpPath)
+			return nil, fmt.Errorf("commit relay spool chunk: %w", err)
+		}
+
+		ledger.received[chunkMeta.ChunkIndex] = chunkDataSize
+		ledger.bytesReceived += int64(chunkDataSize)
+	}
+	ledger.updatedAt = time.Now()
+
+	return buildResumeStateFromLedger(session, ledger, ""), nil
+}
+
+func (fts *FileTransferService) GetResumeState(transferID, userID string) (*model.FileTransferResumeState, error) {
+	session, err := fts.GetSession(transferID)
+	if err != nil {
+		return nil, err
+	}
+
+	role := ""
+	switch userID {
+	case session.FromUserID:
+		role = "sender"
+	case session.ToUserID:
+		role = "receiver"
+	default:
+		return nil, fmt.Errorf("user %s is not authorized for transfer %s", userID, transferID)
+	}
+
+	fts.chunkLedgersMutex.RLock()
+	defer fts.chunkLedgersMutex.RUnlock()
+
+	return buildResumeStateFromLedger(session, fts.chunkLedgers[transferID], role), nil
+}
+
+func (fts *FileTransferService) ReplaySpoolChunksToReceiver(transferID string, chunkIndexes []int) ([]int, []int, error) {
+	session, err := fts.GetSession(transferID)
+	if err != nil {
+		return nil, chunkIndexes, err
+	}
+	if session.Status == "completed" || session.Status == "cancelled" || session.Status == "error" || session.Status == "rejected" {
+		return nil, chunkIndexes, fmt.Errorf("transfer session is terminal: %s", session.Status)
+	}
+
+	receiverClient, err := fts.findClientForSession(session.ToClientID, session.ToUserID, session.RoomName)
+	if err != nil {
+		_ = fts.UpdateSessionStatus(transferID, "", "interrupted")
+		return nil, chunkIndexes, fmt.Errorf("%w: 找不到接收者: %v", ErrRelayReceiverUnavailable, err)
+	}
+
+	replayed := make([]int, 0, len(chunkIndexes))
+	missing := make([]int, 0)
+	seen := make(map[int]bool, len(chunkIndexes))
+	for _, chunkIndex := range chunkIndexes {
+		if seen[chunkIndex] {
+			continue
+		}
+		seen[chunkIndex] = true
+		if chunkIndex < 0 || chunkIndex >= session.TotalChunks {
+			missing = append(missing, chunkIndex)
+			continue
+		}
+
+		frame, readErr := os.ReadFile(fts.chunkSpoolPath(transferID, chunkIndex))
+		if errors.Is(readErr, os.ErrNotExist) {
+			missing = append(missing, chunkIndex)
+			continue
+		}
+		if readErr != nil {
+			return replayed, missing, fmt.Errorf("read relay spool chunk %d: %w", chunkIndex, readErr)
+		}
+
+		activeReceiver := receiverClient
+		if writeErr := fts.wsService.writeBinaryToClient(activeReceiver, frame); writeErr != nil {
+			if !fts.wsService.removeClientIfClosedWrite(activeReceiver, writeErr) {
+				_ = fts.UpdateSessionStatus(transferID, "", "interrupted")
+				return replayed, append(missing, chunkIndex), fmt.Errorf("%w: replay relay chunk failed: %v", ErrRelayReceiverUnavailable, writeErr)
+			}
+
+			reboundClient, reboundErr := fts.findClientByUserID(session.ToUserID, session.RoomName)
+			if reboundErr != nil || reboundClient.ID == activeReceiver.ID {
+				_ = fts.UpdateSessionStatus(transferID, "", "interrupted")
+				return replayed, append(missing, chunkIndex), fmt.Errorf("%w: replay relay chunk rebind failed: %v", ErrRelayReceiverUnavailable, reboundErr)
+			}
+			if retryErr := fts.wsService.writeBinaryToClient(reboundClient, frame); retryErr != nil {
+				fts.wsService.removeClientIfClosedWrite(reboundClient, retryErr)
+				_ = fts.UpdateSessionStatus(transferID, "", "interrupted")
+				return replayed, append(missing, chunkIndex), fmt.Errorf("%w: replay relay chunk retry failed: %v", ErrRelayReceiverUnavailable, retryErr)
+			}
+			receiverClient = reboundClient
+			if updateErr := fts.UpdateSessionClients(session.TransferID, session.FromClientID, reboundClient.ID); updateErr != nil {
+				logrus.WithFields(logrus.Fields{
+					"transfer_id": session.TransferID,
+					"client_id":   reboundClient.ID,
+					"error":       updateErr.Error(),
+				}).Warn("更新重绑定接收者客户端失败")
+			}
+		}
+
+		replayed = append(replayed, chunkIndex)
+	}
+
+	if len(replayed) > 0 && session.Status == "interrupted" {
+		_ = fts.UpdateSessionStatus(transferID, "", "transferring")
+	}
+
+	return replayed, missing, nil
+}
+
+func buildResumeStateFromLedger(
+	session *model.FileTransferSession,
+	ledger *transferChunkLedger,
+	role string,
+) *model.FileTransferResumeState {
+	receivedSet := make(map[int]bool)
+	receivedChunks := make([]int, 0)
+	bytesReceived := int64(0)
+	updatedAt := session.LastActivity
+
+	if ledger != nil {
+		bytesReceived = ledger.bytesReceived
+		updatedAt = ledger.updatedAt
+		for index := range ledger.received {
+			receivedSet[index] = true
+			receivedChunks = append(receivedChunks, index)
+		}
+		sort.Ints(receivedChunks)
+	}
+
+	missingChunks := make([]int, 0)
+	for index := 0; index < session.TotalChunks; index++ {
+		if !receivedSet[index] {
+			missingChunks = append(missingChunks, index)
+		}
+	}
+
+	return &model.FileTransferResumeState{
+		TransferID:     session.TransferID,
+		Status:         session.Status,
+		Role:           role,
+		RoomName:       session.RoomName,
+		FileName:       session.FileName,
+		FileSize:       session.FileSize,
+		ChunkSize:      session.ChunkSize,
+		TotalChunks:    session.TotalChunks,
+		ReceivedChunks: receivedChunks,
+		MissingChunks:  missingChunks,
+		ReceivedCount:  len(receivedChunks),
+		MissingCount:   len(missingChunks),
+		BytesReceived:  bytesReceived,
+		UpdatedAt:      updatedAt.UnixMilli(),
+	}
 }
 
 // ForwardChunkToReceiver 转发数据块给接收者(保留前端二进制帧头，接收端可直接按 transfer_id 定位)
@@ -260,27 +585,74 @@ func (fts *FileTransferService) ForwardChunkToReceiver(transferID string, framed
 		return fmt.Errorf("传输会话已终止: %s (status=%s)", transferID, session.Status)
 	}
 
+	resumeState, err := fts.recordChunkReceipt(session, chunkMeta, framedChunkData, chunkDataSize)
+	if err != nil {
+		logrus.WithFields(logrus.Fields{
+			"operation":   "relay.chunk_ledger.record",
+			"transfer_id": transferID,
+			"chunk_index": chunkMeta.ChunkIndex,
+			"chunk_size":  chunkDataSize,
+			"error":       err.Error(),
+		}).Error("record relay chunk state failed")
+		return fmt.Errorf("记录中转分片状态失败: %w", err)
+	}
+
 	// Prefer the client that accepted this transfer. Same-user stale sockets can
 	// remain briefly after mobile/browser reconnects and should not receive chunks.
 	receiverClient, err := fts.findClientForSession(session.ToClientID, session.ToUserID, session.RoomName)
 	if err != nil {
-		return fmt.Errorf("找不到接收者: %w", err)
+		_ = fts.UpdateSessionStatus(transferID, "", "interrupted")
+		return fmt.Errorf("%w: 找不到接收者: %v", ErrRelayReceiverUnavailable, err)
 	}
 
 	// 发送二进制帧给接收者。锁必须在此释放，
 	// 因为后续 sendProgressUpdate → sendToClient 会对同一接收方再次加锁。
 	if err := fts.wsService.writeBinaryToClient(receiverClient, framedChunkData); err != nil {
 		if !fts.wsService.removeClientIfClosedWrite(receiverClient, err) {
-			return fmt.Errorf("转发数据块失败: %w", err)
+			logrus.WithFields(logrus.Fields{
+				"operation":          "relay.forward_chunk.write_receiver",
+				"transfer_id":        transferID,
+				"chunk_index":        chunkMeta.ChunkIndex,
+				"chunk_size":         chunkDataSize,
+				"receiver_client_id": receiverClient.ID,
+				"receiver_user_id":   session.ToUserID,
+				"room":               session.RoomName,
+				"error":              err.Error(),
+			}).Error("relay receiver chunk write failed")
+			_ = fts.UpdateSessionStatus(transferID, "", "interrupted")
+			return fmt.Errorf("%w: 转发数据块失败: %v", ErrRelayReceiverUnavailable, err)
 		}
 
 		reboundClient, reboundErr := fts.findClientByUserID(session.ToUserID, session.RoomName)
 		if reboundErr != nil || reboundClient.ID == receiverClient.ID {
-			return fmt.Errorf("转发数据块失败: %w", err)
+			logrus.WithFields(logrus.Fields{
+				"operation":          "relay.forward_chunk.rebind_receiver",
+				"transfer_id":        transferID,
+				"chunk_index":        chunkMeta.ChunkIndex,
+				"chunk_size":         chunkDataSize,
+				"receiver_client_id": receiverClient.ID,
+				"receiver_user_id":   session.ToUserID,
+				"room":               session.RoomName,
+				"write_error":        err.Error(),
+				"rebind_error":       fmt.Sprint(reboundErr),
+			}).Error("relay receiver rebind failed after closed write")
+			_ = fts.UpdateSessionStatus(transferID, "", "interrupted")
+			return fmt.Errorf("%w: 转发数据块失败: %v", ErrRelayReceiverUnavailable, err)
 		}
 		if retryErr := fts.wsService.writeBinaryToClient(reboundClient, framedChunkData); retryErr != nil {
 			fts.wsService.removeClientIfClosedWrite(reboundClient, retryErr)
-			return fmt.Errorf("转发数据块失败: %w", retryErr)
+			logrus.WithFields(logrus.Fields{
+				"operation":          "relay.forward_chunk.write_rebound_receiver",
+				"transfer_id":        transferID,
+				"chunk_index":        chunkMeta.ChunkIndex,
+				"chunk_size":         chunkDataSize,
+				"receiver_client_id": reboundClient.ID,
+				"receiver_user_id":   session.ToUserID,
+				"room":               session.RoomName,
+				"error":              retryErr.Error(),
+			}).Error("relay rebound receiver chunk write failed")
+			_ = fts.UpdateSessionStatus(transferID, "", "interrupted")
+			return fmt.Errorf("%w: 转发数据块失败: %v", ErrRelayReceiverUnavailable, retryErr)
 		}
 		if updateErr := fts.UpdateSessionClients(session.TransferID, session.FromClientID, reboundClient.ID); updateErr != nil {
 			logrus.WithFields(logrus.Fields{
@@ -291,8 +663,12 @@ func (fts *FileTransferService) ForwardChunkToReceiver(transferID string, framed
 		}
 	}
 
+	if session.Status == "interrupted" {
+		_ = fts.UpdateSessionStatus(transferID, "", "transferring")
+	}
+
 	// 发送进度更新给发送者（锁已释放，安全）
-	bytesTransferred := int64(chunkMeta.ChunkIndex+1) * int64(session.ChunkSize)
+	bytesTransferred := resumeState.BytesReceived
 	if bytesTransferred > session.FileSize {
 		bytesTransferred = session.FileSize
 	}
@@ -481,8 +857,17 @@ func (fts *FileTransferService) cleanupStaleSessions() {
 		fts.sessionsMutex.Lock()
 		delete(fts.sessions, s.transferID)
 		fts.sessionsMutex.Unlock()
+		fts.removeChunkLedger(s.transferID)
 
-		logrus.WithField("transfer_id", s.transferID).Info("清理过期传输会话")
+		logrus.WithFields(logrus.Fields{
+			"operation":   "relay.session_timeout",
+			"transfer_id": s.transferID,
+			"from_user":   s.fromUserID,
+			"to_user":     s.toUserID,
+			"room":        s.roomName,
+			"timeout":     timeout.String(),
+			"error":       "传输会话超时",
+		}).Error("清理过期传输会话")
 	}
 }
 

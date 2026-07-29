@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"letshare-server/internal/model"
 	"letshare-server/internal/service"
+	"math"
 	"net"
 	"net/http"
 	"strings"
@@ -37,6 +39,8 @@ var upgrader = websocket.Upgrader{
 }
 
 const websocketReadTimeout = 120 * time.Second
+
+const maxRelayResendChunkIndexes = 256
 
 // ErrorRateLimiter 限制向客户端发送错误消息的频率
 // 防止移动网络重连风暴时大量错误消息淹没客户端
@@ -363,6 +367,8 @@ func (h *WebSocketHandler) processMessage(client *model.Client, message *model.W
 		h.handleFileTransferAck(client, message)
 	case model.MessageTypeFileTransferResend:
 		h.handleFileTransferResend(client, message)
+	case model.MessageTypeFileTransferResumeQuery:
+		h.handleFileTransferResumeQuery(client, message)
 	case model.MessageTypeFileTransferCancel:
 		h.handleFileTransferCancel(client, message)
 	case model.MessageTypeFileTransferProgress:
@@ -593,7 +599,7 @@ func (h *WebSocketHandler) handleFileChunk(client *model.Client, chunkMeta *mode
 		return
 	}
 
-	// 验证会话状态 — 允许 transferring 和 resending（重传）
+	// 验证会话状态 — 允许 transferring、resending 和 interrupted（等待接收端恢复）
 	if session.Status == "completed" {
 		logrus.WithFields(logrus.Fields{
 			"transfer_id": chunkMeta.TransferID,
@@ -601,7 +607,7 @@ func (h *WebSocketHandler) handleFileChunk(client *model.Client, chunkMeta *mode
 		}).Debug("ignore late file chunk for completed transfer")
 		return
 	}
-	if session.Status != "completed" && session.Status != "transferring" && session.Status != "resending" {
+	if session.Status != "completed" && session.Status != "transferring" && session.Status != "resending" && session.Status != "interrupted" {
 		// CRITICAL: 大文件传输中如果接收方断开/会话超时，后续chunk会走到这里
 		// 必须带上 transfer_id，否则触发客户端连锁错误
 		h.sendFileTransferError(client, 400, "传输会话状态错误: "+session.Status, chunkMeta.TransferID)
@@ -610,13 +616,65 @@ func (h *WebSocketHandler) handleFileChunk(client *model.Client, chunkMeta *mode
 
 	// 转发数据块给接收者(零拷贝)
 	if err := h.fileTransferService.ForwardChunkToReceiver(chunkMeta.TransferID, framedData, len(chunkData), chunkMeta); err != nil {
-		logrus.WithError(err).Error("转发文件数据块失败")
+		logrus.WithFields(logrus.Fields{
+			"operation":   "relay.forward_chunk",
+			"transfer_id": chunkMeta.TransferID,
+			"chunk_index": chunkMeta.ChunkIndex,
+			"chunk_size":  len(chunkData),
+			"client_id":   client.ID,
+			"user_id":     client.UserID,
+			"room":        session.RoomName,
+		}).WithError(err).Error("转发文件数据块失败")
+		if service.IsRelayReceiverUnavailable(err) {
+			if state, stateErr := h.fileTransferService.GetResumeState(chunkMeta.TransferID, client.UserID); stateErr == nil {
+				h.sendMessage(client, model.NewWebSocketMessage(
+					model.MessageTypeFileTransferResumeState,
+					state.RoomName,
+					"",
+					state,
+				))
+			}
+			return
+		}
+
 		h.sendFileTransferError(client, 500, "转发失败: "+err.Error(), chunkMeta.TransferID)
 
 		// 通知双方传输错误
 		h.notifyTransferError(session, "数据转发失败")
 		return
 	}
+}
+
+func (h *WebSocketHandler) handleFileTransferResumeQuery(client *model.Client, message *model.WebSocketMessage) {
+	var query model.FileTransferResumeQuery
+	if err := json.Unmarshal(message.Data, &query); err != nil {
+		h.sendFileTransferError(client, 400, "resume query data format error", "")
+		return
+	}
+	if query.TransferID == "" {
+		h.sendFileTransferError(client, 400, "missing transfer_id", "")
+		return
+	}
+
+	state, err := h.fileTransferService.GetResumeState(query.TransferID, client.UserID)
+	if err != nil {
+		logrus.WithFields(logrus.Fields{
+			"operation":   "relay.resume_state.query",
+			"transfer_id": query.TransferID,
+			"client_id":   client.ID,
+			"user_id":     client.UserID,
+			"error":       err.Error(),
+		}).Warn("relay resume state query failed")
+		h.sendFileTransferError(client, 404, err.Error(), query.TransferID)
+		return
+	}
+
+	h.sendMessage(client, model.NewWebSocketMessage(
+		model.MessageTypeFileTransferResumeState,
+		state.RoomName,
+		"",
+		state,
+	))
 }
 
 // handleFileTransferRequest 处理文件传输请求
@@ -886,7 +944,7 @@ func (h *WebSocketHandler) handleFileTransferEnd(client *model.Client, message *
 	}
 
 	// 验证状态转换合法性
-	if session.Status != "completed" && session.Status != "transferring" && session.Status != "resending" {
+	if session.Status != "completed" && session.Status != "transferring" && session.Status != "resending" && session.Status != "interrupted" {
 		h.sendFileTransferError(client, 400, "传输会话状态错误，无法结束传输: "+session.Status, transferID)
 		return
 	}
@@ -962,7 +1020,7 @@ func (h *WebSocketHandler) handleFileTransferComplete(client *model.Client, mess
 		logrus.WithField("transfer_id", transferID).Debug("ignore duplicate transfer complete")
 		return
 	}
-	if session.Status != "transferring" && session.Status != "ending" && session.Status != "resending" {
+	if session.Status != "transferring" && session.Status != "ending" && session.Status != "resending" && session.Status != "interrupted" {
 		h.sendFileTransferError(client, 400, "传输会话状态错误，无法确认完成: "+session.Status, transferID)
 		return
 	}
@@ -1024,7 +1082,7 @@ func (h *WebSocketHandler) handleFileTransferAck(client *model.Client, message *
 		return
 	}
 
-	if session.Status != "transferring" && session.Status != "resending" && session.Status != "ending" {
+	if session.Status != "transferring" && session.Status != "resending" && session.Status != "ending" && session.Status != "interrupted" {
 		logrus.WithFields(logrus.Fields{
 			"transfer_id": transferID,
 			"status":      session.Status,
@@ -1081,9 +1139,68 @@ func (h *WebSocketHandler) handleFileTransferResend(client *model.Client, messag
 		logrus.WithField("transfer_id", transferID).Debug("ignore late resend request for completed transfer")
 		return
 	}
-	if session.Status != "transferring" && session.Status != "ending" {
+	if session.Status != "transferring" && session.Status != "ending" && session.Status != "interrupted" {
 		h.sendFileTransferError(client, 400, "传输会话状态错误，无法请求重传: "+session.Status, transferID)
 		return
+	}
+
+	requestedChunkIndexes, err := parseRequestedChunkIndexes(data["chunk_indexes"], data["missing_count"], session.TotalChunks)
+	if err != nil {
+		h.sendFileTransferError(client, 400, err.Error(), transferID)
+		return
+	}
+	if len(requestedChunkIndexes) > 0 {
+		replayed, missing, replayErr := h.fileTransferService.ReplaySpoolChunksToReceiver(transferID, requestedChunkIndexes)
+		if replayErr != nil {
+			logrus.WithFields(logrus.Fields{
+				"operation":   "relay.spool_replay",
+				"transfer_id": transferID,
+				"requested":   len(requestedChunkIndexes),
+				"replayed":    len(replayed),
+				"missing":     len(missing),
+				"error":       replayErr.Error(),
+			}).Warn("relay spool replay failed")
+			if service.IsRelayReceiverUnavailable(replayErr) {
+				if state, stateErr := h.fileTransferService.GetResumeState(transferID, client.UserID); stateErr == nil {
+					h.sendMessage(client, model.NewWebSocketMessage(
+						model.MessageTypeFileTransferResumeState,
+						state.RoomName,
+						"",
+						state,
+					))
+				}
+				return
+			}
+		}
+
+		if len(replayed) > 0 {
+			logrus.WithFields(logrus.Fields{
+				"operation":   "relay.spool_replay",
+				"transfer_id": transferID,
+				"replayed":    replayed,
+				"missing":     missing,
+			}).Info("replayed relay chunks from server spool")
+		}
+
+		if len(replayed) > 0 && len(missing) == 0 {
+			endMsg := model.NewWebSocketMessage(
+				model.MessageTypeFileTransferEnd,
+				session.RoomName,
+				"",
+				map[string]interface{}{
+					"transfer_id": transferID,
+					"file_name":   session.FileName,
+					"file_size":   session.FileSize,
+				},
+			)
+			h.fileTransferService.SendMessageToUser(session.ToUserID, session.RoomName, endMsg)
+			return
+		}
+
+		if len(replayed) > 0 && len(missing) > 0 {
+			data["chunk_indexes"] = missing
+			data["missing_count"] = len(missing)
+		}
 	}
 
 	// 重传请求到达后进入 resending 恢复模式，等待发送端确认后回到 transferring。
@@ -1222,6 +1339,127 @@ func getMapKeys(data map[string]interface{}) []string {
 		keys = append(keys, k)
 	}
 	return keys
+}
+
+func parseRequestedChunkIndexes(value interface{}, missingCountValue interface{}, totalChunks int) ([]int, error) {
+	indexes, provided, err := parseChunkIndexes(value)
+	if err != nil {
+		return nil, err
+	}
+	if !provided {
+		return nil, nil
+	}
+	if totalChunks <= 0 {
+		return nil, fmt.Errorf("invalid total_chunks for resend")
+	}
+	if len(indexes) == 0 {
+		return nil, fmt.Errorf("chunk_indexes cannot be empty")
+	}
+	if len(indexes) > maxRelayResendChunkIndexes {
+		return nil, fmt.Errorf("chunk_indexes exceeds limit: %d > %d", len(indexes), maxRelayResendChunkIndexes)
+	}
+
+	seen := make(map[int]bool, len(indexes))
+	unique := make([]int, 0, len(indexes))
+	for _, index := range indexes {
+		if index < 0 || index >= totalChunks {
+			return nil, fmt.Errorf("chunk index out of range: %d/%d", index, totalChunks)
+		}
+		if seen[index] {
+			continue
+		}
+		seen[index] = true
+		unique = append(unique, index)
+	}
+
+	if missingCount, provided, err := parseNonNegativeInt(missingCountValue); err != nil {
+		return nil, fmt.Errorf("invalid missing_count: %w", err)
+	} else if provided && missingCount != len(unique) {
+		return nil, fmt.Errorf("missing_count mismatch: %d != %d", missingCount, len(unique))
+	}
+
+	return unique, nil
+}
+
+func parseChunkIndexes(value interface{}) ([]int, bool, error) {
+	switch typed := value.(type) {
+	case []int:
+		return typed, true, nil
+	case []float64:
+		indexes := make([]int, 0, len(typed))
+		for _, item := range typed {
+			index, err := parseFloatIndex(item)
+			if err != nil {
+				return nil, true, err
+			}
+			indexes = append(indexes, index)
+		}
+		return indexes, true, nil
+	case []interface{}:
+		indexes := make([]int, 0, len(typed))
+		for _, item := range typed {
+			index, err := parseChunkIndexValue(item)
+			if err != nil {
+				return nil, true, err
+			}
+			indexes = append(indexes, index)
+		}
+		return indexes, true, nil
+	default:
+		if value == nil {
+			return nil, false, nil
+		}
+		return nil, true, fmt.Errorf("chunk_indexes must be an array")
+	}
+}
+
+func parseChunkIndexValue(value interface{}) (int, error) {
+	switch v := value.(type) {
+	case int:
+		return v, nil
+	case int64:
+		if v > int64(math.MaxInt) || v < int64(math.MinInt) {
+			return 0, fmt.Errorf("chunk index outside int range")
+		}
+		return int(v), nil
+	case float64:
+		return parseFloatIndex(v)
+	case json.Number:
+		parsed, err := v.Int64()
+		if err != nil {
+			return 0, err
+		}
+		if parsed > int64(math.MaxInt) || parsed < int64(math.MinInt) {
+			return 0, fmt.Errorf("chunk index outside int range")
+		}
+		return int(parsed), nil
+	default:
+		return 0, fmt.Errorf("chunk index must be an integer")
+	}
+}
+
+func parseFloatIndex(value float64) (int, error) {
+	if math.IsNaN(value) || math.IsInf(value, 0) || math.Trunc(value) != value {
+		return 0, fmt.Errorf("chunk index must be a finite integer")
+	}
+	if value > float64(math.MaxInt) || value < float64(math.MinInt) {
+		return 0, fmt.Errorf("chunk index outside int range")
+	}
+	return int(value), nil
+}
+
+func parseNonNegativeInt(value interface{}) (int, bool, error) {
+	if value == nil {
+		return 0, false, nil
+	}
+	parsed, err := parseChunkIndexValue(value)
+	if err != nil {
+		return 0, true, err
+	}
+	if parsed < 0 {
+		return 0, true, fmt.Errorf("must be non-negative")
+	}
+	return parsed, true, nil
 }
 
 func isConnClosedError(err error) bool {

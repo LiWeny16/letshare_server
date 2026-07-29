@@ -28,6 +28,8 @@ type FileHook struct {
 	appendOnly bool // true: 只追加, 不在每次写入时读取整个文件
 }
 
+const errorLogRetention = 7 * 24 * time.Hour
+
 var (
 	fileHook *FileHook
 	once     sync.Once
@@ -83,12 +85,15 @@ func Init(level string, maxEntries int) {
 
 // Fire 实现 logrus.Hook 接口 — 追加写入, 不读取全文件
 func (hook *FileHook) Fire(entry *logrus.Entry) error {
-	if entry.Level > logrus.WarnLevel {
+	if entry.Level != logrus.ErrorLevel {
 		return nil
 	}
 
 	hook.mu.Lock()
 	defer hook.mu.Unlock()
+	if hook.writeFile == nil {
+		return fmt.Errorf("日志文件未打开")
+	}
 
 	logEntry := LogEntry{
 		Timestamp: entry.Time,
@@ -121,46 +126,22 @@ func (hook *FileHook) truncateIfNeeded() {
 		return
 	}
 
-	var logs []LogEntry
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		var le LogEntry
-		if json.Unmarshal([]byte(line), &le) == nil {
-			logs = append(logs, le)
-		}
-	}
-
-	if len(logs) <= hook.maxEntries {
+	logs := parseLogEntries(data)
+	retained := retainErrorLogs(logs, time.Now(), hook.maxEntries)
+	if logEntriesEqual(logs, retained) {
 		return
 	}
 
-	// 保留最新的
-	logs = logs[len(logs)-hook.maxEntries:]
-
-	f, err := os.Create(filename)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-
-	for _, le := range logs {
-		if b, err := json.Marshal(le); err == nil {
-			f.Write(append(b, '\n'))
-		}
+	hook.mu.Lock()
+	defer hook.mu.Unlock()
+	if err := hook.rewriteLogsLocked(retained); err != nil {
+		logrus.WithError(err).Error("裁剪错误日志失败")
 	}
 }
 
 // Levels 实现 logrus.Hook 接口
 func (hook *FileHook) Levels() []logrus.Level {
-	return []logrus.Level{
-		logrus.PanicLevel,
-		logrus.FatalLevel,
-		logrus.ErrorLevel,
-		logrus.WarnLevel,
-	}
+	return []logrus.Level{logrus.ErrorLevel}
 }
 
 // CleanupLogs 定期裁剪日志 (每 30 秒由维护任务调用)
@@ -179,47 +160,14 @@ func CleanupLogs() {
 		return
 	}
 
-	var logs []LogEntry
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		var le LogEntry
-		if json.Unmarshal([]byte(line), &le) == nil {
-			logs = append(logs, le)
-		}
-	}
-
-	if len(logs) <= fileHook.maxEntries {
+	logs := parseLogEntries(data)
+	retained := retainErrorLogs(logs, time.Now(), fileHook.maxEntries)
+	if logEntriesEqual(logs, retained) {
 		return
 	}
 
-	sort.Slice(logs, func(i, j int) bool {
-		return logs[i].Timestamp.After(logs[j].Timestamp)
-	})
-	logs = logs[:fileHook.maxEntries]
-
-	f, err := os.Create(filename)
-	if err != nil {
+	if err := fileHook.rewriteLogsLocked(retained); err != nil {
 		return
-	}
-	defer f.Close()
-
-	// 重新打开追加文件句柄
-	fileHook.writeFile.Close()
-	fileHook.writeFile = f
-
-	for _, le := range logs {
-		if b, err := json.Marshal(le); err == nil {
-			f.Write(append(b, '\n'))
-		}
-	}
-
-	// 重新以追加模式打开
-	newF, _ := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if newF != nil {
-		fileHook.writeFile = newF
 	}
 }
 
@@ -238,6 +186,20 @@ func GetErrorLogs(limit int) ([]LogEntry, error) {
 		return nil, err
 	}
 
+	logs := retainErrorLogs(parseLogEntries(data), time.Now(), 0)
+
+	sort.Slice(logs, func(i, j int) bool {
+		return logs[i].Timestamp.After(logs[j].Timestamp)
+	})
+
+	if limit > 0 && len(logs) > limit {
+		logs = logs[:limit]
+	}
+
+	return logs, nil
+}
+
+func parseLogEntries(data []byte) []LogEntry {
 	var logs []LogEntry
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
@@ -249,14 +211,72 @@ func GetErrorLogs(limit int) ([]LogEntry, error) {
 			logs = append(logs, le)
 		}
 	}
+	return logs
+}
 
-	sort.Slice(logs, func(i, j int) bool {
-		return logs[i].Timestamp.After(logs[j].Timestamp)
-	})
-
-	if limit > 0 && len(logs) > limit {
-		logs = logs[:limit]
+func retainErrorLogs(logs []LogEntry, now time.Time, maxEntries int) []LogEntry {
+	cutoff := now.Add(-errorLogRetention)
+	retained := make([]LogEntry, 0, len(logs))
+	for _, le := range logs {
+		if le.Level != logrus.ErrorLevel.String() {
+			continue
+		}
+		if le.Timestamp.IsZero() || le.Timestamp.Before(cutoff) {
+			continue
+		}
+		retained = append(retained, le)
 	}
 
-	return logs, nil
+	sort.SliceStable(retained, func(i, j int) bool {
+		return retained[i].Timestamp.Before(retained[j].Timestamp)
+	})
+	if maxEntries > 0 && len(retained) > maxEntries {
+		retained = retained[len(retained)-maxEntries:]
+	}
+	return retained
+}
+
+func logEntriesEqual(a, b []LogEntry) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !a[i].Timestamp.Equal(b[i].Timestamp) ||
+			a[i].Level != b[i].Level ||
+			a[i].Message != b[i].Message ||
+			fmt.Sprint(a[i].Fields) != fmt.Sprint(b[i].Fields) {
+			return false
+		}
+	}
+	return true
+}
+
+func (hook *FileHook) rewriteLogsLocked(logs []LogEntry) error {
+	filename := filepath.Join(hook.logDir, "errors.log")
+	if hook.writeFile != nil {
+		_ = hook.writeFile.Close()
+		hook.writeFile = nil
+	}
+
+	f, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	for _, le := range logs {
+		b, err := json.Marshal(le)
+		if err != nil {
+			_ = f.Close()
+			return err
+		}
+		if _, err := f.Write(append(b, '\n')); err != nil {
+			_ = f.Close()
+			return err
+		}
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+
+	hook.writeFile, err = os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	return err
 }

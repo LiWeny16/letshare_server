@@ -3,6 +3,10 @@ package service
 import (
 	"fmt"
 	"letshare-server/internal/model"
+	"os"
+	"path/filepath"
+	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -104,7 +108,10 @@ func TestUpdateSessionStatus_ResendFromTransferring(t *testing.T) {
 
 func TestUpdateSessionStatus_AllTransitions(t *testing.T) {
 	fts := newTestFTS()
-	tests := []struct{ setup, expected, new string; wantErr bool }{
+	tests := []struct {
+		setup, expected, new string
+		wantErr              bool
+	}{
 		{"pending", "pending", "accepted", false},
 		{"accepted", "accepted", "transferring", false},
 		{"transferring", "transferring", "ending", false},
@@ -161,6 +168,128 @@ func TestFileTransferSession_Lifecycle(t *testing.T) {
 	fts.RemoveSession("tf-lifecycle")
 	if _, err := fts.GetSession("tf-lifecycle"); err == nil {
 		t.Fatal("expected error after remove")
+	}
+}
+
+func TestRelayChunkLedgerResumeState(t *testing.T) {
+	fts := newTestFTS()
+	fts.spoolDir = t.TempDir()
+
+	req := validRequest()
+	req.TransferID = "tf-ledger"
+	req.FileSize = 10
+	req.ChunkSize = 4
+	createSession(t, fts, req, false)
+	if err := fts.UpdateSessionStatus(req.TransferID, "", "transferring"); err != nil {
+		t.Fatalf("start transfer: %v", err)
+	}
+	session, err := fts.GetSession(req.TransferID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+
+	chunk := &model.FileTransferChunk{
+		TransferID:  req.TransferID,
+		ChunkIndex:  1,
+		ChunkSize:   4,
+		TotalChunks: 3,
+	}
+	frame := []byte("frame-data")
+	state, err := fts.recordChunkReceipt(session, chunk, frame, 4)
+	if err != nil {
+		t.Fatalf("record chunk: %v", err)
+	}
+	if !reflect.DeepEqual(state.ReceivedChunks, []int{1}) {
+		t.Fatalf("received chunks = %v, want [1]", state.ReceivedChunks)
+	}
+	if !reflect.DeepEqual(state.MissingChunks, []int{0, 2}) {
+		t.Fatalf("missing chunks = %v, want [0 2]", state.MissingChunks)
+	}
+	if state.ReceivedCount != 1 || state.MissingCount != 2 || state.BytesReceived != 4 {
+		t.Fatalf("bad state counts: %+v", state)
+	}
+
+	spoolPath := filepath.Join(fts.transferSpoolDir(req.TransferID), "chunk_00000001.frame")
+	spoolInfo, err := os.Stat(spoolPath)
+	if err != nil {
+		t.Fatalf("spooled chunk missing: %v", err)
+	}
+	if runtime.GOOS != "windows" {
+		rootInfo, err := os.Stat(fts.spoolDir)
+		if err != nil {
+			t.Fatalf("spool root missing: %v", err)
+		}
+		transferInfo, err := os.Stat(fts.transferSpoolDir(req.TransferID))
+		if err != nil {
+			t.Fatalf("transfer spool dir missing: %v", err)
+		}
+		if got := rootInfo.Mode().Perm(); got != relaySpoolDirPerm {
+			t.Fatalf("spool root permissions = %v, want %v", got, relaySpoolDirPerm)
+		}
+		if got := transferInfo.Mode().Perm(); got != relaySpoolDirPerm {
+			t.Fatalf("transfer spool permissions = %v, want %v", got, relaySpoolDirPerm)
+		}
+		if got := spoolInfo.Mode().Perm(); got != relaySpoolFilePerm {
+			t.Fatalf("spool file permissions = %v, want %v", got, relaySpoolFilePerm)
+		}
+	}
+
+	state, err = fts.recordChunkReceipt(session, chunk, []byte("replacement"), 4)
+	if err != nil {
+		t.Fatalf("record duplicate chunk: %v", err)
+	}
+	if state.ReceivedCount != 1 || state.BytesReceived != 4 {
+		t.Fatalf("duplicate chunk should not change counts: %+v", state)
+	}
+}
+
+func TestFileTransferServiceUsesConfiguredSpoolDir(t *testing.T) {
+	customSpoolDir := filepath.Join(t.TempDir(), "relay-spool")
+	t.Setenv(relaySpoolDirEnv, customSpoolDir)
+
+	fts := newTestFTS()
+
+	if fts.spoolDir != customSpoolDir {
+		t.Fatalf("spoolDir = %q, want %q", fts.spoolDir, customSpoolDir)
+	}
+}
+
+func TestGetResumeStateRejectsUnauthorizedUser(t *testing.T) {
+	fts := newTestFTS()
+	req := validRequest()
+	req.TransferID = "tf-resume-auth"
+	createSession(t, fts, req, false)
+
+	if _, err := fts.GetResumeState(req.TransferID, "intruder"); err == nil {
+		t.Fatal("expected unauthorized resume query to fail")
+	}
+	state, err := fts.GetResumeState(req.TransferID, req.FromUserID)
+	if err != nil {
+		t.Fatalf("authorized sender resume query: %v", err)
+	}
+	if state.Role != "sender" || state.MissingCount != state.TotalChunks {
+		t.Fatalf("unexpected sender resume state: %+v", state)
+	}
+}
+
+func TestHandleClientDisconnectMarksInterruptedAndKeepsSession(t *testing.T) {
+	fts := newTestFTS()
+	req := validRequest()
+	req.TransferID = "tf-interrupted"
+	createSession(t, fts, req, false)
+	fts.UpdateSessionClients(req.TransferID, "sender-client", "receiver-client")
+	if err := fts.UpdateSessionStatus(req.TransferID, "", "transferring"); err != nil {
+		t.Fatalf("start transfer: %v", err)
+	}
+
+	fts.HandleClientDisconnect("receiver-client")
+
+	session, err := fts.GetSession(req.TransferID)
+	if err != nil {
+		t.Fatalf("session should remain available for resume: %v", err)
+	}
+	if session.Status != "interrupted" {
+		t.Fatalf("status = %s, want interrupted", session.Status)
 	}
 }
 

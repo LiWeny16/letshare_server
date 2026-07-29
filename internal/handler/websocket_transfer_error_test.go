@@ -3,6 +3,8 @@ package handler
 import (
 	"encoding/json"
 	"letshare-server/internal/model"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -62,5 +64,49 @@ func TestNotifyTransferErrorBypassesGenericRateLimiter(t *testing.T) {
 	}
 	if payload["transfer_id"] != session.TransferID {
 		t.Fatalf("transfer_id = %v, want %s", payload["transfer_id"], session.TransferID)
+	}
+}
+
+func TestParseRequestedChunkIndexesValidatesBoundsAndCount(t *testing.T) {
+	indexes, err := parseRequestedChunkIndexes(
+		[]interface{}{float64(0), float64(2), float64(2)},
+		float64(2),
+		3,
+	)
+	if err != nil {
+		t.Fatalf("valid chunk indexes: %v", err)
+	}
+	if !reflect.DeepEqual(indexes, []int{0, 2}) {
+		t.Fatalf("indexes = %v, want [0 2]", indexes)
+	}
+
+	tooMany := make([]interface{}, maxRelayResendChunkIndexes+1)
+	for i := range tooMany {
+		tooMany[i] = float64(0)
+	}
+
+	tests := []struct {
+		name         string
+		value        interface{}
+		missingCount interface{}
+		totalChunks  int
+		want         string
+	}{
+		{name: "negative index", value: []interface{}{float64(-1)}, missingCount: float64(1), totalChunks: 3, want: "out of range"},
+		{name: "fractional index", value: []interface{}{1.5}, missingCount: float64(1), totalChunks: 3, want: "finite integer"},
+		{name: "out of range", value: []interface{}{float64(3)}, missingCount: float64(1), totalChunks: 3, want: "out of range"},
+		{name: "too many", value: tooMany, missingCount: float64(len(tooMany)), totalChunks: 3, want: "exceeds limit"},
+		{name: "missing count mismatch", value: []interface{}{float64(0), float64(1)}, missingCount: float64(1), totalChunks: 3, want: "missing_count mismatch"},
+		{name: "invalid missing count", value: []interface{}{float64(0)}, missingCount: "1", totalChunks: 3, want: "invalid missing_count"},
+		{name: "empty array", value: []interface{}{}, missingCount: float64(0), totalChunks: 3, want: "cannot be empty"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := parseRequestedChunkIndexes(tt.value, tt.missingCount, tt.totalChunks)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("expected error containing %q, got %v", tt.want, err)
+			}
+		})
 	}
 }

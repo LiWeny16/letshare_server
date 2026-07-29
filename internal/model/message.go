@@ -15,18 +15,20 @@ const (
 	MessageTypeMessage     = "message"
 	MessageTypeError       = "error"
 	// 文件传输相关消息类型
-	MessageTypeFileTransferRequest  = "file:transfer:request"  // 发起文件传输请求
-	MessageTypeFileTransferAccept   = "file:transfer:accept"   // 接受文件传输
-	MessageTypeFileTransferReject   = "file:transfer:reject"   // 拒绝文件传输
-	MessageTypeFileTransferStart    = "file:transfer:start"    // 开始传输
-	MessageTypeFileTransferChunk    = "file:transfer:chunk"    // 传输数据块(二进制)
-	MessageTypeFileTransferEnd      = "file:transfer:end"      // 传输完成
-	MessageTypeFileTransferComplete = "file:transfer:complete" // 接收方已完成文件组装
-	MessageTypeFileTransferAck      = "file:transfer:ack"      // receiver has processed relay chunks
-	MessageTypeFileTransferResend   = "file:transfer:resend"   // 接收方请求重传缺失分片
-	MessageTypeFileTransferCancel   = "file:transfer:cancel"   // 取消传输
-	MessageTypeFileTransferError    = "file:transfer:error"    // 传输错误
-	MessageTypeFileTransferProgress = "file:transfer:progress" // 传输进度
+	MessageTypeFileTransferRequest     = "file:transfer:request"      // 发起文件传输请求
+	MessageTypeFileTransferAccept      = "file:transfer:accept"       // 接受文件传输
+	MessageTypeFileTransferReject      = "file:transfer:reject"       // 拒绝文件传输
+	MessageTypeFileTransferStart       = "file:transfer:start"        // 开始传输
+	MessageTypeFileTransferChunk       = "file:transfer:chunk"        // 传输数据块(二进制)
+	MessageTypeFileTransferEnd         = "file:transfer:end"          // 传输完成
+	MessageTypeFileTransferComplete    = "file:transfer:complete"     // 接收方已完成文件组装
+	MessageTypeFileTransferAck         = "file:transfer:ack"          // receiver has processed relay chunks
+	MessageTypeFileTransferResend      = "file:transfer:resend"       // 接收方请求重传缺失分片
+	MessageTypeFileTransferResumeQuery = "file:transfer:resume-query" // query relay chunk state
+	MessageTypeFileTransferResumeState = "file:transfer:resume-state" // relay chunk state response
+	MessageTypeFileTransferCancel      = "file:transfer:cancel"       // 取消传输
+	MessageTypeFileTransferError       = "file:transfer:error"        // 传输错误
+	MessageTypeFileTransferProgress    = "file:transfer:progress"     // 传输进度
 )
 
 // WebSocketMessage 表示WebSocket消息（兼容Ably格式）
@@ -120,15 +122,15 @@ func NewRoom(name string) *Room {
 
 // FileTransferRequest 文件传输请求信息
 type FileTransferRequest struct {
-	TransferID  string `json:"transfer_id"`          // 传输会话ID
-	FileName    string `json:"file_name"`            // 文件名
-	FileSize    int64  `json:"file_size"`            // 文件大小(字节)
-	FileType    string `json:"file_type"`            // 文件MIME类型
-	ChunkSize   int    `json:"chunk_size"`           // 分块大小(字节)
-	TotalChunks int    `json:"total_chunks"`         // 总块数
-	FromUserID  string `json:"from_user_id"`         // 发送者用户ID
-	ToUserID    string `json:"to_user_id"`           // 接收者用户ID
-	RoomName    string `json:"room_name"`            // 房间名称
+	TransferID  string `json:"transfer_id"`  // 传输会话ID
+	FileName    string `json:"file_name"`    // 文件名
+	FileSize    int64  `json:"file_size"`    // 文件大小(字节)
+	FileType    string `json:"file_type"`    // 文件MIME类型
+	ChunkSize   int    `json:"chunk_size"`   // 分块大小(字节)
+	TotalChunks int    `json:"total_chunks"` // 总块数
+	FromUserID  string `json:"from_user_id"` // 发送者用户ID
+	ToUserID    string `json:"to_user_id"`   // 接收者用户ID
+	RoomName    string `json:"room_name"`    // 房间名称
 	FlowControl string `json:"flow_control,omitempty"`
 	// is_pro 由服务端根据 WebSocket 握手时的 JWT 判定，不从客户端请求中读取
 }
@@ -152,6 +154,27 @@ type FileTransferProgress struct {
 	Percentage       float64 `json:"percentage"`
 }
 
+type FileTransferResumeQuery struct {
+	TransferID string `json:"transfer_id"`
+}
+
+type FileTransferResumeState struct {
+	TransferID     string `json:"transfer_id"`
+	Status         string `json:"status"`
+	Role           string `json:"role,omitempty"`
+	RoomName       string `json:"room_name,omitempty"`
+	FileName       string `json:"file_name,omitempty"`
+	FileSize       int64  `json:"file_size"`
+	ChunkSize      int    `json:"chunk_size"`
+	TotalChunks    int    `json:"total_chunks"`
+	ReceivedChunks []int  `json:"received_chunks"`
+	MissingChunks  []int  `json:"missing_chunks"`
+	ReceivedCount  int    `json:"received_count"`
+	MissingCount   int    `json:"missing_count"`
+	BytesReceived  int64  `json:"bytes_received"`
+	UpdatedAt      int64  `json:"updated_at"`
+}
+
 // FileTransferSession 文件传输会话
 type FileTransferSession struct {
 	TransferID   string
@@ -167,5 +190,5 @@ type FileTransferSession struct {
 	TotalChunks  int
 	StartTime    time.Time
 	LastActivity time.Time
-	Status       string // "pending", "accepted", "rejected", "transferring", "resending", "ending", "completed", "cancelled", "error"
+	Status       string // "pending", "accepted", "rejected", "transferring", "resending", "interrupted", "ending", "completed", "cancelled", "error"
 }

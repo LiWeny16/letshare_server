@@ -345,3 +345,153 @@ func TestForwardChunkToReceiverRebindsClosedAcceptedClient(t *testing.T) {
 		t.Fatalf("ToClientID = %s, want receiver-active-new", updated.ToClientID)
 	}
 }
+
+func TestForwardChunkToReceiverRebindsClosedAcceptedClientWithDisconnectCallback(t *testing.T) {
+	ws := NewWebSocketService(10)
+	fts := NewFileTransferService(ws, 3*1024*1024*1024, 65536)
+	ws.SetOnClientDisconnect(func(clientID string) {
+		fts.HandleClientDisconnect(clientID)
+	})
+
+	_, _ = newDeadlineTestClient(t, ws, "sender-client", "sender-user", "room1")
+	_, closedReceiverServerConn := newDeadlineTestClient(t, ws, "receiver-accepted-closed", "receiver-user", "room1")
+	activeReceiverConn, _ := newDeadlineTestClient(t, ws, "receiver-active-new", "receiver-user", "room1")
+
+	session, err := fts.CreateTransferSession(&model.FileTransferRequest{
+		TransferID:  "transfer-rebind-receiver-with-callback",
+		FileName:    "rebind-callback.bin",
+		FileSize:    6,
+		FileType:    "application/octet-stream",
+		ChunkSize:   6,
+		FromUserID:  "sender-user",
+		ToUserID:    "receiver-user",
+		RoomName:    "room1",
+		TotalChunks: 1,
+	}, false)
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := fts.UpdateSessionClients(session.TransferID, "sender-client", "receiver-accepted-closed"); err != nil {
+		t.Fatalf("update clients: %v", err)
+	}
+	if err := fts.UpdateSessionStatus(session.TransferID, "pending", "accepted"); err != nil {
+		t.Fatalf("accept session: %v", err)
+	}
+	if err := fts.UpdateSessionStatus(session.TransferID, "accepted", "transferring"); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	if client, exists := ws.GetClient("receiver-active-new"); exists {
+		client.LastPing = time.Now().Add(time.Second)
+	}
+
+	chunk := &model.FileTransferChunk{
+		TransferID:  session.TransferID,
+		ChunkIndex:  0,
+		ChunkSize:   6,
+		TotalChunks: 1,
+	}
+	payload := []byte("ABCDEF")
+	meta, _ := json.Marshal(chunk)
+	frame := make([]byte, 256+len(payload))
+	copy(frame[:256], meta)
+	copy(frame[256:], payload)
+
+	closedReceiverServerConn.Close()
+
+	if err := fts.ForwardChunkToReceiver(session.TransferID, frame, len(payload), chunk); err != nil {
+		t.Fatalf("ForwardChunkToReceiver should rebind to active same-user receiver after closed accepted client: %v", err)
+	}
+
+	activeReceiverConn.SetReadDeadline(time.Now().Add(time.Second))
+	messageType, raw, err := activeReceiverConn.ReadMessage()
+	if err != nil {
+		t.Fatalf("active receiver should receive rebound chunk: %v", err)
+	}
+	if messageType != websocket.BinaryMessage {
+		t.Fatalf("message type = %d, want binary", messageType)
+	}
+	if !bytes.Equal(raw, frame) {
+		t.Fatalf("rebound frame mismatch")
+	}
+
+	updated, err := fts.GetSession(session.TransferID)
+	if err != nil {
+		t.Fatalf("get updated session: %v", err)
+	}
+	if updated.Status != "transferring" {
+		t.Fatalf("Status = %s, want transferring", updated.Status)
+	}
+	if updated.ToClientID != "receiver-active-new" {
+		t.Fatalf("ToClientID = %s, want receiver-active-new", updated.ToClientID)
+	}
+}
+
+func TestReplaySpoolChunksToReceiverReplaysAvailableChunks(t *testing.T) {
+	ws := NewWebSocketService(10)
+	fts := NewFileTransferService(ws, 3*1024*1024*1024, 65536)
+	fts.spoolDir = t.TempDir()
+	receiverConn, _ := newDeadlineTestClient(t, ws, "receiver-client", "receiver-user", "room1")
+
+	session, err := fts.CreateTransferSession(&model.FileTransferRequest{
+		TransferID: "transfer-spool-replay",
+		FileName:   "replay.bin",
+		FileSize:   12,
+		FileType:   "application/octet-stream",
+		ChunkSize:  6,
+		FromUserID: "sender-user",
+		ToUserID:   "receiver-user",
+		RoomName:   "room1",
+	}, false)
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := fts.UpdateSessionClients(session.TransferID, "sender-client", "receiver-client"); err != nil {
+		t.Fatalf("update clients: %v", err)
+	}
+	if err := fts.UpdateSessionStatus(session.TransferID, "pending", "transferring"); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+
+	chunk := &model.FileTransferChunk{
+		TransferID:  session.TransferID,
+		ChunkIndex:  0,
+		ChunkSize:   6,
+		TotalChunks: 2,
+	}
+	payload := []byte("ABCDEF")
+	meta, _ := json.Marshal(chunk)
+	frame := make([]byte, 256+len(payload))
+	copy(frame[:256], meta)
+	copy(frame[256:], payload)
+
+	updated, err := fts.GetSession(session.TransferID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if _, err := fts.recordChunkReceipt(updated, chunk, frame, len(payload)); err != nil {
+		t.Fatalf("record chunk: %v", err)
+	}
+
+	replayed, missing, err := fts.ReplaySpoolChunksToReceiver(session.TransferID, []int{0, 1})
+	if err != nil {
+		t.Fatalf("replay spool chunks: %v", err)
+	}
+	if len(replayed) != 1 || replayed[0] != 0 {
+		t.Fatalf("replayed = %v, want [0]", replayed)
+	}
+	if len(missing) != 1 || missing[0] != 1 {
+		t.Fatalf("missing = %v, want [1]", missing)
+	}
+
+	receiverConn.SetReadDeadline(time.Now().Add(time.Second))
+	messageType, raw, err := receiverConn.ReadMessage()
+	if err != nil {
+		t.Fatalf("receiver should receive replayed chunk: %v", err)
+	}
+	if messageType != websocket.BinaryMessage {
+		t.Fatalf("message type = %d, want binary", messageType)
+	}
+	if !bytes.Equal(raw, frame) {
+		t.Fatalf("replayed frame mismatch")
+	}
+}
