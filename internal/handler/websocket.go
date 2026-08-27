@@ -548,13 +548,30 @@ func (h *WebSocketHandler) sendFileTransferError(client *model.Client, code int,
 	h.sendMessage(client, errorMsg)
 }
 
-// processBinaryMessage 处理二进制消息(文件数据块)
-func (h *WebSocketHandler) processBinaryMessage(client *model.Client, data []byte) {
-	// 二进制消息格式: 前面是JSON元数据(固定长度或分隔符),后面是实际数据
-	// 这里我们假设客户端先发送JSON元数据,再发送二进制数据
-	// 因此在收到二进制消息时,我们需要先解析元数据
+// mediaFrameHeaderSize 媒体帧固定头大小（与客户端 callSignaling.ts 的 MEDIA_FRAME_HEADER_SIZE 一致）
+const mediaFrameHeaderSize = 24
 
-	// 简化处理:假设前256字节是JSON元数据头,剩余是数据
+// mediaFrameCallIDBytes 媒体帧头中 callId 占用字节数
+const mediaFrameCallIDBytes = 16
+
+// mediaFrameMaxPayload 单帧 payload 上限（64KB，防止异常大包占用内存/带宽）
+const mediaFrameMaxPayload = 64 * 1024
+
+// isMediaFrame 判断二进制帧是否为通话媒体帧（"medi" 魔数开头）
+func isMediaFrame(data []byte) bool {
+	return len(data) >= mediaFrameHeaderSize+1 && data[0] == 'm' && data[1] == 'e' && data[2] == 'd' && data[3] == 'i'
+}
+
+// processBinaryMessage 处理二进制消息(文件数据块 / 通话媒体帧)
+func (h *WebSocketHandler) processBinaryMessage(client *model.Client, data []byte) {
+	// 媒体帧（通话公网兜底轨道）：24字节固定头 [callId 16B | seq 2B | track 1B | padding 5B] + 裸 payload。
+	// 盲转发：不解析 payload，按头内 callId 定向转发。
+	if isMediaFrame(data) {
+		h.handleMediaFrame(client, data)
+		return
+	}
+
+	// 文件传输二进制：前256字节是JSON元数据头,剩余是数据
 	if len(data) < 256 {
 		h.sendFileTransferError(client, 400, "二进制消息格式错误", "")
 		return
@@ -572,6 +589,100 @@ func (h *WebSocketHandler) processBinaryMessage(client *model.Client, data []byt
 	// 提取实际数据(跳过元数据部分)，但转发时保留完整帧，接收端可直接按 transfer_id 定位会话
 	chunkData := data[256:]
 	h.handleFileChunk(client, &chunkMeta, chunkData, data)
+}
+
+// handleMediaFrame 处理通话媒体帧（公网兜底轨道）。
+// 帧头 layout（24B，与客户端 encodeMediaFrame 一致）：
+//
+//	[0..4)   "medi" 魔数
+//	[4..20)  callId (ascii, \0 填充)
+//	[20..22) seq (uint16 BE)
+//	[22)     track: 0=audio 1=video 2=data
+//	[23)     padding
+//
+// 转发语义：盲转发。服务器不解析 payload，不做会话管理、不做重传。
+// 目标用户定位：媒体帧是 1对1 通话，发送方所在房间 + 头内 callId 关联的对端。
+// 由于服务器不维护通话会话表，这里采用"房间内除发送方外的全部用户"广播，
+// 由客户端按 callId 过滤丢弃非本通话帧（与信令 publish 广播同语义，零会话状态）。
+func (h *WebSocketHandler) handleMediaFrame(client *model.Client, frame []byte) {
+	if len(frame) < mediaFrameHeaderSize {
+		return
+	}
+	payloadLen := len(frame) - mediaFrameHeaderSize
+	if payloadLen > mediaFrameMaxPayload {
+		logrus.WithFields(logrus.Fields{
+			"client_id": client.ID,
+			"payload":   payloadLen,
+		}).Warn("媒体帧 payload 超过上限，丢弃")
+		return
+	}
+
+	// 发送方必须已加入某个房间才能定位对端
+	var roomName string
+	for r := range client.Rooms {
+		roomName = r
+		break
+	}
+	if roomName == "" {
+		return
+	}
+
+	// callId 仅用于日志，不解析 payload
+	callID := mediaFrameCallID(frame)
+	seq := mediaFrameSeq(frame)
+	track := frame[18]
+
+	// 转发给房间内除发送方外的全部用户（客户端按 callId 过滤）
+	forwarded := 0
+	for _, target := range h.wsService.GetRoomClients(roomName) {
+		if target.ID == client.ID {
+			continue
+		}
+		if err := h.wsService.WriteBinaryToClient(target, frame); err != nil {
+			logrus.WithFields(logrus.Fields{
+				"operation":    "media.forward",
+				"call_id":      callID,
+				"seq":          seq,
+				"track":        track,
+				"target":       target.UserID,
+				"room":         roomName,
+				"error":        err.Error(),
+			}).Debug("媒体帧转发失败")
+			continue
+		}
+		forwarded++
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"operation": "media.forward",
+		"call_id":   callID,
+		"seq":       seq,
+		"track":     track,
+		"payload":   payloadLen,
+		"room":      roomName,
+		"forwarded": forwarded,
+	}).Debug("媒体帧已转发")
+}
+
+// mediaFrameCallID 从媒体帧头提取 callId（offset 4, ascii, 遇 \0 截断）
+func mediaFrameCallID(frame []byte) string {
+	if len(frame) < 4+mediaFrameCallIDBytes {
+		return ""
+	}
+	for i := 0; i < mediaFrameCallIDBytes; i++ {
+		if frame[4+i] == 0 {
+			return string(frame[4 : 4+i])
+		}
+	}
+	return string(frame[4 : 4+mediaFrameCallIDBytes])
+}
+
+// mediaFrameSeq 从媒体帧头提取 seq (uint16 BE, offset 20)
+func mediaFrameSeq(frame []byte) uint16 {
+	if len(frame) < 22 {
+		return 0
+	}
+	return uint16(frame[20])<<8 | uint16(frame[21])
 }
 
 // handleFileChunk 处理文件数据块

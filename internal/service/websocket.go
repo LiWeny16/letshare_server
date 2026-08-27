@@ -141,6 +141,46 @@ func (ws *WebSocketService) GetClientInRoom(clientID, roomName string) (*model.C
 	return client, true
 }
 
+// GetRoomClients 返回房间内所有客户端的快照（按 LastPing 最新者优先去重同一用户）。
+// 用于媒体帧等需要按房间定向转发的场景。
+func (ws *WebSocketService) GetRoomClients(roomName string) []*model.Client {
+	ws.clientsMutex.RLock()
+	defer ws.clientsMutex.RUnlock()
+
+	seen := make(map[string]bool)
+	result := make([]*model.Client, 0, 8)
+	for _, client := range ws.clients {
+		if client.Rooms == nil || !client.Rooms[roomName] {
+			continue
+		}
+		if client.Connection == nil {
+			continue
+		}
+		if seen[client.UserID] {
+			continue
+		}
+		seen[client.UserID] = true
+		result = append(result, client)
+	}
+	return result
+}
+
+// FindClientByUserID 按用户ID在指定房间中查找连接最新的客户端（单次尝试，不重试）。
+func (ws *WebSocketService) FindClientByUserID(userID, roomName string) *model.Client {
+	ws.clientsMutex.RLock()
+	defer ws.clientsMutex.RUnlock()
+
+	var found *model.Client
+	for _, client := range ws.clients {
+		if client.UserID == userID && client.Rooms != nil && client.Rooms[roomName] && client.Connection != nil {
+			if found == nil || client.LastPing.After(found.LastPing) {
+				found = client
+			}
+		}
+	}
+	return found
+}
+
 // SubscribeToRoom 订阅房间
 func (ws *WebSocketService) SubscribeToRoom(clientID, roomName, event string) error {
 	// 验证房间名
@@ -308,6 +348,11 @@ func (ws *WebSocketService) writeBinaryToClient(client *model.Client, data []byt
 	return ws.writeToClient(client, func(conn *websocket.Conn) error {
 		return conn.WriteMessage(websocket.BinaryMessage, data)
 	})
+}
+
+// WriteBinaryToClient 是 writeBinaryToClient 的导出别名，供 handler 等外部包调用。
+func (ws *WebSocketService) WriteBinaryToClient(client *model.Client, data []byte) error {
+	return ws.writeBinaryToClient(client, data)
 }
 
 func (ws *WebSocketService) writeToClient(client *model.Client, write func(*websocket.Conn) error) error {
