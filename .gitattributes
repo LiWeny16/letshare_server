@@ -1,0 +1,2 @@
+# 强制 Go 源码用 LF 行尾，避免跨平台 autocrlf 污染 diff
+*.go text eol=lf

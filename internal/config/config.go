@@ -20,6 +20,7 @@ type Config struct {
 	Runtime      Runtime      `mapstructure:"runtime"`
 	GLM          GLM          `mapstructure:"glm"`
 	JWT          JWT          `mapstructure:"jwt"`
+	TURN         TURN         `mapstructure:"turn"`
 }
 
 type Server struct {
@@ -57,6 +58,19 @@ type FileTransfer struct {
 type JWT struct {
 	Secret          string `mapstructure:"secret"`
 	ExpirationHours int    `mapstructure:"expiration_hours"`
+}
+
+// TURN 短效凭据签发配置（RFC 5766 use-auth-secret 模式）
+type TURN struct {
+	// Enabled 是否启用 TURN 凭据端点。false 时 /api/turn-credentials 返回 404。
+	Enabled bool `mapstructure:"enabled"`
+	// Secret 与 coturn 的 static-auth-secret 一致，用于签发短效 HMAC 凭据。
+	// 绝不进 git：通过 LETSHARE_TURN_SECRET 环境变量或服务器配置文件注入。
+	Secret string `mapstructure:"secret"`
+	// URIs coturn 服务器地址列表（下发前端 iceServers 用）。
+	URIs []string `mapstructure:"uris"`
+	// TTLSeconds 短效凭据有效期（秒）。
+	TTLSeconds int `mapstructure:"ttl_seconds"`
 }
 
 type Runtime struct {
@@ -115,6 +129,10 @@ func setDefaults() {
 	viper.SetDefault("file_transfer.pro_invite_code", "bigonion")
 	viper.SetDefault("jwt.secret", "letshare-jwt-secret-key-2024")
 	viper.SetDefault("jwt.expiration_hours", 720) // 30 天
+	viper.SetDefault("turn.enabled", false)
+	viper.SetDefault("turn.secret", os.Getenv("LETSHARE_TURN_SECRET"))
+	viper.SetDefault("turn.uris", []string{"turn:ecs.letshare.fun:3478"})
+	viper.SetDefault("turn.ttl_seconds", 600) // 10 分钟
 	viper.SetDefault("runtime.gomaxprocs", 0)                  // 使用所有核心
 	viper.SetDefault("glm.base_url", "https://open.bigmodel.cn/api/paas/v4")
 	viper.SetDefault("glm.model_opus", os.Getenv("GLM_MODEL_OPUS"))

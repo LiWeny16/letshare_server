@@ -122,10 +122,12 @@ func main() {
 
 	// 路由
 	proHandler := handler.NewProHandler(jwtService, cfg.FileTransfer.ProInviteCode)
+	turnHandler := handler.NewTurnHandler(cfg.TURN.Enabled, cfg.TURN.Secret, cfg.TURN.URIs, cfg.TURN.TTLSeconds)
 
 	r.GET("/health", healthHandler.Health)
 	r.GET("/metrics", healthHandler.Metrics)
 	r.POST("/api/pro/activate", proHandler.Activate)
+	r.GET("/api/turn-credentials", turnHandler.Credentials)
 	r.GET("/ws", wsHandler.HandleWebSocket)
 	r.GET("/", wsHandler.HandleWebSocket)
 	r.Any("/api/glm/*path", glmHandler.Proxy)
