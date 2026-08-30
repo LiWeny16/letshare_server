@@ -61,10 +61,11 @@ func (h *TurnHandler) Credentials(c *gin.Context) {
 		return
 	}
 
-	now := time.Now()
-	unix := now.Unix()
-	// RFC 5766: username = "<unix>:<ttl秒>"
-	username := strconv.FormatInt(unix, 10) + ":" + strconv.Itoa(h.ttlSeconds)
+	// RFC 5766 use-auth-secret 短效凭据：username = "<过期时间戳>:<用户标识>"，
+	// credential = Base64(HMAC-SHA1(secret, username))。
+	// 过期时间戳 = 当前 unix + TTL 秒数（到期后 coturn 拒绝该凭据）。
+	expiry := time.Now().Unix() + int64(h.ttlSeconds)
+	username := strconv.FormatInt(expiry, 10) + ":letshare"
 	credential := turnHMACSHA1(h.secret, username)
 
 	iceServers := make([]gin.H, 0, len(h.uris))

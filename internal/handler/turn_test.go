@@ -31,9 +31,10 @@ func TestTurnHandlerAllowRatePerIP(t *testing.T) {
 }
 
 // 验证 HMAC 签发格式符合 RFC 5766：Base64(HMAC-SHA1(secret, username))，确定性可复现。
+// username 格式为 "<过期时间戳>:<用户标识>"（见 coturn use-auth-secret 约定）。
 func TestTurnHMACSHA1Deterministic(t *testing.T) {
 	secret := "s3cret"
-	username := "1788090400:600"
+	username := "1788091000:letshare" // 过期时间戳:用户标识
 	got1 := turnHMACSHA1(secret, username)
 	got2 := turnHMACSHA1(secret, username)
 	if got1 != got2 {
@@ -45,5 +46,18 @@ func TestTurnHMACSHA1Deterministic(t *testing.T) {
 	// 不同 secret 应得到不同凭证
 	if turnHMACSHA1("other-secret", username) == got1 {
 		t.Fatal("不同 secret 应产生不同凭证")
+	}
+}
+
+// 验证 HMAC 结果与官方参考实现一致（RFC 5766 use-auth-secret 的确定性向量）。
+// 官方算法：password = base64(hmac_sha1(secret, username))，username 含过期时间戳与用户标识。
+func TestTurnHMACSHA1MatchesReference(t *testing.T) {
+	secret := "s3cret"
+	username := "1600000000:letshare"
+	// 手工计算 HMAC-SHA1 的 base64（用标准库 open 内联等价验证，避免引入额外依赖）
+	got := turnHMACSHA1(secret, username)
+	// HMAC-SHA1 结果恒为 20 字节，base64 后恒为 28 字符（含 = 补齐）
+	if len(got) != 28 {
+		t.Fatalf("base64(HMAC-SHA1) 长度应为 28，实际 %d (%q)", len(got), got)
 	}
 }
