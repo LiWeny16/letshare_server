@@ -38,3 +38,19 @@ file_transfer:
 
 runtime:
   gomaxprocs: 0  # 0 = use all available CPU cores
+
+# TURN 嵌入式中继（pion/turn，随主进程启动）。
+# secret 绝不进 git：部署时用环境变量 LETSHARE_TURN_SECRET 注入
+# （viper AutomaticEnv：LETSHARE_TURN_SECRET → turn.secret）。
+# 安全组须放行：3478/udp + 3478/tcp（listener），49160-49200/udp（中继端口段）。
+turn:
+  enabled: true
+  public_ip: "101.133.108.16"     # ecs.letshare.fun 公网 IP（RelayAddress 下发用）
+  port: 3478
+  relay_port_min: 49160
+  relay_port_max: 49200
+  realm: "letshare.fun"
+  uris:
+    - "turn:ecs.letshare.fun:3478?transport=udp"
+    - "turn:ecs.letshare.fun:3478?transport=tcp"
+  ttl_seconds: 600

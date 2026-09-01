@@ -60,17 +60,27 @@ type JWT struct {
 	ExpirationHours int    `mapstructure:"expiration_hours"`
 }
 
-// TURN 短效凭据签发配置（RFC 5766 use-auth-secret 模式）
+// TURN 短效凭据签发配置（RFC 5766 use-auth-secret 模式）。
+// Enabled 同时控制凭据端点与嵌入式 pion/turn 中继服务。
 type TURN struct {
-	// Enabled 是否启用 TURN 凭据端点。false 时 /api/turn-credentials 返回 404。
+	// Enabled 是否启用 TURN（凭据端点 + 嵌入式中继）。false 时 /api/turn-credentials 返回 404 且不启动中继。
 	Enabled bool `mapstructure:"enabled"`
-	// Secret 与 coturn 的 static-auth-secret 一致，用于签发短效 HMAC 凭据。
+	// Secret 与签发/校验共用的 static-auth-secret。
 	// 绝不进 git：通过 LETSHARE_TURN_SECRET 环境变量或服务器配置文件注入。
 	Secret string `mapstructure:"secret"`
-	// URIs coturn 服务器地址列表（下发前端 iceServers 用）。
+	// URIs coturn/pion 服务器地址列表（下发前端 iceServers 用）。
 	URIs []string `mapstructure:"uris"`
 	// TTLSeconds 短效凭据有效期（秒）。
 	TTLSeconds int `mapstructure:"ttl_seconds"`
+	// PublicIP 中继下发给客户端的公网 IP（RelayAddress；本地默认 127.0.0.1）。
+	PublicIP string `mapstructure:"public_ip"`
+	// Port 嵌入式 TURN listener 端口（UDP+TCP 同端口，默认 3478）。
+	Port int `mapstructure:"port"`
+	// RelayPortMin / RelayPortMax 中继端口段（含两端，默认 49160-49200）。
+	RelayPortMin int `mapstructure:"relay_port_min"`
+	RelayPortMax int `mapstructure:"relay_port_max"`
+	// Realm TURN realm（默认 letshare.fun）。
+	Realm string `mapstructure:"realm"`
 }
 
 type Runtime struct {
@@ -131,8 +141,13 @@ func setDefaults() {
 	viper.SetDefault("jwt.expiration_hours", 720) // 30 天
 	viper.SetDefault("turn.enabled", false)
 	viper.SetDefault("turn.secret", os.Getenv("LETSHARE_TURN_SECRET"))
-	viper.SetDefault("turn.uris", []string{"turn:ecs.letshare.fun:3478"})
-	viper.SetDefault("turn.ttl_seconds", 600) // 10 分钟
+	viper.SetDefault("turn.uris", []string{"turn:ecs.letshare.fun:3478?transport=udp", "turn:ecs.letshare.fun:3478?transport=tcp"})
+	viper.SetDefault("turn.ttl_seconds", 600)  // 10 分钟
+	viper.SetDefault("turn.public_ip", "127.0.0.1") // 本地默认；生产须配服务器公网 IP
+	viper.SetDefault("turn.port", 3478)             // TURN/STUN listener（UDP+TCP 同端口）
+	viper.SetDefault("turn.relay_port_min", 49160)  // 中继端口段下界
+	viper.SetDefault("turn.relay_port_max", 49200)  // 中继端口段上界
+	viper.SetDefault("turn.realm", "letshare.fun")
 	viper.SetDefault("runtime.gomaxprocs", 0)                  // 使用所有核心
 	viper.SetDefault("glm.base_url", "https://open.bigmodel.cn/api/paas/v4")
 	viper.SetDefault("glm.model_opus", os.Getenv("GLM_MODEL_OPUS"))

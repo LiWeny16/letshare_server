@@ -1,16 +1,14 @@
 package handler
 
 import (
-	"crypto/hmac"
-	"crypto/sha1"
-	"encoding/base64"
 	"net/http"
-	"strconv"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
+
+	"letshare-server/internal/turnauth"
 )
 
 // TurnHandler 签发短效 TURN 凭据（RFC 5766 use-auth-secret 模式）。
@@ -61,12 +59,11 @@ func (h *TurnHandler) Credentials(c *gin.Context) {
 		return
 	}
 
-	// RFC 5766 use-auth-secret 短效凭据：username = "<过期时间戳>:<用户标识>"，
-	// credential = Base64(HMAC-SHA1(secret, username))。
-	// 过期时间戳 = 当前 unix + TTL 秒数（到期后 coturn 拒绝该凭据）。
+	// RFC 5766 use-auth-secret 短效凭据（构造与校验统一在 turnauth 包，
+	// 与嵌入式 TURN 服务的 AuthHandler 共享同一事实源）。
 	expiry := time.Now().Unix() + int64(h.ttlSeconds)
-	username := strconv.FormatInt(expiry, 10) + ":letshare"
-	credential := turnHMACSHA1(h.secret, username)
+	username := turnauth.BuildUsername(time.Unix(expiry, 0))
+	credential := turnauth.Credential(h.secret, username)
 
 	iceServers := make([]gin.H, 0, len(h.uris))
 	for _, u := range h.uris {
@@ -86,11 +83,4 @@ func (h *TurnHandler) Credentials(c *gin.Context) {
 		"ice_servers": iceServers,
 		"ttl_seconds": h.ttlSeconds,
 	})
-}
-
-// turnHMACSHA1 计算 RFC 5766 短效凭据：Base64(HMAC-SHA1(secret, username))。
-func turnHMACSHA1(secret, username string) string {
-	mac := hmac.New(sha1.New, []byte(secret))
-	mac.Write([]byte(username))
-	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
 }

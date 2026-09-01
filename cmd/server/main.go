@@ -5,6 +5,7 @@ import (
 	"letshare-server/internal/handler"
 	"letshare-server/internal/middleware"
 	"letshare-server/internal/service"
+	"letshare-server/internal/turnserver"
 	"letshare-server/pkg/logger"
 	"net"
 	"net/http"
@@ -120,6 +121,25 @@ func main() {
 	healthHandler := handler.NewHealthHandler(wsService)
 	glmHandler := handler.NewGLMHandler(cfg.GLM)
 
+	// 嵌入式 TURN/STUN 中继（与 HTTP/WS 同进程；凭据签发端点共享同一 secret）
+	var turnRelay *turnserver.Server
+	if cfg.TURN.Enabled && cfg.TURN.Secret != "" {
+		relay, err := turnserver.Start(turnserver.Config{
+			Secret:       cfg.TURN.Secret,
+			PublicIP:     cfg.TURN.PublicIP,
+			Port:         cfg.TURN.Port,
+			RelayPortMin: cfg.TURN.RelayPortMin,
+			RelayPortMax: cfg.TURN.RelayPortMax,
+			Realm:        cfg.TURN.Realm,
+		})
+		if err != nil {
+			logrus.WithError(err).Fatal("嵌入式 TURN 服务启动失败")
+		}
+		turnRelay = relay
+	} else {
+		logrus.Info("TURN 未启用（turn.enabled=false 或 secret 为空）")
+	}
+
 	// 路由
 	proHandler := handler.NewProHandler(jwtService, cfg.FileTransfer.ProInviteCode)
 	turnHandler := handler.NewTurnHandler(cfg.TURN.Enabled, cfg.TURN.Secret, cfg.TURN.URIs, cfg.TURN.TTLSeconds)
@@ -182,6 +202,7 @@ func main() {
 	<-quit
 
 	logrus.Info("正在关闭服务器...")
+	turnRelay.Close()
 	wsService.Shutdown()
 	logrus.Info("服务器已关闭")
 }
