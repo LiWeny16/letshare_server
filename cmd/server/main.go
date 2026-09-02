@@ -171,8 +171,8 @@ func main() {
 							target := "https://" + req.Host + req.URL.RequestURI()
 							http.Redirect(w, req, target, http.StatusMovedPermanently)
 						}
-						logrus.Info("启动 HTTP→HTTPS 重定向 :80")
-						if err := http.ListenAndServe(":80", http.HandlerFunc(redirect)); err != nil {
+						logrus.Info("启动 HTTP→HTTPS 重定向 :8080") // :80 已让给 nginx（letshare.fun CDN HTTP 回源）
+						if err := http.ListenAndServe(":8080", http.HandlerFunc(redirect)); err != nil {
 							logrus.WithError(err).Warn("HTTP重定向服务停止")
 						}
 					}()
