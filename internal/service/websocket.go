@@ -462,6 +462,25 @@ func (ws *WebSocketService) removeClientFromRoom(clientID, roomName string) {
 	}
 }
 
+// SendDirectedToUser 定向发送一条消息给房间内指定的（按 UserID 去重取最新连接的）客户端。
+// 用于 SFU 会议信令等需要“服务端直连单个 uniqId”的定向下发场景。
+// msgType 是下行消息类型（如 meeting:sdp / meeting:ice），event 通常传 "signal:"+toUserID。
+// 返回是否送达。
+func (ws *WebSocketService) SendDirectedToUser(roomName, toUserID, event, msgType string, data interface{}) bool {
+	client := ws.FindClientByUserID(toUserID, roomName)
+	if client == nil {
+		logrus.WithFields(logrus.Fields{
+			"room": roomName,
+			"to":   toUserID,
+			"event": event,
+		}).Debug("定向发送目标不存在于房间")
+		return false
+	}
+	msg := model.NewWebSocketMessage(msgType, roomName, event, data)
+	ws.sendToClient(client, msg)
+	return true
+}
+
 // RoomHasUserID 判断房间内是否仍有指定 userID 的活跃连接（用于离场广播去重：多标签页时同 userID 其它连接仍在则不下发 leave）。
 func (ws *WebSocketService) RoomHasUserID(roomName, userID string) bool {
 	ws.roomsMutex.RLock()
@@ -493,8 +512,12 @@ func (ws *WebSocketService) BroadcastMembershipEvent(roomName, event string, dat
 
 	msg := model.NewWebSocketMessage(model.MessageTypeMessage, roomName, event, data)
 	count := 0
+
+	// 在持读锁时只收集收件人，绝不在此持锁状态下 sendToClient：
+	// sendToClient 的写路径若失败会经 removeClientIfClosedWrite 申请写锁，
+	// 同一 goroutine 持读锁再要写锁会死锁。
 	ws.clientsMutex.RLock()
-	defer ws.clientsMutex.RUnlock()
+	recipients := make([]*model.Client, 0, 4)
 	for clientID := range room.ClientIDs {
 		client, ok := ws.clients[clientID]
 		if !ok || client.Connection == nil {
@@ -506,6 +529,11 @@ func (ws *WebSocketService) BroadcastMembershipEvent(roomName, event string, dat
 		if !client.Events["signal:all"] {
 			continue
 		}
+		recipients = append(recipients, client)
+	}
+	ws.clientsMutex.RUnlock()
+
+	for _, client := range recipients {
 		ws.sendToClient(client, msg)
 		count++
 	}

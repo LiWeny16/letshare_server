@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"letshare-server/internal/model"
 	"letshare-server/internal/service"
+	"letshare-server/internal/sfu"
 	"math"
 	"net"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/pion/webrtc/v4"
 	"github.com/sirupsen/logrus"
 )
 
@@ -108,6 +110,7 @@ type WebSocketHandler struct {
 	fileTransferService *service.FileTransferService
 	jwtService          *service.JWTService
 	errorRateLimiter    *ErrorRateLimiter
+	sfuManager          *sfu.Manager
 }
 
 func NewWebSocketHandler(wsService *service.WebSocketService, authService *service.AuthService, fileTransferService *service.FileTransferService, jwtService *service.JWTService) *WebSocketHandler {
@@ -117,6 +120,9 @@ func NewWebSocketHandler(wsService *service.WebSocketService, authService *servi
 		fileTransferService: fileTransferService,
 		jwtService:          jwtService,
 		errorRateLimiter:    NewErrorRateLimiter(),
+		// 默认 SFU Manager：生产使用空 SettingEngine（真实 ICE）。
+		// 测试可用 SetSFU 注入离线引擎。
+		sfuManager: sfu.MustNewManager(&webrtc.SettingEngine{}),
 	}
 
 	// 注册客户端断开回调：当 WebSocket 客户端断开时，清理其作为发送方的文件传输会话
@@ -125,6 +131,13 @@ func NewWebSocketHandler(wsService *service.WebSocketService, authService *servi
 	})
 
 	return handler
+}
+
+// SetSFU 注入/替换 SFU Manager（主要用于测试注入离线回环引擎；生产直接用默认 Manager）。
+func (h *WebSocketHandler) SetSFU(m *sfu.Manager) {
+	if m != nil {
+		h.sfuManager = m
+	}
 }
 
 // HandleWebSocket 处理WebSocket连接
@@ -374,6 +387,14 @@ func (h *WebSocketHandler) processMessage(client *model.Client, message *model.W
 	case model.MessageTypeFileTransferProgress:
 		// 进度消息仅由服务端向客户端推送，客户端不应主动发送
 		// 移动网络不稳定时客户端可能回显进度消息，静默跳过避免产生错误
+	case model.MessageTypeMeetingJoin:
+		h.handleMeetingJoin(client, message)
+	case model.MessageTypeMeetingLeave:
+		h.handleMeetingLeave(client, message)
+	case model.MessageTypeMeetingSDP:
+		h.handleMeetingSDP(client, message)
+	case model.MessageTypeMeetingICE:
+		h.handleMeetingICE(client, message)
 	default:
 		h.sendError(client, 400, "不支持的消息类型: "+message.Type)
 	}
@@ -480,6 +501,191 @@ func (h *WebSocketHandler) handlePublish(client *model.Client, message *model.We
 		h.sendError(client, 400, err.Error())
 		return
 	}
+}
+
+// ============ Meeting / SFU 会议媒体通道 ============
+// 信令方向约定（客户端为 uniqId，等于 client.UserID）：
+//   - meeting:join  → 在 SFU 房间登记该客户端（幂等）。
+//   - meeting:sdp（offer，无 to）→ 发布 PC：Participant.Offer → answer 定向回发布者。
+//   - meeting:sdp（offer，to=发布者）→ 订阅请求：订阅者发起，服务器建 Subscriber 并用其
+//     （服务端生成的）offer 定向回订阅者；订阅者回 answer（to=发布者）→ Subscriber.SetRemoteDescription。
+//   - meeting:ice（无 to）→ 发布 PC 候选；meeting:ice（to=发布者）→ 订阅 PC 候选。
+//   服务器侧每条 PC 的本地候选经 Participant/Subscriber 的 OnICECandidate 定向回发客户端。
+
+type meetingSDPMsg struct {
+	Type string `json:"type"`
+	SDP  string `json:"sdp"`
+	To   string `json:"to"`
+}
+
+type meetingICEMsg struct {
+	Candidate json.RawMessage `json:"candidate"`
+	To        string          `json:"to"`
+}
+
+func (h *WebSocketHandler) handleMeetingJoin(client *model.Client, message *model.WebSocketMessage) {
+	if message.Channel == "" {
+		h.sendError(client, 400, "meeting:join 缺少房间")
+		return
+	}
+	room := h.sfuManager.JoinRoom(message.Channel)
+	// 幂等：已存在则不重复建 PC
+	if _, ok := room.GetParticipant(client.UserID); ok {
+		return
+	}
+	p, err := room.AddParticipant(client.UserID)
+	if err != nil {
+		h.sendError(client, 500, "meeting:join 失败: "+err.Error())
+		return
+	}
+	// 接入该参与者发布 PC 的本地候选，定向回发给客户端
+	p.OnICECandidate(func(c *webrtc.ICECandidate) {
+		h.forwardMeetingICE(message.Channel, client.UserID, c, "")
+	})
+}
+
+func (h *WebSocketHandler) handleMeetingLeave(client *model.Client, message *model.WebSocketMessage) {
+	roomName := message.Channel
+	if roomName == "" {
+		return
+	}
+	if room, ok := h.sfuManager.GetRoom(roomName); ok {
+		_ = room.RemoveParticipant(client.UserID)
+		// 房间已无参与者则整体移除
+		if len(room.Participants()) == 0 {
+			h.sfuManager.RemoveRoom(roomName)
+		}
+	}
+}
+
+func (h *WebSocketHandler) handleMeetingSDP(client *model.Client, message *model.WebSocketMessage) {
+	if message.Channel == "" {
+		h.sendError(client, 400, "meeting:sdp 缺少房间")
+		return
+	}
+	var m meetingSDPMsg
+	if err := json.Unmarshal(message.Data, &m); err != nil {
+		h.sendError(client, 400, "meeting:sdp 数据格式错误: "+err.Error())
+		return
+	}
+
+	room, ok := h.sfuManager.GetRoom(message.Channel)
+	if !ok {
+		h.sendError(client, 400, "meeting:sdp 尚未加入该会议房间")
+		return
+	}
+	part, ok := room.GetParticipant(client.UserID)
+	if !ok {
+		h.sendError(client, 400, "meeting:sdp 请先 meeting:join")
+		return
+	}
+
+	switch {
+	case m.Type == "offer" && m.To == "":
+		// 客户端发布 offer（本人主 PC）
+		offer := webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: m.SDP}
+		answer, err := part.Offer(offer)
+		if err != nil {
+			h.sendError(client, 500, "meeting:sdp 生成 answer 失败: "+err.Error())
+			return
+		}
+		reply := map[string]interface{}{"type": "answer", "sdp": answer.SDP, "to": client.UserID}
+		h.wsService.SendDirectedToUser(message.Channel, client.UserID, "signal:"+client.UserID, model.MessageTypeMeetingSDP, reply)
+
+	case m.Type == "offer" && m.To != "":
+		// 订阅请求：订阅者要求订阅 m.To 发布者；服务器建 Subscriber 并把其 offer 回发订阅者
+		sub, err := part.SubscribeTo(m.To)
+		if err != nil {
+			h.sendError(client, 400, "meeting:sdp 订阅失败: "+err.Error())
+			return
+		}
+		// 接入该订阅 PC 的本地候选，定向回发给订阅者（默认引擎非离线需真实 ICE）
+		sub.OnICECandidate(func(c *webrtc.ICECandidate) {
+			h.forwardMeetingICE(message.Channel, client.UserID, c, m.To)
+		})
+		reply := map[string]interface{}{"type": "offer", "sdp": sub.Offer().SDP, "to": m.To}
+		h.wsService.SendDirectedToUser(message.Channel, client.UserID, "signal:"+client.UserID, model.MessageTypeMeetingSDP, reply)
+
+	case m.Type == "answer" && m.To != "":
+		// 订阅者回 answer（订阅 PC）：按发布者 m.To 找到对应 Subscriber
+		sub, ok := part.GetSubscriber(m.To)
+		if !ok {
+			h.sendError(client, 400, fmt.Sprintf("meeting:sdp 未找到订阅 %s 的连接", m.To))
+			return
+		}
+		if err := sub.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: m.SDP}); err != nil {
+			h.sendError(client, 500, "meeting:sdp answer 设置失败: "+err.Error())
+			return
+		}
+
+	case m.Type == "answer" && m.To == "":
+		// 发布 PC 的重协商 answer（少见）
+		if err := part.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: m.SDP}); err != nil {
+			h.sendError(client, 500, "meeting:sdp answer 设置失败: "+err.Error())
+			return
+		}
+
+	default:
+		h.sendError(client, 400, "meeting:sdp 未知的 type/direction 组合")
+	}
+}
+
+func (h *WebSocketHandler) handleMeetingICE(client *model.Client, message *model.WebSocketMessage) {
+	if message.Channel == "" {
+		h.sendError(client, 400, "meeting:ice 缺少房间")
+		return
+	}
+	var m meetingICEMsg
+	if err := json.Unmarshal(message.Data, &m); err != nil {
+		h.sendError(client, 400, "meeting:ice 数据格式错误: "+err.Error())
+		return
+	}
+	var init webrtc.ICECandidateInit
+	if len(m.Candidate) > 0 {
+		_ = json.Unmarshal(m.Candidate, &init)
+	}
+
+	room, ok := h.sfuManager.GetRoom(message.Channel)
+	if !ok {
+		h.sendError(client, 400, "meeting:ice 尚未加入该会议房间")
+		return
+	}
+	part, ok := room.GetParticipant(client.UserID)
+	if !ok {
+		h.sendError(client, 400, "meeting:ice 请先 meeting:join")
+		return
+	}
+
+	if m.To == "" {
+		// 发布 PC 候选
+		if err := part.AddICECandidate(init); err != nil {
+			h.sendError(client, 500, "meeting:ice 添加失败: "+err.Error())
+			return
+		}
+		return
+	}
+	// 订阅 PC 候选（to=发布者）
+	sub, ok := part.GetSubscriber(m.To)
+	if !ok {
+		h.sendError(client, 400, fmt.Sprintf("meeting:ice 未找到订阅 %s 的连接", m.To))
+		return
+	}
+	if err := sub.AddICECandidate(init); err != nil {
+		h.sendError(client, 500, "meeting:ice 添加失败: "+err.Error())
+		return
+	}
+}
+
+// forwardMeetingICE 把服务器侧某条 PC 的本地候选定向回发给客户端。
+// pubID 为发布者时表示订阅 PC 的候选；为空表示发布 PC 的候选。
+func (h *WebSocketHandler) forwardMeetingICE(roomName, toUserID string, c *webrtc.ICECandidate, pubID string) {
+	if c == nil {
+		// ice 收集完成哨兵：nil 候选，跳过（客户端可自行判断收尾）
+		return
+	}
+	init := c.ToJSON()
+	payload := map[string]interface{}{"candidate": init, "to": pubID}
+	h.wsService.SendDirectedToUser(roomName, toUserID, "signal:"+toUserID, model.MessageTypeMeetingICE, payload)
 }
 
 // sendMessage 发送消息给客户端

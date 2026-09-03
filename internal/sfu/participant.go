@@ -256,6 +256,14 @@ func (p *Participant) Subscriptions() []string {
 	return out
 }
 
+// GetSubscriber 返回本参与者对 publisherID 的订阅连接（供信令桥接 answer/ICE 用）。
+func (p *Participant) GetSubscriber(publisherID string) (*Subscriber, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	s, ok := p.subscriptions[publisherID]
+	return s, ok
+}
+
 // Close 关闭参与者的主连接与全部订阅连接。幂等。
 func (p *Participant) Close() error {
 	if !p.closed.CompareAndSwap(false, true) {
