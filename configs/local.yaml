@@ -48,5 +48,5 @@ turn:
   uris:
     - "turn:127.0.0.1:3478?transport=udp"
     - "turn:127.0.0.1:3478?transport=tcp"
-  ttl_seconds: 600
+  ttl_seconds: 3600
 

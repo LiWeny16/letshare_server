@@ -142,7 +142,7 @@ func setDefaults() {
 	viper.SetDefault("turn.enabled", false)
 	viper.SetDefault("turn.secret", os.Getenv("LETSHARE_TURN_SECRET"))
 	viper.SetDefault("turn.uris", []string{"turn:ecs.letshare.fun:3478?transport=udp", "turn:ecs.letshare.fun:3478?transport=tcp"})
-	viper.SetDefault("turn.ttl_seconds", 600)  // 10 分钟
+	viper.SetDefault("turn.ttl_seconds", 3600) // 默认 1 小时；前端在到期前 60s 主动续期 + 按需 ICE restart（3.7.0）
 	viper.SetDefault("turn.public_ip", "127.0.0.1") // 本地默认；生产须配服务器公网 IP
 	viper.SetDefault("turn.port", 3478)             // TURN/STUN listener（UDP+TCP 同端口）
 	viper.SetDefault("turn.relay_port_min", 49160)  // 中继端口段下界
