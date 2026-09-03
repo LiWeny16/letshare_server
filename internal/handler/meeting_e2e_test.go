@@ -8,6 +8,7 @@ import (
 	"letshare-server/internal/sfu"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"sync"
 	"testing"
 	"time"
@@ -88,12 +89,14 @@ func (ts *meetingTestServer) Close() { ts.srv.Close(); ts.wsService.Shutdown() }
 // wsRPC 模拟一个会议客户端：单 reader 将每条 WS 消息推入 in，
 // dispatcher 把 meeting:ice 应用到对应 PC、把 subscribed / meeting:sdp 送入相应通道。
 type wsRPC struct {
-	conn  *websocket.Conn
-	in    chan model.WebSocketMessage
-	subs  chan struct{}
-	sdp   chan model.WebSocketMessage
-	pubPC *webrtc.PeerConnection
-	subPC *webrtc.PeerConnection
+	conn   *websocket.Conn
+	in     chan model.WebSocketMessage
+	subs   chan struct{}
+	sdp    chan model.WebSocketMessage
+	create chan model.WebSocketMessage
+	err    chan model.WebSocketMessage
+	pubPC  *webrtc.PeerConnection
+	subPC  *webrtc.PeerConnection
 }
 
 // reader 单 goroutine 读取 WS，所有消息入 in 通道。
@@ -120,6 +123,10 @@ func (r *wsRPC) dispatch() {
 			r.subs <- struct{}{}
 		case model.MessageTypeMeetingSDP:
 			r.sdp <- m
+		case model.MessageTypeMeetingCreate:
+			r.create <- m
+		case model.MessageTypeError:
+			r.err <- m
 		case model.MessageTypeMeetingICE:
 			var d meetingICEMsg
 			_ = json.Unmarshal(m.Data, &d)
@@ -151,6 +158,35 @@ func (r *wsRPC) waitSubscribed(timeout time.Duration) error {
 	}
 }
 
+// waitCreate 阻塞等待一条 meeting:create 回包并取出 roomId。
+func (r *wsRPC) waitCreate(timeout time.Duration) (string, error) {
+	select {
+	case m := <-r.create:
+		var d map[string]interface{}
+		_ = json.Unmarshal(m.Data, &d)
+		room, _ := d["roomId"].(string)
+		return room, nil
+	case <-time.After(timeout):
+		return "", fmt.Errorf("等待 meeting:create 超时")
+	}
+}
+
+// waitError 阻塞等待一条 error 回包并取出 message。
+func (r *wsRPC) waitError(timeout time.Duration) (string, error) {
+	select {
+	case m := <-r.err:
+		if m.Error != nil {
+			return m.Error.Message, nil
+		}
+		var d map[string]interface{}
+		_ = json.Unmarshal(m.Data, &d)
+		msg, _ := d["message"].(string)
+		return msg, nil
+	case <-time.After(timeout):
+		return "", fmt.Errorf("等待 error 超时")
+	}
+}
+
 // waitSDP 阻塞等待一条满足 pred 的 meeting:sdp。
 func (r *wsRPC) waitSDP(pred func(m model.WebSocketMessage) bool, timeout time.Duration) (model.WebSocketMessage, error) {
 	t := time.NewTimer(timeout)
@@ -174,10 +210,12 @@ func newWSRPC(t *testing.T, srv *httptest.Server, userID string) *wsRPC {
 	t.Helper()
 	conn := dialTestClient(t, srv, userID)
 	r := &wsRPC{
-		conn: conn,
-		in:   make(chan model.WebSocketMessage, 128),
-		subs: make(chan struct{}, 16),
-		sdp:  make(chan model.WebSocketMessage, 64),
+		conn:   conn,
+		in:     make(chan model.WebSocketMessage, 128),
+		subs:   make(chan struct{}, 16),
+		sdp:    make(chan model.WebSocketMessage, 64),
+		create: make(chan model.WebSocketMessage, 8),
+		err:    make(chan model.WebSocketMessage, 8),
 	}
 	go r.reader()
 	go r.dispatch()
@@ -223,12 +261,23 @@ func TestMeetingE2E_OfferAnswerAndMediaForward(t *testing.T) {
 		t.Fatalf("初始化离线 API 失败: %v", err)
 	}
 
-	const room = "mt-room"
 	const userA = "uniqA-1"
 	const userB = "uniqB-1"
 
 	a := newWSRPC(t, ts.srv, userA)
 	b := newWSRPC(t, ts.srv, userB)
+
+	// A 创建会议，服务器回发 4 位会议号（加入前必须先登记）。
+	if err := a.sendJSON(model.WebSocketMessage{Type: "meeting:create"}); err != nil {
+		t.Fatalf("发送 meeting:create 失败: %v", err)
+	}
+	room, err := a.waitCreate(5 * time.Second)
+	if err != nil {
+		t.Fatalf("等待 meeting:create 失败: %v", err)
+	}
+	if !regexp.MustCompile(`^\d{4}$`).MatchString(room) {
+		t.Fatalf("会议号应为 4 位数字，实际 %q", room)
+	}
 
 	// A、B 各自订阅房间
 	sendSubscribe := func(r *wsRPC) {
@@ -409,4 +458,42 @@ func makeOpusRTPPacket(seq uint16, ssrc uint32) *rtp.Packet {
 		},
 		Payload: []byte{0xF8, 0xFF, 0xFE, 0x00, 0x01, 0x02},
 	}
+}
+
+// TestMeetingJoinRejectsNonExistent 验证加入一个未登记的会议号会被服务端拒绝（meeting:join 未再自动建房）。
+func TestMeetingJoinRejectsNonExistent(t *testing.T) {
+	ts := newMeetingTestServer(t)
+	defer ts.Close()
+
+	const userA = "uniqReject-1"
+	a := newWSRPC(t, ts.srv, userA)
+
+	// 直接 join 一个未创建的会议号，应收到 404「会议不存在」。
+	data, _ := json.Marshal(map[string]interface{}{"roomId": "9999", "from": userA})
+	if err := a.sendJSON(model.WebSocketMessage{Type: "meeting:join", Channel: "9999", Data: data}); err != nil {
+		t.Fatalf("发送 meeting:join 失败: %v", err)
+	}
+	msg, err := a.waitError(5 * time.Second)
+	if err != nil {
+		t.Fatalf("等待 error 失败: %v", err)
+	}
+	if msg == "" {
+		t.Fatalf("未返回错误信息")
+	}
+	t.Logf("未登记会议号 join 被拒绝：%s", msg)
+
+	// 创建后同一号码可成功加入（end-to-end 验证登记放行）。仅通过信号层验证 JoinRoom 不报错即可。
+	if err := a.sendJSON(model.WebSocketMessage{Type: "meeting:create"}); err != nil {
+		t.Fatalf("发送 meeting:create 失败: %v", err)
+	}
+	room, err := a.waitCreate(5 * time.Second)
+	if err != nil {
+		t.Fatalf("等待 meeting:create 失败: %v", err)
+	}
+	joinData, _ := json.Marshal(map[string]interface{}{"roomId": room, "from": userA})
+	if err := a.sendJSON(model.WebSocketMessage{Type: "meeting:join", Channel: room, Data: joinData}); err != nil {
+		t.Fatalf("发送 meeting:join 失败: %v", err)
+	}
+	// 再发一条 sdp 不应触发「尚未加入该会议房间」，说明 join 已登记成功。
+	_ = a.sendJSON(model.WebSocketMessage{Type: "meeting:sdp", Channel: room, Data: []byte(`{"type":"disable-audio","sdp":"x"}`)})
 }

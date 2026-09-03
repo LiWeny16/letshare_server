@@ -19,6 +19,7 @@ const (
 	MessageTypeMeetingLeave = "meeting:leave"
 	MessageTypeMeetingSDP   = "meeting:sdp"
 	MessageTypeMeetingICE   = "meeting:ice"
+	MessageTypeMeetingCreate = "meeting:create"
 	// 文件传输相关消息类型
 	MessageTypeFileTransferRequest     = "file:transfer:request"      // 发起文件传输请求
 	MessageTypeFileTransferAccept      = "file:transfer:accept"       // 接受文件传输

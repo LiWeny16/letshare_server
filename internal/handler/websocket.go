@@ -9,6 +9,7 @@ import (
 	"letshare-server/internal/service"
 	"letshare-server/internal/sfu"
 	"math"
+	"math/rand"
 	"net"
 	"net/http"
 	"strings"
@@ -111,6 +112,9 @@ type WebSocketHandler struct {
 	jwtService          *service.JWTService
 	errorRateLimiter    *ErrorRateLimiter
 	sfuManager          *sfu.Manager
+	// activeMeetingRooms 保存当前合法的（已登记）4 位会议号。
+	// 会议号与 SFU 房间名（message.Channel）是同一个值；加入前需在此存在才放行。
+	activeMeetingRooms sync.Map
 }
 
 func NewWebSocketHandler(wsService *service.WebSocketService, authService *service.AuthService, fileTransferService *service.FileTransferService, jwtService *service.JWTService) *WebSocketHandler {
@@ -387,6 +391,8 @@ func (h *WebSocketHandler) processMessage(client *model.Client, message *model.W
 	case model.MessageTypeFileTransferProgress:
 		// 进度消息仅由服务端向客户端推送，客户端不应主动发送
 		// 移动网络不稳定时客户端可能回显进度消息，静默跳过避免产生错误
+	case model.MessageTypeMeetingCreate:
+		h.handleMeetingCreate(client, message)
 	case model.MessageTypeMeetingJoin:
 		h.handleMeetingJoin(client, message)
 	case model.MessageTypeMeetingLeave:
@@ -523,9 +529,37 @@ type meetingICEMsg struct {
 	To        string          `json:"to"`
 }
 
+func (h *WebSocketHandler) handleMeetingCreate(client *model.Client, message *model.WebSocketMessage) {
+	// 生成 4 位数字会议号，循环直到不与已登记会议冲突。
+	var roomID string
+	for i := 0; i < 10000; i++ {
+		candidate := fmt.Sprintf("%04d", rand.Intn(10000))
+		if _, loaded := h.activeMeetingRooms.LoadOrStore(candidate, struct{}{}); !loaded {
+			roomID = candidate
+			break
+		}
+	}
+	if roomID == "" {
+		h.sendError(client, 500, "meeting:create 会议号生成失败")
+		return
+	}
+	// 回发创建的会议号给发起者（channel 设为会议号，便于后续 join 使用同一值）。
+	h.sendMessage(client, model.NewWebSocketMessage(
+		model.MessageTypeMeetingCreate,
+		roomID,
+		"signal:"+client.UserID,
+		map[string]interface{}{"roomId": roomID},
+	))
+}
+
 func (h *WebSocketHandler) handleMeetingJoin(client *model.Client, message *model.WebSocketMessage) {
 	if message.Channel == "" {
 		h.sendError(client, 400, "meeting:join 缺少房间")
+		return
+	}
+	// 加入前校验：会议号必须已登记。不存在则拒绝，防止任意号码自动建房。
+	if _, ok := h.activeMeetingRooms.Load(message.Channel); !ok {
+		h.sendError(client, 404, "会议不存在")
 		return
 	}
 	room := h.sfuManager.JoinRoom(message.Channel)
@@ -551,9 +585,10 @@ func (h *WebSocketHandler) handleMeetingLeave(client *model.Client, message *mod
 	}
 	if room, ok := h.sfuManager.GetRoom(roomName); ok {
 		_ = room.RemoveParticipant(client.UserID)
-		// 房间已无参与者则整体移除
+		// 房间已无参与者则整体移除，同时释放该会议号以便后续复用
 		if len(room.Participants()) == 0 {
 			h.sfuManager.RemoveRoom(roomName)
+			h.activeMeetingRooms.Delete(roomName)
 		}
 	}
 }
