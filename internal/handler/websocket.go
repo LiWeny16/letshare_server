@@ -112,10 +112,27 @@ type WebSocketHandler struct {
 	jwtService          *service.JWTService
 	errorRateLimiter    *ErrorRateLimiter
 	sfuManager          *sfu.Manager
-	// activeMeetingRooms 保存当前合法的（已登记）4 位会议号。
+	// activeMeetingRooms 保存当前合法的（已登记）会议号 → *meetingMeta。
 	// 会议号与 SFU 房间名（message.Channel）是同一个值；加入前需在此存在才放行。
 	activeMeetingRooms sync.Map
 }
+
+// meetingMeta 会议元数据：房主权威 + breakout 父子关系 + 房主断线宽限定时器。
+// 挂在 activeMeetingRooms 的 value 上（指针），自身细粒度加锁，避免全局锁竞争。
+type meetingMeta struct {
+	Host   string // 房主 UserID（uniqId）
+	Title  string // 会议标题（可选，≤64 字）
+	Parent string // breakout 房间指向主会议号；主会议为空
+	mu       sync.Mutex
+	endTimer *time.Timer // 房主断线宽限期后自动结束会议（刷新场景由重入取消）
+}
+
+// hostLeaveGrace 房主意外断线（刷新/网络抖动）后等待其重入的宽限期。
+// 到点仍未回到房间则结束会议并释放资源，防止僵尸会议占用会议号与 SFU 内存。
+const hostLeaveGrace = 12 * time.Second
+
+// meetingChatMaxLen 会议聊天单条文本上限（字节）。
+const meetingChatMaxLen = 2000
 
 func NewWebSocketHandler(wsService *service.WebSocketService, authService *service.AuthService, fileTransferService *service.FileTransferService, jwtService *service.JWTService) *WebSocketHandler {
 	handler := &WebSocketHandler{
@@ -230,6 +247,8 @@ func (h *WebSocketHandler) HandleWebSocket(c *gin.Context) {
 
 		// 从服务中移除客户端（这会清理所有相关资源）
 		h.wsService.RemoveClient(clientID)
+		// 会议侧资源清理：SFU 参与者、空房会议号释放、房主宽限定时
+		h.cleanupMeetingState(client)
 
 		logrus.WithField("client_id", clientID).Info("WebSocket连接已清理")
 	}()
@@ -401,6 +420,16 @@ func (h *WebSocketHandler) processMessage(client *model.Client, message *model.W
 		h.handleMeetingSDP(client, message)
 	case model.MessageTypeMeetingICE:
 		h.handleMeetingICE(client, message)
+	case model.MessageTypeMeetingEnd:
+		h.handleMeetingEnd(client, message)
+	case model.MessageTypeMeetingKick:
+		h.handleMeetingKick(client, message)
+	case model.MessageTypeMeetingChat:
+		h.handleMeetingChat(client, message)
+	case model.MessageTypeMeetingDraw:
+		h.handleMeetingDraw(client, message)
+	case model.MessageTypeMeetingBreakout:
+		h.handleMeetingBreakout(client, message)
 	default:
 		h.sendError(client, 400, "不支持的消息类型: "+message.Type)
 	}
@@ -530,11 +559,24 @@ type meetingICEMsg struct {
 }
 
 func (h *WebSocketHandler) handleMeetingCreate(client *model.Client, message *model.WebSocketMessage) {
+	// 可选会议标题（≤64 字，超长截断）。
+	title := ""
+	if len(message.Data) > 0 {
+		var d struct {
+			Title string `json:"title"`
+		}
+		if json.Unmarshal(message.Data, &d) == nil {
+			title = strings.TrimSpace(d.Title)
+			if len(title) > 64 {
+				title = title[:64]
+			}
+		}
+	}
 	// 生成 4 位数字会议号，循环直到不与已登记会议冲突。
 	var roomID string
 	for i := 0; i < 10000; i++ {
 		candidate := fmt.Sprintf("%04d", rand.Intn(10000))
-		if _, loaded := h.activeMeetingRooms.LoadOrStore(candidate, struct{}{}); !loaded {
+		if _, loaded := h.activeMeetingRooms.LoadOrStore(candidate, &meetingMeta{Host: client.UserID, Title: title}); !loaded {
 			roomID = candidate
 			break
 		}
@@ -548,7 +590,7 @@ func (h *WebSocketHandler) handleMeetingCreate(client *model.Client, message *mo
 		model.MessageTypeMeetingCreate,
 		roomID,
 		"signal:"+client.UserID,
-		map[string]interface{}{"roomId": roomID},
+		map[string]interface{}{"roomId": roomID, "host": client.UserID},
 	))
 }
 
@@ -558,11 +600,24 @@ func (h *WebSocketHandler) handleMeetingJoin(client *model.Client, message *mode
 		return
 	}
 	// 加入前校验：会议号必须已登记。不存在则拒绝，防止任意号码自动建房。
-	if _, ok := h.activeMeetingRooms.Load(message.Channel); !ok {
+	v, ok := h.activeMeetingRooms.Load(message.Channel)
+	if !ok {
 		h.sendError(client, 404, "会议不存在")
 		return
 	}
+	meta, _ := v.(*meetingMeta)
+	// 任何成员成功加入都取消挂起的自动结束定时器（宽限期语义：空房等待重入）。
+	if meta != nil {
+		meta.mu.Lock()
+		if meta.endTimer != nil {
+			meta.endTimer.Stop()
+			meta.endTimer = nil
+		}
+		meta.mu.Unlock()
+	}
 	room := h.sfuManager.JoinRoom(message.Channel)
+	// 发布者中途新增 track（屏幕共享等）→ 通知所有已订阅者重协商
+	room.OnTrackPublished = h.onMeetingTrackPublished
 	// 幂等：已存在则不重复建 PC
 	if _, ok := room.GetParticipant(client.UserID); ok {
 		return
@@ -576,6 +631,12 @@ func (h *WebSocketHandler) handleMeetingJoin(client *model.Client, message *mode
 	p.OnICECandidate(func(c *webrtc.ICECandidate) {
 		h.forwardMeetingICE(message.Channel, client.UserID, c, "")
 	})
+	// 定向告知会议信息（房主/标题）：前端用于房主徽章与控制按钮可见性。
+	if meta != nil {
+		h.wsService.SendDirectedToUser(message.Channel, client.UserID, "signal:"+client.UserID, model.MessageTypeMeetingInfo, map[string]interface{}{
+			"roomId": message.Channel, "host": meta.Host, "title": meta.Title,
+		})
+	}
 }
 
 func (h *WebSocketHandler) handleMeetingLeave(client *model.Client, message *model.WebSocketMessage) {
@@ -583,14 +644,121 @@ func (h *WebSocketHandler) handleMeetingLeave(client *model.Client, message *mod
 	if roomName == "" {
 		return
 	}
+	// 房主显式离开 = 结束会议（无主机转移机制，避免留下无人管控的僵尸会议）。
+	if v, ok := h.activeMeetingRooms.Load(roomName); ok {
+		if meta, _ := v.(*meetingMeta); meta != nil && meta.Host == client.UserID {
+			h.endMeetingRoom(roomName, "host-left")
+			return
+		}
+	}
 	if room, ok := h.sfuManager.GetRoom(roomName); ok {
 		_ = room.RemoveParticipant(client.UserID)
 		// 房间已无参与者则整体移除，同时释放该会议号以便后续复用
-		if len(room.Participants()) == 0 {
-			h.sfuManager.RemoveRoom(roomName)
-			h.activeMeetingRooms.Delete(roomName)
+		if room.Count() == 0 {
+			h.teardownMeeting(roomName, false)
 		}
 	}
+}
+
+// endMeetingRoom 房主主动结束会议：通知房间内所有成员 + 级联拆除 breakout 子房间 + 释放资源。
+func (h *WebSocketHandler) endMeetingRoom(roomID, reason string) {
+	if _, ok := h.sfuManager.GetRoom(roomID); ok || h.hasRegistered(roomID) {
+		h.wsService.BroadcastMeetingEvent(roomID, model.MessageTypeMeetingEnded, map[string]interface{}{
+			"roomId": roomID, "reason": reason,
+		}, "")
+	}
+	h.teardownMeeting(roomID, true)
+}
+
+// teardownMeeting 拆除一个会议房间：停宽限定时器、关 SFU 房间（关闭所有 PC）、
+// 释放会议号，并级联拆除其 breakout 子房间。
+func (h *WebSocketHandler) teardownMeeting(roomID string, notify bool) {
+	if v, loaded := h.activeMeetingRooms.LoadAndDelete(roomID); loaded {
+		if meta, _ := v.(*meetingMeta); meta != nil {
+			meta.mu.Lock()
+			if meta.endTimer != nil {
+				meta.endTimer.Stop()
+				meta.endTimer = nil
+			}
+			meta.mu.Unlock()
+		}
+	}
+	if notify {
+		if room, ok := h.sfuManager.GetRoom(roomID); ok && room.Count() > 0 {
+			h.wsService.BroadcastMeetingEvent(roomID, model.MessageTypeMeetingEnded, map[string]interface{}{
+				"roomId": roomID, "reason": "ended",
+			}, "")
+		}
+	}
+	h.sfuManager.RemoveRoom(roomID)
+	// 级联：拆除以本房间为父的 breakout 房间（递归深度恒为 1，Parent 指向主会议号）。
+	h.activeMeetingRooms.Range(func(key, value any) bool {
+		if meta, ok := value.(*meetingMeta); ok && meta.Parent == roomID {
+			h.teardownMeeting(key.(string), notify)
+		}
+		return true
+	})
+}
+
+// hasRegistered 判断会议号是否仍登记（不区分 SFU 房间是否已建）。
+func (h *WebSocketHandler) hasRegistered(roomID string) bool {
+	_, ok := h.activeMeetingRooms.Load(roomID)
+	return ok
+}
+
+// cleanupMeetingState 客户端断线后的会议侧清理：
+//  1. 从所有 SFU 房间移除其参与者；房间变空则启动宽限定时（重入即取消），不立即回收——
+//     正常流程"创建→路由跳转(WS 弹跳)→join"依赖这一点。
+//  2. 房主登记了会议但从未进入（无 SFU 房间）：同样宽限后回收，防"创建即泄漏"。
+func (h *WebSocketHandler) cleanupMeetingState(client *model.Client) {
+	for _, roomID := range h.sfuManager.Rooms() {
+		room, ok := h.sfuManager.GetRoom(roomID)
+		if !ok {
+			continue
+		}
+		if _, exists := room.GetParticipant(client.UserID); !exists {
+			continue
+		}
+		_ = room.RemoveParticipant(client.UserID)
+		if room.Count() == 0 {
+			h.scheduleMeetingEnd(roomID)
+		}
+	}
+	// 登记但从未进入的会议（房主断线）：宽限后回收。
+	h.activeMeetingRooms.Range(func(key, value any) bool {
+		roomID, _ := key.(string)
+		meta, ok := value.(*meetingMeta)
+		if !ok || meta.Host != client.UserID || meta.Parent != "" {
+			return true
+		}
+		if _, roomExists := h.sfuManager.GetRoom(roomID); !roomExists {
+			h.scheduleMeetingEnd(roomID)
+		}
+		return true
+	})
+}
+
+// scheduleMeetingEnd 为会议安排宽限期后自动结束：到点时若房间已有成员（重入）则跳过，
+// 否则通知+拆除+释放会议号。幂等：已有定时器时不重复安排。
+func (h *WebSocketHandler) scheduleMeetingEnd(roomID string) {
+	v, ok := h.activeMeetingRooms.Load(roomID)
+	if !ok {
+		return
+	}
+	meta, _ := v.(*meetingMeta)
+	if meta == nil {
+		return
+	}
+	meta.mu.Lock()
+	if meta.endTimer == nil {
+		meta.endTimer = time.AfterFunc(hostLeaveGrace, func() {
+			if room, ok := h.sfuManager.GetRoom(roomID); ok && room.Count() > 0 {
+				return // 有人重入，会议继续
+			}
+			h.endMeetingRoom(roomID, "timeout")
+		})
+	}
+	meta.mu.Unlock()
 }
 
 func (h *WebSocketHandler) handleMeetingSDP(client *model.Client, message *model.WebSocketMessage) {
@@ -711,6 +879,37 @@ func (h *WebSocketHandler) handleMeetingICE(client *model.Client, message *model
 	}
 }
 
+// onMeetingTrackPublished 发布者新增 track 时的扇出：向每个已订阅该发布者的成员
+// 推送重协商 offer（客户端 answer 走既有 meeting:sdp answer 通道）。
+func (h *WebSocketHandler) onMeetingTrackPublished(roomID, publisherID string, track *webrtc.TrackRemote) {
+	room, ok := h.sfuManager.GetRoom(roomID)
+	if !ok {
+		return
+	}
+	for _, p := range room.Participants() {
+		if p.ID == publisherID {
+			continue
+		}
+		sub, ok := p.GetSubscriber(publisherID)
+		if !ok {
+			continue
+		}
+		offer, err := sub.AddPublishedTrack(track)
+		if err != nil {
+			logrus.WithError(err).WithFields(logrus.Fields{
+				"room": roomID, "publisher": publisherID, "subscriber": p.ID,
+			}).Warn("会议 track 扇出重协商失败")
+			continue
+		}
+		if offer.SDP == "" {
+			continue // 幂等跳过
+		}
+		h.wsService.SendDirectedToUser(roomID, p.ID, "signal:"+p.ID, model.MessageTypeMeetingSDP, map[string]interface{}{
+			"type": "offer", "sdp": offer.SDP, "to": publisherID,
+		})
+	}
+}
+
 // forwardMeetingICE 把服务器侧某条 PC 的本地候选定向回发给客户端。
 // pubID 为发布者时表示订阅 PC 的候选；为空表示发布 PC 的候选。
 func (h *WebSocketHandler) forwardMeetingICE(roomName, toUserID string, c *webrtc.ICECandidate, pubID string) {
@@ -721,6 +920,201 @@ func (h *WebSocketHandler) forwardMeetingICE(roomName, toUserID string, c *webrt
 	init := c.ToJSON()
 	payload := map[string]interface{}{"candidate": init, "to": pubID}
 	h.wsService.SendDirectedToUser(roomName, toUserID, "signal:"+toUserID, model.MessageTypeMeetingICE, payload)
+}
+
+// handleMeetingEnd 房主结束会议：全员收到 meeting:ended 后退出，会议号与 SFU 资源全部释放。
+func (h *WebSocketHandler) handleMeetingEnd(client *model.Client, message *model.WebSocketMessage) {
+	roomID := message.Channel
+	if roomID == "" {
+		return
+	}
+	v, ok := h.activeMeetingRooms.Load(roomID)
+	if !ok {
+		return // 已结束/不存在：幂等静默
+	}
+	if meta, _ := v.(*meetingMeta); meta == nil || meta.Host != client.UserID {
+		h.sendError(client, 403, "仅房主可结束会议")
+		return
+	}
+	h.endMeetingRoom(roomID, "host-ended")
+}
+
+// handleMeetingKick 房主移出成员：目标收到定向 meeting:kicked，其余成员经成员表更新感知。
+func (h *WebSocketHandler) handleMeetingKick(client *model.Client, message *model.WebSocketMessage) {
+	roomID := message.Channel
+	if roomID == "" {
+		return
+	}
+	var m struct {
+		To string `json:"to"`
+	}
+	if len(message.Data) > 0 {
+		if err := json.Unmarshal(message.Data, &m); err != nil || m.To == "" {
+			h.sendError(client, 400, "meeting:kick 缺少目标")
+			return
+		}
+	}
+	v, ok := h.activeMeetingRooms.Load(roomID)
+	if !ok {
+		return
+	}
+	meta, _ := v.(*meetingMeta)
+	if meta == nil || meta.Host != client.UserID {
+		h.sendError(client, 403, "仅房主可移出成员")
+		return
+	}
+	if m.To == client.UserID || m.To == meta.Host {
+		h.sendError(client, 400, "不能移出房主")
+		return
+	}
+	// 从 SFU 房间移除（断其上下行媒体）
+	if room, ok := h.sfuManager.GetRoom(roomID); ok {
+		_ = room.RemoveParticipant(m.To)
+	}
+	// 定向通知被移出者（其前端自行 leaveMeeting + 退出导航）
+	h.wsService.SendDirectedToUser(roomID, m.To, "signal:"+m.To, model.MessageTypeMeetingKicked, map[string]interface{}{
+		"roomId": roomID,
+	})
+	// 广播成员表变更，让其余成员即时更新列表（被移出者随后 meeting:leave 幂等）
+	h.wsService.BroadcastMembershipEvent(roomID, "membership:changed", map[string]interface{}{
+		"type": "leave", "userId": m.To,
+	}, m.To)
+}
+
+// handleMeetingChat 会议内实时聊天：服务器纯转发广播（不落盘、不存历史）。
+// 文本长度服务端封顶，防止小水管被大包滥用。
+func (h *WebSocketHandler) handleMeetingChat(client *model.Client, message *model.WebSocketMessage) {
+	roomID := message.Channel
+	if roomID == "" {
+		return
+	}
+	if _, ok := h.sfuManager.GetRoom(roomID); !ok {
+		h.sendError(client, 400, "meeting:chat 尚未加入该会议房间")
+		return
+	}
+	var m struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(message.Data, &m); err != nil {
+		h.sendError(client, 400, "meeting:chat 数据格式错误")
+		return
+	}
+	text := strings.TrimSpace(m.Text)
+	if text == "" {
+		return
+	}
+	if len(text) > meetingChatMaxLen {
+		text = text[:meetingChatMaxLen]
+	}
+	h.wsService.BroadcastMeetingEvent(roomID, model.MessageTypeMeetingChat, map[string]interface{}{
+		"from": client.UserID, "text": text, "ts": time.Now().UnixMilli(),
+	}, client.UserID) // 排除发送者：其 UI 已本地回显，省一次回环
+}
+
+// handleMeetingDraw 协作画板：服务器纯转发笔画/清空操作，所有成员同步渲染。
+func (h *WebSocketHandler) handleMeetingDraw(client *model.Client, message *model.WebSocketMessage) {
+	roomID := message.Channel
+	if roomID == "" {
+		return
+	}
+	if _, ok := h.sfuManager.GetRoom(roomID); !ok {
+		h.sendError(client, 400, "meeting:draw 尚未加入该会议房间")
+		return
+	}
+	// 原样转发（数据已在 conn 层 512KB 限制内），补充发送者便于去重回显。
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(message.Data, &payload); err != nil {
+		return
+	}
+	payload["from"] = json.RawMessage(fmt.Sprintf("%q", client.UserID))
+	data, _ := json.Marshal(payload)
+	h.wsService.BroadcastMeetingEvent(roomID, model.MessageTypeMeetingDraw, json.RawMessage(data), client.UserID) // 排除发送者：本地已实时绘制
+}
+
+// handleMeetingBreakout 分组讨论：
+//   - action=create（房主）：登记 breakout 子房间（Parent=主会议号），向每个成员定向下发 invite。
+//   - action=recall（房主）：向所有 breakout 房间成员定向下发召回，并拆除子房间。
+//   成员侧收到 invite/recall 后自行切换房间（leave + join 复用既有流程）。
+func (h *WebSocketHandler) handleMeetingBreakout(client *model.Client, message *model.WebSocketMessage) {
+	roomID := message.Channel
+	if roomID == "" {
+		return
+	}
+	v, ok := h.activeMeetingRooms.Load(roomID)
+	if !ok {
+		return
+	}
+	meta, _ := v.(*meetingMeta)
+	if meta == nil || meta.Host != client.UserID {
+		h.sendError(client, 403, "仅房主可管理分组讨论")
+		return
+	}
+	var m struct {
+		Action      string `json:"action"`
+		Assignments []struct {
+			Room    string   `json:"room"`
+			Members []string `json:"members"`
+		} `json:"assignments"`
+	}
+	if err := json.Unmarshal(message.Data, &m); err != nil {
+		h.sendError(client, 400, "meeting:breakout 数据格式错误")
+		return
+	}
+	switch m.Action {
+	case "create":
+		if meta.Parent != "" {
+			h.sendError(client, 400, "breakout 房间内不能再分组")
+			return
+		}
+		sent := 0
+		for _, a := range m.Assignments {
+			if a.Room == "" || !strings.HasPrefix(a.Room, roomID) || a.Room == roomID || len(a.Members) == 0 {
+				continue
+			}
+			// 幂等登记：重复 create 同名房间不覆盖
+			if _, exists := h.activeMeetingRooms.LoadOrStore(a.Room, &meetingMeta{Host: meta.Host, Parent: roomID}); exists {
+				continue
+			}
+			for _, uid := range a.Members {
+				if uid == meta.Host {
+					continue // 房主留守主会场
+				}
+				if h.wsService.SendDirectedToUser(roomID, uid, "signal:"+uid, model.MessageTypeMeetingBreakout, map[string]interface{}{
+					"action": "invite", "room": a.Room, "main": roomID,
+				}) {
+					sent++
+				}
+			}
+		}
+		if sent == 0 {
+			h.sendError(client, 400, "meeting:breakout 无有效分组")
+		}
+	case "recall":
+		// 向每个 breakout 房间内的成员定向召回，然后拆除全部子房间
+		h.activeMeetingRooms.Range(func(key, value any) bool {
+			childID, _ := key.(string)
+			cmeta, ok := value.(*meetingMeta)
+			if !ok || cmeta.Parent != roomID {
+				return true
+			}
+			if room, ok := h.sfuManager.GetRoom(childID); ok {
+				seen := map[string]bool{}
+				for _, p := range room.Participants() {
+					if seen[p.ID] {
+						continue
+					}
+					seen[p.ID] = true
+					h.wsService.SendDirectedToUser(childID, p.ID, "signal:"+p.ID, model.MessageTypeMeetingBreakout, map[string]interface{}{
+						"action": "recall", "room": roomID,
+					})
+				}
+			}
+			h.teardownMeeting(childID, false)
+			return true
+		})
+	default:
+		h.sendError(client, 400, "meeting:breakout 未知 action")
+	}
 }
 
 // sendMessage 发送消息给客户端

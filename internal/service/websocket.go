@@ -500,23 +500,18 @@ func (ws *WebSocketService) RoomHasUserID(roomName, userID string) bool {
 	return false
 }
 
-// BroadcastMembershipEvent 向房间内除 excludeUserID 外的所有成员广播一个 presence 事件。
-// 这是服务器主动发起的房间广播（区别于 PublishToRoom 的"发送者视角"），用于 join/leave 成员变更通知。
-func (ws *WebSocketService) BroadcastMembershipEvent(roomName, event string, data interface{}, excludeUserID string) int {
+// roomRecipients 收集房间内除 excludeUserID 外、可写且订阅了 signal:all 的客户端快照。
+// 只在读锁内收集，发送放到锁外（写路径可能申请写锁，避免同 goroutine 锁升级死锁）。
+func (ws *WebSocketService) roomRecipients(roomName, excludeUserID string) []*model.Client {
 	ws.roomsMutex.RLock()
 	room, exists := ws.rooms[roomName]
 	ws.roomsMutex.RUnlock()
 	if !exists {
-		return 0
+		return nil
 	}
 
-	msg := model.NewWebSocketMessage(model.MessageTypeMessage, roomName, event, data)
-	count := 0
-
-	// 在持读锁时只收集收件人，绝不在此持锁状态下 sendToClient：
-	// sendToClient 的写路径若失败会经 removeClientIfClosedWrite 申请写锁，
-	// 同一 goroutine 持读锁再要写锁会死锁。
 	ws.clientsMutex.RLock()
+	defer ws.clientsMutex.RUnlock()
 	recipients := make([]*model.Client, 0, 4)
 	for clientID := range room.ClientIDs {
 		client, ok := ws.clients[clientID]
@@ -531,9 +526,28 @@ func (ws *WebSocketService) BroadcastMembershipEvent(roomName, event string, dat
 		}
 		recipients = append(recipients, client)
 	}
-	ws.clientsMutex.RUnlock()
+	return recipients
+}
 
-	for _, client := range recipients {
+// BroadcastMeetingEvent 向会议房间内除 excludeUserID 外的所有成员广播一条自定义类型的消息
+// （如 meeting:chat / meeting:draw / meeting:ended）。服务器纯转发，不落盘。
+// 返回实际送达人数。
+func (ws *WebSocketService) BroadcastMeetingEvent(roomName, msgType string, data interface{}, excludeUserID string) int {
+	msg := model.NewWebSocketMessage(msgType, roomName, "signal:"+roomName, data)
+	count := 0
+	for _, client := range ws.roomRecipients(roomName, excludeUserID) {
+		ws.sendToClient(client, msg)
+		count++
+	}
+	return count
+}
+
+// BroadcastMembershipEvent 向房间内除 excludeUserID 外的所有成员广播一个 presence 事件。
+// 这是服务器主动发起的房间广播（区别于 PublishToRoom 的"发送者视角"），用于 join/leave 成员变更通知。
+func (ws *WebSocketService) BroadcastMembershipEvent(roomName, event string, data interface{}, excludeUserID string) int {
+	msg := model.NewWebSocketMessage(model.MessageTypeMessage, roomName, event, data)
+	count := 0
+	for _, client := range ws.roomRecipients(roomName, excludeUserID) {
 		ws.sendToClient(client, msg)
 		count++
 	}

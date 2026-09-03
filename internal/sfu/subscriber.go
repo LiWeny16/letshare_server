@@ -49,6 +49,36 @@ func (s *Subscriber) Offer() webrtc.SessionDescription {
 	return s.offer
 }
 
+// AddPublishedTrack 发布者后续新增 track（如中途开始屏幕共享）时：
+// 为其建转发轨道并生成重协商 offer，由主线把新 offer 定向推给订阅客户端。
+// 已转发过的 track 幂等跳过（返回空 SDP 表示无需重协商）。
+func (s *Subscriber) AddPublishedTrack(remote *webrtc.TrackRemote) (webrtc.SessionDescription, error) {
+	var empty webrtc.SessionDescription
+	if s.off.Load() {
+		return empty, errors.New("sfu: 订阅连接已关闭")
+	}
+	s.mu.RLock()
+	_, exists := s.locTracks[remote.ID()]
+	s.mu.RUnlock()
+	if exists {
+		return empty, nil
+	}
+	if err := s.addForwardTrack(remote); err != nil {
+		return empty, err
+	}
+	offer, err := s.pc.CreateOffer(nil)
+	if err != nil {
+		return empty, err
+	}
+	if err := s.pc.SetLocalDescription(offer); err != nil {
+		return empty, err
+	}
+	s.mu.Lock()
+	s.offer = offer
+	s.mu.Unlock()
+	return offer, nil
+}
+
 // SetRemoteDescription 接收订阅者客户端对订阅 offer 的 answer（或其重协商）。
 func (s *Subscriber) SetRemoteDescription(sd webrtc.SessionDescription) error {
 	if s.off.Load() {

@@ -20,6 +20,15 @@ const (
 	MessageTypeMeetingSDP   = "meeting:sdp"
 	MessageTypeMeetingICE   = "meeting:ice"
 	MessageTypeMeetingCreate = "meeting:create"
+	// 会议控制/协作消息（服务器校验后转发或广播）
+	MessageTypeMeetingEnd     = "meeting:end"     // 房主结束会议（全员退出并释放资源）
+	MessageTypeMeetingKick    = "meeting:kick"    // 房主移出成员
+	MessageTypeMeetingKicked  = "meeting:kicked"  // 被移出通知（下行）
+	MessageTypeMeetingEnded   = "meeting:ended"   // 会议已结束通知（下行）
+	MessageTypeMeetingChat    = "meeting:chat"    // 会议内实时聊天（纯转发，不落盘）
+	MessageTypeMeetingDraw    = "meeting:draw"    // 协作画板笔画（纯转发，不落盘）
+	MessageTypeMeetingBreakout = "meeting:breakout" // 分组讨论（create 召集 / invite 定向 / recall 召回）
+	MessageTypeMeetingInfo     = "meeting:info"     // 加入成功后的会议信息定向通知（host/title）
 	// 文件传输相关消息类型
 	MessageTypeFileTransferRequest     = "file:transfer:request"      // 发起文件传输请求
 	MessageTypeFileTransferAccept      = "file:transfer:accept"       // 接受文件传输
