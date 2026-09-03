@@ -110,6 +110,16 @@ func (ws *WebSocketService) cleanupClientResources(client *model.Client, notifyD
 		ws.removeClientFromRoom(client.ID, roomName)
 	}
 
+	// 离场 presence 广播：该 userID 在房间内已无其它连接时才通知"离开"
+	for _, roomName := range roomsToCleanup {
+		if !ws.RoomHasUserID(roomName, client.UserID) {
+			ws.BroadcastMembershipEvent(roomName, "membership:changed", map[string]interface{}{
+				"type":   "leave",
+				"userId": client.UserID,
+			}, client.UserID)
+		}
+	}
+
 	// 清理客户端内部引用
 	client.Rooms = nil
 	client.Events = nil
@@ -449,6 +459,82 @@ func (ws *WebSocketService) removeClientFromRoom(clientID, roomName string) {
 	if len(room.ClientIDs) == 0 {
 		delete(ws.rooms, roomName)
 		logrus.WithField("room", roomName).Debug("空房间已删除")
+	}
+}
+
+// RoomHasUserID 判断房间内是否仍有指定 userID 的活跃连接（用于离场广播去重：多标签页时同 userID 其它连接仍在则不下发 leave）。
+func (ws *WebSocketService) RoomHasUserID(roomName, userID string) bool {
+	ws.roomsMutex.RLock()
+	room, exists := ws.rooms[roomName]
+	ws.roomsMutex.RUnlock()
+	if !exists {
+		return false
+	}
+
+	ws.clientsMutex.RLock()
+	defer ws.clientsMutex.RUnlock()
+	for clientID := range room.ClientIDs {
+		if client, ok := ws.clients[clientID]; ok && client.UserID == userID && client.Connection != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// BroadcastMembershipEvent 向房间内除 excludeUserID 外的所有成员广播一个 presence 事件。
+// 这是服务器主动发起的房间广播（区别于 PublishToRoom 的"发送者视角"），用于 join/leave 成员变更通知。
+func (ws *WebSocketService) BroadcastMembershipEvent(roomName, event string, data interface{}, excludeUserID string) int {
+	ws.roomsMutex.RLock()
+	room, exists := ws.rooms[roomName]
+	ws.roomsMutex.RUnlock()
+	if !exists {
+		return 0
+	}
+
+	msg := model.NewWebSocketMessage(model.MessageTypeMessage, roomName, event, data)
+	count := 0
+	ws.clientsMutex.RLock()
+	defer ws.clientsMutex.RUnlock()
+	for clientID := range room.ClientIDs {
+		client, ok := ws.clients[clientID]
+		if !ok || client.Connection == nil {
+			continue
+		}
+		if excludeUserID != "" && client.UserID == excludeUserID {
+			continue
+		}
+		if !client.Events["signal:all"] {
+			continue
+		}
+		ws.sendToClient(client, msg)
+		count++
+	}
+	return count
+}
+
+// SendMembershipSnapshot 向单个客户端下发当前房间权威成员表（按 UserID 去重）。
+// 客户端订阅房间后立即收到，作为 presence 的初始权威状态。
+func (ws *WebSocketService) SendMembershipSnapshot(clientID, roomName string) {
+	members := make([]string, 0)
+	ws.clientsMutex.RLock()
+	seen := make(map[string]bool)
+	for _, c := range ws.clients {
+		if c.Rooms == nil || !c.Rooms[roomName] || c.Connection == nil {
+			continue
+		}
+		if seen[c.UserID] {
+			continue
+		}
+		seen[c.UserID] = true
+		members = append(members, c.UserID)
+	}
+	ws.clientsMutex.RUnlock()
+
+	msg := model.NewWebSocketMessage(model.MessageTypeMessage, roomName, "membership:snapshot", map[string]interface{}{
+		"members": members,
+	})
+	if client, ok := ws.GetClient(clientID); ok {
+		ws.sendToClient(client, msg)
 	}
 }
 

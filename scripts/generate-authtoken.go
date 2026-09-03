@@ -1,3 +1,5 @@
+//go:build ignore
+// NOTE: 源码在历史清理(186dadb)受损，构建跳过；待重写。
  
 
  (

@@ -394,6 +394,13 @@ func (h *WebSocketHandler) handleSubscribe(client *model.Client, message *model.
 		return
 	}
 
+	// Presence 中心化：订阅成功后下发权威成员表快照，并广播入房事件给房间内其它成员。
+	h.wsService.SendMembershipSnapshot(client.ID, message.Channel)
+	h.wsService.BroadcastMembershipEvent(message.Channel, "membership:changed", map[string]interface{}{
+		"type":   "join",
+		"userId": client.UserID,
+	}, client.UserID)
+
 	// 发送订阅确认
 	h.sendMessage(client, model.NewWebSocketMessage(
 		"subscribed",
