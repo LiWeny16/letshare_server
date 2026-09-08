@@ -5,8 +5,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	log "github.com/sirupsen/logrus"
 	"github.com/pion/webrtc/v4"
+	log "github.com/sirupsen/logrus"
 )
 
 // Room 代表一个会议的媒体会话容器：包含参与者集合，
@@ -21,7 +21,15 @@ type Room struct {
 
 	// OnTrackPublished 可选回调：某参与者 publish 了新 track 时触发。
 	// 主线可借此触发“已订阅该发布者的订阅端发起重协商”。
-	OnTrackPublished func(roomID, publisherID string, track *webrtc.TrackRemote)
+	trackPublishedMu sync.RWMutex
+	onTrackPublished func(roomID, publisherID string, track *webrtc.TrackRemote)
+}
+
+// SetOnTrackPublished installs the room-level publish callback safely.
+func (r *Room) SetOnTrackPublished(cb func(roomID, publisherID string, track *webrtc.TrackRemote)) {
+	r.trackPublishedMu.Lock()
+	r.onTrackPublished = cb
+	r.trackPublishedMu.Unlock()
 }
 
 // AddParticipant 在房间内新增一名参与者，并为其建立订阅/发布用的
@@ -39,22 +47,22 @@ func (r *Room) AddParticipant(participantID string) (*Participant, error) {
 	}
 
 	p := &Participant{
-		ID:           participantID,
-		room:         r,
-		pc:           pc,
-		tracks:       map[string]*webrtc.TrackRemote{},
+		ID:            participantID,
+		room:          r,
+		pc:            pc,
+		tracks:        map[string]*webrtc.TrackRemote{},
 		subscriptions: map[string]*Subscriber{},
 	}
 
 	// 监测连接态，异常仅记录并局部化，不影响房间其它参与者。
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		log.WithFields(log.Fields{
-			"sfu":      "participant",
-			"roomID":   r.ID,
+			"sfu":           "participant",
+			"roomID":        r.ID,
 			"participantID": participantID,
-			"state":    state.String(),
+			"state":         state.String(),
 		}).Debug("参与者的主连接状态变化")
-		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed {
+		if (state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed) && p.isCurrentPeerConnection(pc) {
 			_ = p.Close()
 		}
 	})
@@ -77,8 +85,8 @@ func (r *Room) AddParticipant(participantID string) (*Participant, error) {
 	r.mu.Unlock()
 
 	log.WithFields(log.Fields{
-		"sfu":      "room",
-		"roomID":   r.ID,
+		"sfu":           "room",
+		"roomID":        r.ID,
 		"participantID": participantID,
 	}).Info("参与者加入 SFU 房间")
 	return p, nil
@@ -108,6 +116,31 @@ func (r *Room) RemoveParticipant(participantID string) error {
 		return fmt.Errorf("sfu: 关闭参与者 %q 失败: %w", participantID, err)
 	}
 	return nil
+}
+
+// forgetClosedParticipant 把自关闭（发布 PC failed/closed）的参与者从房间表摘除，
+// 并拆除其余成员对该发布者的订阅连接（其转发轨已成死连接，保留只会让客户端
+// 订阅到旧 session 的僵尸连接）。指针比对：防止旧参与者关闭时误删
+// 重连后新建的同名参与者。
+func (r *Room) forgetClosedParticipant(p *Participant) {
+	r.mu.Lock()
+	if cur, ok := r.participants[p.ID]; ok && cur == p {
+		delete(r.participants, p.ID)
+	}
+	r.mu.Unlock()
+
+	if r.closed.Load() {
+		return // 房间整体关闭中：所有参与者一并销毁，无需逐个拆订阅
+	}
+	r.mu.RLock()
+	others := make([]*Participant, 0, len(r.participants))
+	for _, other := range r.participants {
+		others = append(others, other)
+	}
+	r.mu.RUnlock()
+	for _, other := range others {
+		other.UnsubscribeFrom(p.ID)
+	}
 }
 
 // Participants 返回当前所有参与者。
@@ -148,7 +181,10 @@ func (r *Room) Close() error {
 }
 
 func (r *Room) notifyTrackPublished(publisherID string, track *webrtc.TrackRemote) {
-	if r.OnTrackPublished != nil {
-		r.OnTrackPublished(r.ID, publisherID, track)
+	r.trackPublishedMu.RLock()
+	cb := r.onTrackPublished
+	r.trackPublishedMu.RUnlock()
+	if cb != nil {
+		cb(r.ID, publisherID, track)
 	}
 }

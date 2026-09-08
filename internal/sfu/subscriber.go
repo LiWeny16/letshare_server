@@ -6,8 +6,9 @@ import (
 	"sync"
 	"sync/atomic"
 
-	log "github.com/sirupsen/logrus"
+	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
+	log "github.com/sirupsen/logrus"
 )
 
 // subTrack 描述一条“把发布者的远端 track 转发给订阅客户端”的轨道：
@@ -34,6 +35,14 @@ type Subscriber struct {
 	mu        sync.RWMutex
 	locTracks map[string]*subTrack
 	offer     webrtc.SessionDescription
+	// offerMu 串行化同一订阅 PC 的 AddTrack/CreateOffer/SetRemoteDescription。
+	// 发布者的音频、摄像头和屏幕轨可能在同一个事件循环内连续到达；若每条轨
+	// 都立即 CreateOffer，会把第二个 offer 发在第一个 answer 之前，浏览器
+	// 可能丢弃其中一条，形成“偶尔看不到对方视频/共享屏幕”的竞态。
+	offerMu              sync.Mutex
+	offerGeneration      uint64
+	negotiatedGeneration uint64
+	awaitingAnswer       bool
 
 	stop chan struct{}
 	once sync.Once
@@ -49,11 +58,24 @@ func (s *Subscriber) Offer() webrtc.SessionDescription {
 	return s.offer
 }
 
+// OfferForRetry 返回仍在等待客户端 answer 的当前 offer。
+// 仅用于客户端丢帧/重试恢复：稳定连接不重复发 offer。
+func (s *Subscriber) OfferForRetry() (webrtc.SessionDescription, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.awaitingAnswer || s.offer.SDP == "" {
+		return webrtc.SessionDescription{}, false
+	}
+	return s.offer, true
+}
+
 // AddPublishedTrack 发布者后续新增 track（如中途开始屏幕共享）时：
 // 为其建转发轨道并生成重协商 offer，由主线把新 offer 定向推给订阅客户端。
 // 已转发过的 track 幂等跳过（返回空 SDP 表示无需重协商）。
 func (s *Subscriber) AddPublishedTrack(remote *webrtc.TrackRemote) (webrtc.SessionDescription, error) {
 	var empty webrtc.SessionDescription
+	s.offerMu.Lock()
+	defer s.offerMu.Unlock()
 	if s.off.Load() {
 		return empty, errors.New("sfu: 订阅连接已关闭")
 	}
@@ -66,6 +88,61 @@ func (s *Subscriber) AddPublishedTrack(remote *webrtc.TrackRemote) (webrtc.Sessi
 	if err := s.addForwardTrack(remote); err != nil {
 		return empty, err
 	}
+	s.mu.Lock()
+	s.offerGeneration++
+	awaitingAnswer := s.awaitingAnswer
+	s.mu.Unlock()
+	// 第一个 offer 尚未收到 answer：只登记轨道，等 answer 到达后统一生成
+	// 一个包含所有新增轨道的 offer，避免连续 offer 破坏浏览器的状态机。
+	if awaitingAnswer {
+		return empty, nil
+	}
+	return s.createOfferLocked()
+}
+
+// SetRemoteDescription 接收订阅者客户端对订阅 offer 的 answer（或其重协商）。
+func (s *Subscriber) SetRemoteDescription(sd webrtc.SessionDescription) error {
+	s.offerMu.Lock()
+	defer s.offerMu.Unlock()
+	if s.off.Load() {
+		return errors.New("sfu: 订阅连接已关闭")
+	}
+	if err := s.pc.SetRemoteDescription(sd); err != nil {
+		return err
+	}
+	if sd.Type == webrtc.SDPTypeAnswer {
+		s.mu.Lock()
+		s.awaitingAnswer = false
+		s.mu.Unlock()
+		// Ask the publisher for a fresh keyframe after the delivery PC is
+		// negotiated. This closes the join-after-keyframe gap even before the
+		// browser emits its first PLI.
+		go s.requestPublisherKeyframes()
+	}
+	return nil
+}
+
+// PendingOffer 在 answer 确认后检查是否有 answer 到达期间新增的轨道。
+// 若有，则生成一个合并后的后续 offer；调用方负责通过信令送达客户端。
+func (s *Subscriber) PendingOffer() (webrtc.SessionDescription, bool, error) {
+	s.offerMu.Lock()
+	defer s.offerMu.Unlock()
+	if s.off.Load() {
+		return webrtc.SessionDescription{}, false, errors.New("sfu: 订阅连接已关闭")
+	}
+	s.mu.RLock()
+	needsOffer := !s.awaitingAnswer && s.offerGeneration > s.negotiatedGeneration
+	s.mu.RUnlock()
+	if !needsOffer {
+		return webrtc.SessionDescription{}, false, nil
+	}
+	offer, err := s.createOfferLocked()
+	return offer, err == nil, err
+}
+
+// createOfferLocked 必须在 offerMu 持有时调用。
+func (s *Subscriber) createOfferLocked() (webrtc.SessionDescription, error) {
+	var empty webrtc.SessionDescription
 	offer, err := s.pc.CreateOffer(nil)
 	if err != nil {
 		return empty, err
@@ -75,16 +152,10 @@ func (s *Subscriber) AddPublishedTrack(remote *webrtc.TrackRemote) (webrtc.Sessi
 	}
 	s.mu.Lock()
 	s.offer = offer
+	s.awaitingAnswer = true
+	s.negotiatedGeneration = s.offerGeneration
 	s.mu.Unlock()
 	return offer, nil
-}
-
-// SetRemoteDescription 接收订阅者客户端对订阅 offer 的 answer（或其重协商）。
-func (s *Subscriber) SetRemoteDescription(sd webrtc.SessionDescription) error {
-	if s.off.Load() {
-		return errors.New("sfu: 订阅连接已关闭")
-	}
-	return s.pc.SetRemoteDescription(sd)
 }
 
 // AddICECandidate 是 ICE 信号接入点。
@@ -163,10 +234,10 @@ func (s *Subscriber) startForwarder(remote *webrtc.TrackRemote, local *webrtc.Tr
 		defer func() {
 			if r := recover(); r != nil {
 				log.WithFields(log.Fields{
-					"sfu":          "subscriber",
-					"roomID":       s.forParticipant.room.ID,
+					"sfu":           "subscriber",
+					"roomID":        s.forParticipant.room.ID,
 					"participantID": s.forParticipant.ID,
-					"publisherID":  s.publisherID,
+					"publisherID":   s.publisherID,
 				}).WithField("panic", r).Error("订阅转发轨道异常结束")
 			}
 		}()
@@ -218,12 +289,68 @@ func (s *Subscriber) startRTCPDrain(sender *webrtc.RTPSender) {
 				return
 			}
 			// 目前此基座仅消费 RTCP；如需把 PLI/NACK 反馈给发布者，在这里反向转发。
-			_ = len(pkts) > 0
+			if hasKeyframeFeedback(pkts) {
+				s.requestPublisherKeyframes()
+			}
 		}
 	}()
 }
 
+// hasKeyframeFeedback identifies RTCP feedback that asks an encoder to
+// produce a decodable intra frame. Receiver reports and transport feedback
+// stay local to the delivery PC because they use the delivery SSRC space.
+func hasKeyframeFeedback(pkts []rtcp.Packet) bool {
+	for _, pkt := range pkts {
+		switch pkt.(type) {
+		case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
+			return true
+		}
+	}
+	return false
+}
+
+// requestPublisherKeyframes translates delivery-side keyframe feedback into
+// publisher-side PLI packets. The server creates a new local track for each
+// subscriber, so a subscriber PLI's SSRC must not be forwarded verbatim.
+func (s *Subscriber) requestPublisherKeyframes() {
+	if s.off.Load() {
+		return
+	}
+	publisher, ok := s.forParticipant.room.GetParticipant(s.publisherID)
+	if !ok || publisher.IsClosed() {
+		return
+	}
+
+	for _, track := range s.videoTracks() {
+		if err := publisher.writeRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{
+			MediaSSRC: uint32(track.remote.SSRC()),
+		}}); err != nil && !s.off.Load() {
+			log.WithError(err).WithFields(log.Fields{
+				"sfu":         "subscriber",
+				"roomID":      s.forParticipant.room.ID,
+				"publisherID": s.publisherID,
+			}).Debug("订阅端关键帧请求回传失败")
+		}
+	}
+}
+
+func (s *Subscriber) videoTracks() []*subTrack {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	tracks := make([]*subTrack, 0, len(s.locTracks))
+	for _, track := range s.locTracks {
+		if track.remote != nil && track.remote.Kind() == webrtc.RTPCodecTypeVideo {
+			tracks = append(tracks, track)
+		}
+	}
+	return tracks
+}
+
+// IsClosed 返回该订阅连接是否已关闭。
+func (s *Subscriber) IsClosed() bool { return s.off.Load() }
+
 // Close 关闭订阅连接，幂等。
+// 关闭后从所属参与者的订阅表摘除自身，避免 closed 订阅残留被复用。
 func (s *Subscriber) Close() error {
 	var err error
 	s.once.Do(func() {
@@ -231,5 +358,6 @@ func (s *Subscriber) Close() error {
 		close(s.stop)
 		err = s.pc.Close()
 	})
+	s.forParticipant.forgetClosedSubscription(s.publisherID, s)
 	return err
 }

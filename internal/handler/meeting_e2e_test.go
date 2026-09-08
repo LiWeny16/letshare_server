@@ -89,14 +89,23 @@ func (ts *meetingTestServer) Close() { ts.srv.Close(); ts.wsService.Shutdown() }
 // wsRPC 模拟一个会议客户端：单 reader 将每条 WS 消息推入 in，
 // dispatcher 把 meeting:ice 应用到对应 PC、把 subscribed / meeting:sdp 送入相应通道。
 type wsRPC struct {
-	conn   *websocket.Conn
-	in     chan model.WebSocketMessage
-	subs   chan struct{}
-	sdp    chan model.WebSocketMessage
-	create chan model.WebSocketMessage
-	err    chan model.WebSocketMessage
-	pubPC  *webrtc.PeerConnection
-	subPC  *webrtc.PeerConnection
+	conn         *websocket.Conn
+	in           chan model.WebSocketMessage
+	subs         chan struct{}
+	sdp          chan model.WebSocketMessage
+	create       chan model.WebSocketMessage
+	invite       chan model.WebSocketMessage
+	chat         chan model.WebSocketMessage
+	mediaControl chan model.WebSocketMessage
+	draw         chan model.WebSocketMessage
+	presentation chan model.WebSocketMessage
+	excalidraw   chan model.WebSocketMessage
+	breakout     chan model.WebSocketMessage
+	minutes      chan model.WebSocketMessage
+	ended        chan model.WebSocketMessage
+	err          chan model.WebSocketMessage
+	pubPC        *webrtc.PeerConnection
+	subPC        *webrtc.PeerConnection
 }
 
 // reader 单 goroutine 读取 WS，所有消息入 in 通道。
@@ -125,6 +134,24 @@ func (r *wsRPC) dispatch() {
 			r.sdp <- m
 		case model.MessageTypeMeetingCreate:
 			r.create <- m
+		case model.MessageTypeMeetingInvite:
+			r.invite <- m
+		case model.MessageTypeMeetingChat:
+			r.chat <- m
+		case model.MessageTypeMeetingMediaControl:
+			r.mediaControl <- m
+		case model.MessageTypeMeetingDraw:
+			r.draw <- m
+		case model.MessageTypeMeetingPresentation:
+			r.presentation <- m
+		case model.MessageTypeMeetingExcalidraw:
+			r.excalidraw <- m
+		case model.MessageTypeMeetingBreakout:
+			r.breakout <- m
+		case model.MessageTypeMeetingMinutes:
+			r.minutes <- m
+		case model.MessageTypeMeetingEnded:
+			r.ended <- m
 		case model.MessageTypeError:
 			r.err <- m
 		case model.MessageTypeMeetingICE:
@@ -210,12 +237,21 @@ func newWSRPC(t *testing.T, srv *httptest.Server, userID string) *wsRPC {
 	t.Helper()
 	conn := dialTestClient(t, srv, userID)
 	r := &wsRPC{
-		conn:   conn,
-		in:     make(chan model.WebSocketMessage, 128),
-		subs:   make(chan struct{}, 16),
-		sdp:    make(chan model.WebSocketMessage, 64),
-		create: make(chan model.WebSocketMessage, 8),
-		err:    make(chan model.WebSocketMessage, 8),
+		conn:         conn,
+		in:           make(chan model.WebSocketMessage, 128),
+		subs:         make(chan struct{}, 16),
+		sdp:          make(chan model.WebSocketMessage, 64),
+		create:       make(chan model.WebSocketMessage, 8),
+		invite:       make(chan model.WebSocketMessage, 32),
+		chat:         make(chan model.WebSocketMessage, 64),
+		mediaControl: make(chan model.WebSocketMessage, 64),
+		draw:         make(chan model.WebSocketMessage, 64),
+		presentation: make(chan model.WebSocketMessage, 64),
+		excalidraw:   make(chan model.WebSocketMessage, 64),
+		breakout:     make(chan model.WebSocketMessage, 16),
+		minutes:      make(chan model.WebSocketMessage, 64),
+		ended:        make(chan model.WebSocketMessage, 8),
+		err:          make(chan model.WebSocketMessage, 8),
 	}
 	go r.reader()
 	go r.dispatch()

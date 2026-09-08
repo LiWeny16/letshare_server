@@ -151,6 +151,34 @@ func (ws *WebSocketService) GetClientInRoom(clientID, roomName string) (*model.C
 	return client, true
 }
 
+// clientIsInRoom reads the client membership map under clientsMutex. Callers
+// often retain the client pointer for socket writes, but must not read its
+// mutable Rooms map after GetClient releases the lock.
+func (ws *WebSocketService) clientIsInRoom(clientID, roomName string) bool {
+	ws.clientsMutex.RLock()
+	defer ws.clientsMutex.RUnlock()
+
+	client, exists := ws.clients[clientID]
+	return exists && client != nil && client.Rooms != nil && client.Rooms[roomName]
+}
+
+// clientReceivesEvent reads the event subscription map under clientsMutex.
+// The returned bool is a point-in-time decision; the socket itself remains
+// protected by Client.ConnMutex when the caller writes to it.
+func (ws *WebSocketService) clientReceivesEvent(clientID, event string) bool {
+	ws.clientsMutex.RLock()
+	defer ws.clientsMutex.RUnlock()
+
+	client, exists := ws.clients[clientID]
+	if !exists || client == nil || client.Connection == nil || client.Events == nil {
+		return false
+	}
+	if event == "" || event == "signal:all" {
+		return client.Events["signal:all"]
+	}
+	return client.Events[event] || client.Events["signal:all"]
+}
+
 // GetRoomClients 返回房间内所有客户端的快照（按 LastPing 最新者优先去重同一用户）。
 // 用于媒体帧等需要按房间定向转发的场景。
 func (ws *WebSocketService) GetRoomClients(roomName string) []*model.Client {
@@ -222,6 +250,7 @@ func (ws *WebSocketService) SubscribeToRoom(clientID, roomName, event string) er
 	// 添加客户端ID到房间（避免循环引用）
 	room.ClientIDs[clientID] = true
 	room.UpdatedAt = time.Now()
+	roomSize := len(room.ClientIDs)
 	ws.roomsMutex.Unlock()
 
 	// 更新客户端信息
@@ -240,7 +269,7 @@ func (ws *WebSocketService) SubscribeToRoom(clientID, roomName, event string) er
 		"user_id":   client.UserID,
 		"room":      roomName,
 		"event":     event,
-		"room_size": len(room.ClientIDs),
+		"room_size": roomSize,
 	}).Info("客户端订阅房间")
 
 	return nil
@@ -288,13 +317,11 @@ func (ws *WebSocketService) PublishToRoom(clientID, roomName, event string, data
 	}
 
 	// 检查客户端是否在房间中
-	if !client.Rooms[roomName] {
+	if !ws.clientIsInRoom(clientID, roomName) {
 		return fmt.Errorf("客户端未订阅房间: %s", roomName)
 	}
 
-	ws.roomsMutex.RLock()
-	room, roomExists := ws.rooms[roomName]
-	ws.roomsMutex.RUnlock()
+	roomClientIDs, roomExists := ws.roomClientIDsSnapshot(roomName)
 
 	if !roomExists {
 		return fmt.Errorf("房间不存在: %s", roomName)
@@ -305,7 +332,7 @@ func (ws *WebSocketService) PublishToRoom(clientID, roomName, event string, data
 
 	// 广播到房间中的所有客户端
 	count := 0
-	for roomClientID := range room.ClientIDs {
+	for _, roomClientID := range roomClientIDs {
 		if roomClientID == clientID {
 			continue // 不发送给自己
 		}
@@ -318,17 +345,7 @@ func (ws *WebSocketService) PublishToRoom(clientID, roomName, event string, data
 			continue
 		}
 
-		// 检查事件过滤
-		shouldReceive := false
-		if event == "" || event == "signal:all" {
-			// 广播消息，检查是否订阅了signal:all
-			shouldReceive = roomClient.Events["signal:all"]
-		} else {
-			// 特定事件消息，检查是否订阅了该事件或signal:all
-			shouldReceive = roomClient.Events[event] || roomClient.Events["signal:all"]
-		}
-
-		if !shouldReceive {
+		if !ws.clientReceivesEvent(roomClientID, event) {
 			continue
 		}
 
@@ -342,7 +359,7 @@ func (ws *WebSocketService) PublishToRoom(clientID, roomName, event string, data
 		"room":       roomName,
 		"event":      event,
 		"recipients": count,
-		"room_size":  len(room.ClientIDs),
+		"room_size":  len(roomClientIDs),
 	}).Debug("消息已广播")
 
 	return nil
@@ -470,8 +487,8 @@ func (ws *WebSocketService) SendDirectedToUser(roomName, toUserID, event, msgTyp
 	client := ws.FindClientByUserID(toUserID, roomName)
 	if client == nil {
 		logrus.WithFields(logrus.Fields{
-			"room": roomName,
-			"to":   toUserID,
+			"room":  roomName,
+			"to":    toUserID,
 			"event": event,
 		}).Debug("定向发送目标不存在于房间")
 		return false
@@ -482,17 +499,32 @@ func (ws *WebSocketService) SendDirectedToUser(roomName, toUserID, event, msgTyp
 }
 
 // RoomHasUserID 判断房间内是否仍有指定 userID 的活跃连接（用于离场广播去重：多标签页时同 userID 其它连接仍在则不下发 leave）。
-func (ws *WebSocketService) RoomHasUserID(roomName, userID string) bool {
+// roomClientIDsSnapshot copies the live room membership under roomsMutex so
+// callers never iterate ClientIDs while another connection mutates it.
+func (ws *WebSocketService) roomClientIDsSnapshot(roomName string) ([]string, bool) {
 	ws.roomsMutex.RLock()
+	defer ws.roomsMutex.RUnlock()
+
 	room, exists := ws.rooms[roomName]
-	ws.roomsMutex.RUnlock()
+	if !exists || room == nil {
+		return nil, false
+	}
+	clientIDs := make([]string, 0, len(room.ClientIDs))
+	for clientID := range room.ClientIDs {
+		clientIDs = append(clientIDs, clientID)
+	}
+	return clientIDs, true
+}
+
+func (ws *WebSocketService) RoomHasUserID(roomName, userID string) bool {
+	clientIDs, exists := ws.roomClientIDsSnapshot(roomName)
 	if !exists {
 		return false
 	}
 
 	ws.clientsMutex.RLock()
 	defer ws.clientsMutex.RUnlock()
-	for clientID := range room.ClientIDs {
+	for _, clientID := range clientIDs {
 		if client, ok := ws.clients[clientID]; ok && client.UserID == userID && client.Connection != nil {
 			return true
 		}
@@ -503,9 +535,7 @@ func (ws *WebSocketService) RoomHasUserID(roomName, userID string) bool {
 // roomRecipients 收集房间内除 excludeUserID 外、可写且订阅了 signal:all 的客户端快照。
 // 只在读锁内收集，发送放到锁外（写路径可能申请写锁，避免同 goroutine 锁升级死锁）。
 func (ws *WebSocketService) roomRecipients(roomName, excludeUserID string) []*model.Client {
-	ws.roomsMutex.RLock()
-	room, exists := ws.rooms[roomName]
-	ws.roomsMutex.RUnlock()
+	clientIDs, exists := ws.roomClientIDsSnapshot(roomName)
 	if !exists {
 		return nil
 	}
@@ -513,7 +543,7 @@ func (ws *WebSocketService) roomRecipients(roomName, excludeUserID string) []*mo
 	ws.clientsMutex.RLock()
 	defer ws.clientsMutex.RUnlock()
 	recipients := make([]*model.Client, 0, 4)
-	for clientID := range room.ClientIDs {
+	for _, clientID := range clientIDs {
 		client, ok := ws.clients[clientID]
 		if !ok || client.Connection == nil {
 			continue

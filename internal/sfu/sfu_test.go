@@ -201,7 +201,7 @@ func TestPublishSubscribeForward(t *testing.T) {
 		}()
 	})
 
-	sub, err := partB.SubscribeTo("pubA")
+	sub, _, err := partB.SubscribeTo("pubA")
 	if err != nil {
 		t.Fatalf("SubscribeTo 失败: %v", err)
 	}

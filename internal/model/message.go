@@ -15,20 +15,26 @@ const (
 	MessageTypeMessage     = "message"
 	MessageTypeError       = "error"
 	// Meeting（SFU 多人会议媒体通道）消息类型
-	MessageTypeMeetingJoin  = "meeting:join"
-	MessageTypeMeetingLeave = "meeting:leave"
-	MessageTypeMeetingSDP   = "meeting:sdp"
-	MessageTypeMeetingICE   = "meeting:ice"
+	MessageTypeMeetingJoin   = "meeting:join"
+	MessageTypeMeetingLeave  = "meeting:leave"
+	MessageTypeMeetingSDP    = "meeting:sdp"
+	MessageTypeMeetingICE    = "meeting:ice"
 	MessageTypeMeetingCreate = "meeting:create"
+	MessageTypeMeetingUpdate = "meeting:update"
 	// 会议控制/协作消息（服务器校验后转发或广播）
-	MessageTypeMeetingEnd     = "meeting:end"     // 房主结束会议（全员退出并释放资源）
-	MessageTypeMeetingKick    = "meeting:kick"    // 房主移出成员
-	MessageTypeMeetingKicked  = "meeting:kicked"  // 被移出通知（下行）
-	MessageTypeMeetingEnded   = "meeting:ended"   // 会议已结束通知（下行）
-	MessageTypeMeetingChat    = "meeting:chat"    // 会议内实时聊天（纯转发，不落盘）
-	MessageTypeMeetingDraw    = "meeting:draw"    // 协作画板笔画（纯转发，不落盘）
-	MessageTypeMeetingBreakout = "meeting:breakout" // 分组讨论（create 召集 / invite 定向 / recall 召回）
-	MessageTypeMeetingInfo     = "meeting:info"     // 加入成功后的会议信息定向通知（host/title）
+	MessageTypeMeetingEnd          = "meeting:end"           // 房主结束会议（全员退出并释放资源）
+	MessageTypeMeetingKick         = "meeting:kick"          // 房主移出成员
+	MessageTypeMeetingKicked       = "meeting:kicked"        // 被移出通知（下行）
+	MessageTypeMeetingEnded        = "meeting:ended"         // 会议已结束通知（下行）
+	MessageTypeMeetingChat         = "meeting:chat"          // 会议内实时聊天（纯转发，不落盘）
+	MessageTypeMeetingDraw         = "meeting:draw"          // 协作画板笔画（纯转发，不落盘）
+	MessageTypeMeetingBreakout     = "meeting:breakout"      // 分组讨论（create 召集 / invite 定向 / recall 召回）
+	MessageTypeMeetingInfo         = "meeting:info"          // 加入成功后的会议信息定向通知（host/title）
+	MessageTypeMeetingMediaControl = "meeting:media-control" // 房主媒体控制（全员静音/请求开麦）
+	MessageTypeMeetingInvite       = "meeting:invite"        // 房主定向会议邀请
+	MessageTypeMeetingPresentation = "meeting:presentation"  // 单一展示主持权（screen/whiteboard）
+	MessageTypeMeetingExcalidraw   = "meeting:excalidraw"    // Excalidraw 场景同步
+	MessageTypeMeetingMinutes      = "meeting:minutes"       // AI 会议纪要配置、同意、转写与摘要
 	// 文件传输相关消息类型
 	MessageTypeFileTransferRequest     = "file:transfer:request"      // 发起文件传输请求
 	MessageTypeFileTransferAccept      = "file:transfer:accept"       // 接受文件传输

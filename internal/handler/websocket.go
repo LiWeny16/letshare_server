@@ -115,21 +115,84 @@ type WebSocketHandler struct {
 	// activeMeetingRooms 保存当前合法的（已登记）会议号 → *meetingMeta。
 	// 会议号与 SFU 房间名（message.Channel）是同一个值；加入前需在此存在才放行。
 	activeMeetingRooms sync.Map
+	// activeMeetingInvites 保存进行中的会议邀请：inviteId → *meetingInvite（单次邀请状态机）。
+	activeMeetingInvites sync.Map
+	// inviteMu serializes duplicate detection with reservation before delivery.
+	inviteMu sync.Mutex
 }
 
 // meetingMeta 会议元数据：房主权威 + breakout 父子关系 + 房主断线宽限定时器。
 // 挂在 activeMeetingRooms 的 value 上（指针），自身细粒度加锁，避免全局锁竞争。
 type meetingMeta struct {
-	Host   string // 房主 UserID（uniqId）
-	Title  string // 会议标题（可选，≤64 字）
-	Parent string // breakout 房间指向主会议号；主会议为空
-	mu       sync.Mutex
-	endTimer *time.Timer // 房主断线宽限期后自动结束会议（刷新场景由重入取消）
+	// BreakoutMembers is immutable after child-room creation and restricts
+	// direct joins to users explicitly assigned by the host.
+	BreakoutMembers map[string]bool
+	Host            string // 房主 UserID（uniqId）
+	Title           string // 会议标题（可选，≤64 字）
+	Parent          string // breakout 房间指向主会议号；主会议为空
+	mu              sync.Mutex
+	endTimer        *time.Timer // 房主断线宽限期后自动结束会议（刷新场景由重入取消）
+	presentation    meetingPresentationState
+	excalidraw      meetingExcalidrawState
+	minutes         meetingMinutesState
 }
+
+type meetingPresentationState struct {
+	Mode      string `json:"mode"`
+	BoardMode string `json:"boardMode,omitempty"`
+	OwnerID   string `json:"ownerId"`
+	Epoch     uint64 `json:"epoch"`
+}
+
+type meetingExcalidrawState struct {
+	Revision uint64
+	Scene    json.RawMessage
+}
+
+// meetingMinutesState intentionally contains no provider API key. Keys stay in
+// the host browser and are never placed on the meeting WebSocket.
+type meetingMinutesState struct {
+	Configured      bool            `json:"configured"`
+	Running         bool            `json:"running"`
+	RequireConsent  bool            `json:"requireConsent"`
+	AsrSource       string          `json:"asrSource,omitempty"`
+	AsrModel        string          `json:"asrModel,omitempty"`
+	SummaryProvider string          `json:"summaryProvider,omitempty"`
+	SummaryModel    string          `json:"summaryModel,omitempty"`
+	Summary         string          `json:"summary,omitempty"`
+	Consented       map[string]bool `json:"-"`
+}
+
+const meetingExcalidrawMaxSceneBytes = 384 * 1024
 
 // hostLeaveGrace 房主意外断线（刷新/网络抖动）后等待其重入的宽限期。
 // 到点仍未回到房间则结束会议并释放资源，防止僵尸会议占用会议号与 SFU 内存。
 const hostLeaveGrace = 12 * time.Second
+
+// meetingInviteTTL 邀请有效期：超时未响应按过期处理（accept 迟到亦会被服务端拒绝）。
+// var 以便测试注入更短的 TTL。
+var meetingInviteTTL = 60 * time.Second
+
+// meetingInvite 单次会议邀请状态机（inviteId → 状态），挂在 activeMeetingInvites 上。
+type meetingInvite struct {
+	InviteID   string
+	MeetingID  string
+	From       string // 房主 UserID（uniqId）
+	To         string // 被邀请方 UserID（uniqId）
+	SourceRoom string // 原始 LetShare 房间号（与会议号分开，仅作定向投递通道）
+	ExpiresAt  time.Time
+	mu         sync.Mutex
+	Status     string // "pending" / "accepted" / "rejected" / "expired"
+}
+
+// meetingInviteMsg meeting:invite 上行数据（房主发起 / 被邀请方响应共用一个类型）。
+type meetingInviteMsg struct {
+	Action     string `json:"action"` // invite / accept / reject
+	To         string `json:"to"`
+	SourceRoom string `json:"sourceRoomId"`
+	InviteURL  string `json:"inviteUrl"`
+	InviteID   string `json:"inviteId"`
+}
 
 // meetingChatMaxLen 会议聊天单条文本上限（字节）。
 const meetingChatMaxLen = 2000
@@ -412,6 +475,8 @@ func (h *WebSocketHandler) processMessage(client *model.Client, message *model.W
 		// 移动网络不稳定时客户端可能回显进度消息，静默跳过避免产生错误
 	case model.MessageTypeMeetingCreate:
 		h.handleMeetingCreate(client, message)
+	case model.MessageTypeMeetingUpdate:
+		h.handleMeetingUpdate(client, message)
 	case model.MessageTypeMeetingJoin:
 		h.handleMeetingJoin(client, message)
 	case model.MessageTypeMeetingLeave:
@@ -424,12 +489,22 @@ func (h *WebSocketHandler) processMessage(client *model.Client, message *model.W
 		h.handleMeetingEnd(client, message)
 	case model.MessageTypeMeetingKick:
 		h.handleMeetingKick(client, message)
+	case model.MessageTypeMeetingMediaControl:
+		h.handleMeetingMediaControl(client, message)
 	case model.MessageTypeMeetingChat:
 		h.handleMeetingChat(client, message)
 	case model.MessageTypeMeetingDraw:
 		h.handleMeetingDraw(client, message)
 	case model.MessageTypeMeetingBreakout:
 		h.handleMeetingBreakout(client, message)
+	case model.MessageTypeMeetingInvite:
+		h.handleMeetingInvite(client, message)
+	case model.MessageTypeMeetingPresentation:
+		h.handleMeetingPresentation(client, message)
+	case model.MessageTypeMeetingExcalidraw:
+		h.handleMeetingExcalidraw(client, message)
+	case model.MessageTypeMeetingMinutes:
+		h.handleMeetingMinutes(client, message)
 	default:
 		h.sendError(client, 400, "不支持的消息类型: "+message.Type)
 	}
@@ -576,7 +651,11 @@ func (h *WebSocketHandler) handleMeetingCreate(client *model.Client, message *mo
 	var roomID string
 	for i := 0; i < 10000; i++ {
 		candidate := fmt.Sprintf("%04d", rand.Intn(10000))
-		if _, loaded := h.activeMeetingRooms.LoadOrStore(candidate, &meetingMeta{Host: client.UserID, Title: title}); !loaded {
+		if _, loaded := h.activeMeetingRooms.LoadOrStore(candidate, &meetingMeta{
+			Host: client.UserID,
+			Title: title,
+			minutes: meetingMinutesState{RequireConsent: true},
+		}); !loaded {
 			roomID = candidate
 			break
 		}
@@ -594,6 +673,55 @@ func (h *WebSocketHandler) handleMeetingCreate(client *model.Client, message *mo
 	))
 }
 
+// handleMeetingUpdate updates metadata for a reserved meeting before the host joins.
+// Only the registered host may change the title.
+func (h *WebSocketHandler) handleMeetingUpdate(client *model.Client, message *model.WebSocketMessage) {
+	if message.Channel == "" {
+		h.sendError(client, 400, "meeting:update 缺少会议房间")
+		return
+	}
+	v, ok := h.activeMeetingRooms.Load(message.Channel)
+	if !ok {
+		h.sendError(client, 404, "会议不存在")
+		return
+	}
+	meta, ok := v.(*meetingMeta)
+	if !ok || meta == nil {
+		h.sendError(client, 404, "会议不存在")
+		return
+	}
+	if meta.Host != client.UserID {
+		h.sendError(client, 403, "仅房主可以更新会议")
+		return
+	}
+	var update struct {
+		Title string `json:"title"`
+	}
+	if len(message.Data) > 0 {
+		if err := json.Unmarshal(message.Data, &update); err != nil {
+			h.sendError(client, 400, "meeting:update 数据格式错误")
+			return
+		}
+	}
+	title := strings.TrimSpace(update.Title)
+	if len(title) > 64 {
+		title = title[:64]
+	}
+	meta.mu.Lock()
+	meta.Title = title
+	meta.mu.Unlock()
+	// Before join there is no SFU participant. Once the host has joined, refresh
+	// all current members so the title stays consistent for everyone.
+	if room, ok := h.sfuManager.GetRoom(message.Channel); ok {
+		for _, participant := range room.Participants() {
+			if participant == nil || participant.ID == "" {
+				continue
+			}
+			h.sendMeetingInfo(message.Channel, participant.ID, meta)
+		}
+	}
+}
+
 func (h *WebSocketHandler) handleMeetingJoin(client *model.Client, message *model.WebSocketMessage) {
 	if message.Channel == "" {
 		h.sendError(client, 400, "meeting:join 缺少房间")
@@ -606,6 +734,10 @@ func (h *WebSocketHandler) handleMeetingJoin(client *model.Client, message *mode
 		return
 	}
 	meta, _ := v.(*meetingMeta)
+	if meta != nil && meta.Parent != "" && !meta.BreakoutMembers[client.UserID] {
+		h.sendError(client, 403, "breakout 房间仅允许受邀成员加入")
+		return
+	}
 	// 任何成员成功加入都取消挂起的自动结束定时器（宽限期语义：空房等待重入）。
 	if meta != nil {
 		meta.mu.Lock()
@@ -617,9 +749,10 @@ func (h *WebSocketHandler) handleMeetingJoin(client *model.Client, message *mode
 	}
 	room := h.sfuManager.JoinRoom(message.Channel)
 	// 发布者中途新增 track（屏幕共享等）→ 通知所有已订阅者重协商
-	room.OnTrackPublished = h.onMeetingTrackPublished
+	room.SetOnTrackPublished(h.onMeetingTrackPublished)
 	// 幂等：已存在则不重复建 PC
 	if _, ok := room.GetParticipant(client.UserID); ok {
+		h.sendMeetingInfo(message.Channel, client.UserID, meta)
 		return
 	}
 	p, err := room.AddParticipant(client.UserID)
@@ -631,10 +764,32 @@ func (h *WebSocketHandler) handleMeetingJoin(client *model.Client, message *mode
 	p.OnICECandidate(func(c *webrtc.ICECandidate) {
 		h.forwardMeetingICE(message.Channel, client.UserID, c, "")
 	})
-	// 定向告知会议信息（房主/标题）：前端用于房主徽章与控制按钮可见性。
-	if meta != nil {
-		h.wsService.SendDirectedToUser(message.Channel, client.UserID, "signal:"+client.UserID, model.MessageTypeMeetingInfo, map[string]interface{}{
-			"roomId": message.Channel, "host": meta.Host, "title": meta.Title,
+	// 定向告知会议信息（房主/标题）：前端用于房主徽章、控制按钮和无媒体入会状态。
+	h.sendMeetingInfo(message.Channel, client.UserID, meta)
+}
+
+// sendMeetingInfo 是 meeting:join 的逻辑确认。它与媒体采集/PeerConnection
+// 解耦：即使设备不存在或浏览器暂时没有建立媒体 PC，客户端也已经是有效会议成员。
+func (h *WebSocketHandler) sendMeetingInfo(roomID, userID string, meta *meetingMeta) {
+	if meta == nil {
+		return
+	}
+	meta.mu.Lock()
+	presentation := meta.presentation
+	excalidrawScene := append(json.RawMessage(nil), meta.excalidraw.Scene...)
+	excalidrawRevision := meta.excalidraw.Revision
+	minutes := meta.minutes
+	minutes.Consented = nil
+	host := meta.Host
+	title := meta.Title
+	meta.mu.Unlock()
+	h.wsService.SendDirectedToUser(roomID, userID, "signal:"+userID, model.MessageTypeMeetingInfo, map[string]interface{}{
+		"roomId": roomID, "host": host, "title": title, "minutes": minutes,
+		"joined": true, "presentation": presentation,
+	})
+	if len(excalidrawScene) > 0 {
+		h.wsService.SendDirectedToUser(roomID, userID, "signal:"+userID, model.MessageTypeMeetingExcalidraw, map[string]interface{}{
+			"action": "snapshot", "revision": excalidrawRevision, "scene": json.RawMessage(excalidrawScene),
 		})
 	}
 }
@@ -652,6 +807,7 @@ func (h *WebSocketHandler) handleMeetingLeave(client *model.Client, message *mod
 		}
 	}
 	if room, ok := h.sfuManager.GetRoom(roomName); ok {
+		h.releaseMeetingPresentation(roomName, client.UserID)
 		_ = room.RemoveParticipant(client.UserID)
 		// 房间已无参与者则整体移除，同时释放该会议号以便后续复用
 		if room.Count() == 0 {
@@ -662,8 +818,8 @@ func (h *WebSocketHandler) handleMeetingLeave(client *model.Client, message *mod
 
 // endMeetingRoom 房主主动结束会议：通知房间内所有成员 + 级联拆除 breakout 子房间 + 释放资源。
 func (h *WebSocketHandler) endMeetingRoom(roomID, reason string) {
-	if _, ok := h.sfuManager.GetRoom(roomID); ok || h.hasRegistered(roomID) {
-		h.wsService.BroadcastMeetingEvent(roomID, model.MessageTypeMeetingEnded, map[string]interface{}{
+	if room, ok := h.sfuManager.GetRoom(roomID); ok && room.Count() > 0 {
+		h.broadcastMeetingMembers(roomID, room, model.MessageTypeMeetingEnded, map[string]interface{}{
 			"roomId": roomID, "reason": reason,
 		}, "")
 	}
@@ -685,7 +841,7 @@ func (h *WebSocketHandler) teardownMeeting(roomID string, notify bool) {
 	}
 	if notify {
 		if room, ok := h.sfuManager.GetRoom(roomID); ok && room.Count() > 0 {
-			h.wsService.BroadcastMeetingEvent(roomID, model.MessageTypeMeetingEnded, map[string]interface{}{
+			h.broadcastMeetingMembers(roomID, room, model.MessageTypeMeetingEnded, map[string]interface{}{
 				"roomId": roomID, "reason": "ended",
 			}, "")
 		}
@@ -719,6 +875,7 @@ func (h *WebSocketHandler) cleanupMeetingState(client *model.Client) {
 		if _, exists := room.GetParticipant(client.UserID); !exists {
 			continue
 		}
+		h.releaseMeetingPresentation(roomID, client.UserID)
 		_ = room.RemoveParticipant(client.UserID)
 		if room.Count() == 0 {
 			h.scheduleMeetingEnd(roomID)
@@ -794,20 +951,33 @@ func (h *WebSocketHandler) handleMeetingSDP(client *model.Client, message *model
 		}
 		reply := map[string]interface{}{"type": "answer", "sdp": answer.SDP, "to": client.UserID}
 		h.wsService.SendDirectedToUser(message.Channel, client.UserID, "signal:"+client.UserID, model.MessageTypeMeetingSDP, reply)
+		// Pion 可能在 Offer 返回后异步触发 OnTrack；为避免“轨已注册但
+		// 迟发布回调恰好错过”的竞态，发布成功后做一个有界最终一致性补偿。
+		go h.reconcileMeetingSubscriptionsEventually(message.Channel, client.UserID)
 
 	case m.Type == "offer" && m.To != "":
 		// 订阅请求：订阅者要求订阅 m.To 发布者；服务器建 Subscriber 并把其 offer 回发订阅者
-		sub, err := part.SubscribeTo(m.To)
+		sub, created, err := part.SubscribeTo(m.To)
 		if err != nil {
 			h.sendError(client, 400, "meeting:sdp 订阅失败: "+err.Error())
+			// 发布者可能正在加入或刚完成 publish；不要让一次早到的请求
+			// 决定最终结果，后续由 SFU 侧 reconcile 在 track 就绪后补推 offer。
+			go h.reconcileMeetingSubscriptionsEventually(message.Channel, m.To)
+			return
+		}
+		if !created {
+			// 幂等重试：若首个 offer 可能在网络中丢失，只重发仍在等待 answer
+			// 的同一个 offer；稳定连接不重复协商。
+			if offer, pending := sub.OfferForRetry(); pending {
+				h.sendMeetingSubscriberOffer(message.Channel, client.UserID, m.To, offer)
+			}
 			return
 		}
 		// 接入该订阅 PC 的本地候选，定向回发给订阅者（默认引擎非离线需真实 ICE）
 		sub.OnICECandidate(func(c *webrtc.ICECandidate) {
 			h.forwardMeetingICE(message.Channel, client.UserID, c, m.To)
 		})
-		reply := map[string]interface{}{"type": "offer", "sdp": sub.Offer().SDP, "to": m.To}
-		h.wsService.SendDirectedToUser(message.Channel, client.UserID, "signal:"+client.UserID, model.MessageTypeMeetingSDP, reply)
+		h.sendMeetingSubscriberOffer(message.Channel, client.UserID, m.To, sub.Offer())
 
 	case m.Type == "answer" && m.To != "":
 		// 订阅者回 answer（订阅 PC）：按发布者 m.To 找到对应 Subscriber
@@ -819,6 +989,14 @@ func (h *WebSocketHandler) handleMeetingSDP(client *model.Client, message *model
 		if err := sub.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: m.SDP}); err != nil {
 			h.sendError(client, 500, "meeting:sdp answer 设置失败: "+err.Error())
 			return
+		}
+		// 新轨道可能在上一 offer 等待 answer 期间到达。answer 确认后，
+		// 生成并发送一个合并后的后续 offer，闭合音频/摄像头/屏幕的迟发布窗口。
+		if next, ok, err := sub.PendingOffer(); err != nil {
+			h.sendError(client, 500, "meeting:sdp 后续 offer 生成失败: "+err.Error())
+			return
+		} else if ok {
+			h.sendMeetingSubscriberOffer(message.Channel, client.UserID, m.To, next)
 		}
 
 	case m.Type == "answer" && m.To == "":
@@ -879,35 +1057,112 @@ func (h *WebSocketHandler) handleMeetingICE(client *model.Client, message *model
 	}
 }
 
-// onMeetingTrackPublished 发布者新增 track 时的扇出：向每个已订阅该发布者的成员
-// 推送重协商 offer（客户端 answer 走既有 meeting:sdp answer 通道）。
+// onMeetingTrackPublished 发布者新增 track 时的扇出：
+//   - 已订阅该发布者的成员：推送重协商 offer（客户端 answer 走既有 meeting:sdp answer 通道）；
+//   - 尚未建立订阅的成员（订阅早于发布被拒、重试窗口已耗尽）：自动建立订阅并推送其 offer ——
+//     「publisher 尚未 ready」从此变成服务器侧等待 + 主动补推，订阅方无需感知重试节奏。
 func (h *WebSocketHandler) onMeetingTrackPublished(roomID, publisherID string, track *webrtc.TrackRemote) {
 	room, ok := h.sfuManager.GetRoom(roomID)
 	if !ok {
 		return
 	}
+	logrus.WithFields(logrus.Fields{
+		"room": roomID, "publisher": publisherID, "kind": track.Kind().String(), "participants": room.Count(),
+	}).Info("meeting track published: reconcile subscribers")
 	for _, p := range room.Participants() {
 		if p.ID == publisherID {
 			continue
 		}
-		sub, ok := p.GetSubscriber(publisherID)
-		if !ok {
+		if sub, ok := p.GetSubscriber(publisherID); ok && !sub.IsClosed() {
+			offer, err := sub.AddPublishedTrack(track)
+			if err != nil {
+				logrus.WithError(err).WithFields(logrus.Fields{
+					"room": roomID, "publisher": publisherID, "subscriber": p.ID,
+				}).Warn("会议 track 扇出重协商失败")
+				continue
+			}
+			if offer.SDP == "" {
+				continue // 幂等跳过
+			}
+			h.sendMeetingSubscriberOffer(roomID, p.ID, publisherID, offer)
 			continue
 		}
-		offer, err := sub.AddPublishedTrack(track)
+		// 无有效订阅（旧订阅已关闭/不存在）：为迟发布自动建订阅并推送 offer
+		sub, created, err := p.SubscribeTo(publisherID)
 		if err != nil {
 			logrus.WithError(err).WithFields(logrus.Fields{
 				"room": roomID, "publisher": publisherID, "subscriber": p.ID,
-			}).Warn("会议 track 扇出重协商失败")
+			}).Debug("迟发布自动补订阅未成功")
 			continue
 		}
-		if offer.SDP == "" {
-			continue // 幂等跳过
+		if !created {
+			continue // 并发路径已有人建订阅并推送
 		}
-		h.wsService.SendDirectedToUser(roomID, p.ID, "signal:"+p.ID, model.MessageTypeMeetingSDP, map[string]interface{}{
-			"type": "offer", "sdp": offer.SDP, "to": publisherID,
+		sub.OnICECandidate(func(c *webrtc.ICECandidate) {
+			h.forwardMeetingICE(roomID, p.ID, c, publisherID)
 		})
+		h.sendMeetingSubscriberOffer(roomID, p.ID, publisherID, sub.Offer())
 	}
+}
+
+// reconcileMeetingSubscriptionsEventually closes the timing gap between a
+// participant join/publish request and Pion's asynchronous OnTrack callback.
+// It is deliberately bounded: this is recovery for the join race, not a
+// permanent polling loop. Once a subscriber exists, only a pending offer is
+// resent; no duplicate peer connection is created.
+func (h *WebSocketHandler) reconcileMeetingSubscriptionsEventually(roomID, publisherID string) {
+	for attempt := 0; attempt < 10; attempt++ {
+		if attempt > 0 {
+			time.Sleep(100 * time.Millisecond)
+		}
+		h.reconcileMeetingSubscriptions(roomID, publisherID)
+	}
+}
+
+func (h *WebSocketHandler) reconcileMeetingSubscriptions(roomID, publisherID string) {
+	room, ok := h.sfuManager.GetRoom(roomID)
+	if !ok {
+		return
+	}
+	publisher, ok := room.GetParticipant(publisherID)
+	if !ok || publisher.IsClosed() {
+		return
+	}
+	if len(publisher.PublishedTracks()) == 0 {
+		return
+	}
+	for _, subscriber := range room.Participants() {
+		if subscriber.ID == publisherID || subscriber.IsClosed() {
+			continue
+		}
+		sub, created, err := subscriber.SubscribeTo(publisherID)
+		if err != nil {
+			continue
+		}
+		if created {
+			sub.OnICECandidate(func(c *webrtc.ICECandidate) {
+				h.forwardMeetingICE(roomID, subscriber.ID, c, publisherID)
+			})
+			h.sendMeetingSubscriberOffer(roomID, subscriber.ID, publisherID, sub.Offer())
+			continue
+		}
+		if offer, pending := sub.OfferForRetry(); pending {
+			h.sendMeetingSubscriberOffer(roomID, subscriber.ID, publisherID, offer)
+		}
+	}
+}
+
+// sendMeetingSubscriberOffer 统一发送订阅方向 offer，避免不同入口遗漏 to/channel。
+func (h *WebSocketHandler) sendMeetingSubscriberOffer(roomID, subscriberID, publisherID string, offer webrtc.SessionDescription) {
+	if offer.SDP == "" {
+		return
+	}
+	logrus.WithFields(logrus.Fields{
+		"room": roomID, "subscriber": subscriberID, "publisher": publisherID, "sdpLength": len(offer.SDP),
+	}).Info("meeting subscriber offer sent")
+	h.wsService.SendDirectedToUser(roomID, subscriberID, "signal:"+subscriberID, model.MessageTypeMeetingSDP, map[string]interface{}{
+		"type": "offer", "sdp": offer.SDP, "to": publisherID,
+	})
 }
 
 // forwardMeetingICE 把服务器侧某条 PC 的本地候选定向回发给客户端。
@@ -969,6 +1224,7 @@ func (h *WebSocketHandler) handleMeetingKick(client *model.Client, message *mode
 	}
 	// 从 SFU 房间移除（断其上下行媒体）
 	if room, ok := h.sfuManager.GetRoom(roomID); ok {
+		h.releaseMeetingPresentation(roomID, m.To)
 		_ = room.RemoveParticipant(m.To)
 	}
 	// 定向通知被移出者（其前端自行 leaveMeeting + 退出导航）
@@ -981,19 +1237,75 @@ func (h *WebSocketHandler) handleMeetingKick(client *model.Client, message *mode
 	}, m.To)
 }
 
-// handleMeetingChat 会议内实时聊天：服务器纯转发广播（不落盘、不存历史）。
+type meetingMediaControlMsg struct {
+	Action string `json:"action"` // mute-all / request-unmute
+}
+
+// handleMeetingMediaControl 会议主持人媒体控制：服务端只负责鉴权和定向广播，
+// 具体的浏览器麦克风状态仍由每个客户端自己的 meetingManager 修改。
+func (h *WebSocketHandler) handleMeetingMediaControl(client *model.Client, message *model.WebSocketMessage) {
+	roomID := message.Channel
+	if roomID == "" {
+		h.sendError(client, 400, "meeting:media-control 缺少房间")
+		return
+	}
+	v, ok := h.activeMeetingRooms.Load(roomID)
+	if !ok {
+		h.sendError(client, 404, "会议不存在")
+		return
+	}
+	meta, _ := v.(*meetingMeta)
+	room, roomOK := h.sfuManager.GetRoom(roomID)
+	if meta == nil || !roomOK || !meetingParticipantIDs(room)[client.UserID] {
+		h.sendError(client, 403, "meeting:media-control 发送者不是该会议成员")
+		return
+	}
+	if meta.Host != client.UserID {
+		h.sendError(client, 403, "只有主持人可以控制全员麦克风")
+		return
+	}
+	var m meetingMediaControlMsg
+	if err := json.Unmarshal(message.Data, &m); err != nil {
+		h.sendError(client, 400, "meeting:media-control 数据格式错误")
+		return
+	}
+	if m.Action != "mute-all" && m.Action != "request-unmute" {
+		h.sendError(client, 400, "meeting:media-control 未知 action")
+		return
+	}
+	h.broadcastMeetingMembers(roomID, room, model.MessageTypeMeetingMediaControl, map[string]interface{}{
+		"action": m.Action,
+		"from":   client.UserID,
+		"ts":     time.Now().UnixMilli(),
+	}, client.UserID)
+}
+
+// handleMeetingChat 会议内实时聊天：服务器纯转发（不落盘、不存历史）。
+//   - 无 to：房间广播（与会成员可见）。
+//   - 带 to：定向私聊 —— 服务器校验发送者和目标都是当前会议成员
+//     （以 SFU 房间参与者为准，meeting:join 后才算成员），
+//     禁止跨会议、跨房间投递（目标只按 meetingID 房间内查找）。
+//
 // 文本长度服务端封顶，防止小水管被大包滥用。
 func (h *WebSocketHandler) handleMeetingChat(client *model.Client, message *model.WebSocketMessage) {
 	roomID := message.Channel
 	if roomID == "" {
 		return
 	}
-	if _, ok := h.sfuManager.GetRoom(roomID); !ok {
+	room, ok := h.sfuManager.GetRoom(roomID)
+	if !ok {
 		h.sendError(client, 400, "meeting:chat 尚未加入该会议房间")
+		return
+	}
+	// 发送者必须是当前会议成员（SFU 参与者；防跨会议、跨房间伪造投递）
+	memberIDs := meetingParticipantIDs(room)
+	if !memberIDs[client.UserID] {
+		h.sendError(client, 403, "meeting:chat 发送者不是该会议成员")
 		return
 	}
 	var m struct {
 		Text string `json:"text"`
+		To   string `json:"to"`
 	}
 	if err := json.Unmarshal(message.Data, &m); err != nil {
 		h.sendError(client, 400, "meeting:chat 数据格式错误")
@@ -1006,9 +1318,42 @@ func (h *WebSocketHandler) handleMeetingChat(client *model.Client, message *mode
 	if len(text) > meetingChatMaxLen {
 		text = text[:meetingChatMaxLen]
 	}
-	h.wsService.BroadcastMeetingEvent(roomID, model.MessageTypeMeetingChat, map[string]interface{}{
+
+	// 定向私聊：目标必须仍是本会议成员（roomID == meetingID，杜绝跨会议/跨房间）
+	if m.To != "" {
+		if m.To == client.UserID {
+			return
+		}
+		if !memberIDs[m.To] {
+			h.sendError(client, 404, "目标成员不在当前会议中")
+			return
+		}
+		delivered := h.wsService.SendDirectedToUser(roomID, m.To, "signal:"+m.To, model.MessageTypeMeetingChat, map[string]interface{}{
+			"from": client.UserID, "text": text, "ts": time.Now().UnixMilli(), "to": m.To,
+		})
+		if !delivered {
+			h.sendError(client, 404, "目标成员已离开会议")
+		}
+		return
+	}
+
+	h.broadcastMeetingMembers(roomID, room, model.MessageTypeMeetingChat, map[string]interface{}{
 		"from": client.UserID, "text": text, "ts": time.Now().UnixMilli(),
 	}, client.UserID) // 排除发送者：其 UI 已本地回显，省一次回环
+}
+
+// meetingParticipantIDs 汇总 SFU 会议房间的参与者 UserID 集（会议成员权威名单）。
+func meetingParticipantIDs(room *sfu.Room) map[string]bool {
+	ids := make(map[string]bool)
+	if room == nil {
+		return ids
+	}
+	for _, p := range room.Participants() {
+		if p != nil && p.ID != "" {
+			ids[p.ID] = true
+		}
+	}
+	return ids
 }
 
 // handleMeetingDraw 协作画板：服务器纯转发笔画/清空操作，所有成员同步渲染。
@@ -1017,8 +1362,13 @@ func (h *WebSocketHandler) handleMeetingDraw(client *model.Client, message *mode
 	if roomID == "" {
 		return
 	}
-	if _, ok := h.sfuManager.GetRoom(roomID); !ok {
+	room, ok := h.sfuManager.GetRoom(roomID)
+	if !ok {
 		h.sendError(client, 400, "meeting:draw 尚未加入该会议房间")
+		return
+	}
+	if !meetingParticipantIDs(room)[client.UserID] {
+		h.sendError(client, 403, "meeting:draw 发送者不是该会议成员")
 		return
 	}
 	// 原样转发（数据已在 conn 层 512KB 限制内），补充发送者便于去重回显。
@@ -1028,13 +1378,350 @@ func (h *WebSocketHandler) handleMeetingDraw(client *model.Client, message *mode
 	}
 	payload["from"] = json.RawMessage(fmt.Sprintf("%q", client.UserID))
 	data, _ := json.Marshal(payload)
-	h.wsService.BroadcastMeetingEvent(roomID, model.MessageTypeMeetingDraw, json.RawMessage(data), client.UserID) // 排除发送者：本地已实时绘制
+	h.broadcastMeetingMembers(roomID, room, model.MessageTypeMeetingDraw, json.RawMessage(data), client.UserID) // 排除发送者：本地已实时绘制
+}
+
+type meetingMinutesMsg struct {
+	Action          string `json:"action"`
+	RequireConsent  bool   `json:"requireConsent"`
+	AsrSource       string `json:"asrSource"`
+	AsrModel        string `json:"asrModel"`
+	SummaryProvider string `json:"summaryProvider"`
+	SummaryModel    string `json:"summaryModel"`
+	Accepted        bool   `json:"accepted"`
+	SegmentID       string `json:"segmentId"`
+	Text            string `json:"text"`
+	StartMs         int64  `json:"startMs"`
+	EndMs           int64  `json:"endMs"`
+	Final           bool   `json:"final"`
+	Summary         string `json:"summary"`
+}
+
+// handleMeetingMinutes owns the non-media AI collaboration plane. Provider
+// credentials are intentionally not accepted here: they remain in the host
+// browser and are used only for the BYOK request.
+func (h *WebSocketHandler) handleMeetingMinutes(client *model.Client, message *model.WebSocketMessage) {
+	roomID := message.Channel
+	if roomID == "" {
+		h.sendError(client, 400, "meeting:minutes 缺少会议房间")
+		return
+	}
+	v, ok := h.activeMeetingRooms.Load(roomID)
+	meta, metaOK := v.(*meetingMeta)
+	room, roomOK := h.sfuManager.GetRoom(roomID)
+	if !ok || !metaOK || meta == nil || !roomOK {
+		h.sendError(client, 404, "会议不存在")
+		return
+	}
+	if !meetingParticipantIDs(room)[client.UserID] {
+		h.sendError(client, 403, "meeting:minutes 发送者不是会议成员")
+		return
+	}
+	var m meetingMinutesMsg
+	if err := json.Unmarshal(message.Data, &m); err != nil {
+		h.sendError(client, 400, "meeting:minutes 数据格式错误")
+		return
+	}
+
+	meta.mu.Lock()
+	if meta.minutes.Consented == nil {
+		meta.minutes.Consented = make(map[string]bool)
+	}
+	state := meta.minutes
+	meta.mu.Unlock()
+
+	switch m.Action {
+	case "configure":
+		if meta.Host != client.UserID {
+			h.sendError(client, 403, "仅主持人可以配置会议纪要")
+			return
+		}
+		if m.AsrSource != "browser-speech" && m.AsrSource != "wasm" && m.AsrSource != "iflytek" {
+			h.sendError(client, 400, "不支持的 ASR 来源")
+			return
+		}
+		if m.SummaryProvider != "mimo" && m.SummaryProvider != "openai" && m.SummaryProvider != "anthropic" && m.SummaryProvider != "custom" {
+			h.sendError(client, 400, "不支持的摘要供应商")
+			return
+		}
+		if len(m.AsrModel) > 64 || len(m.SummaryModel) > 128 {
+			h.sendError(client, 400, "模型名称过长")
+			return
+		}
+		meta.mu.Lock()
+		meta.minutes = meetingMinutesState{
+			Configured: true, Running: false, RequireConsent: m.RequireConsent,
+			AsrSource: m.AsrSource, AsrModel: strings.TrimSpace(m.AsrModel),
+			SummaryProvider: m.SummaryProvider, SummaryModel: strings.TrimSpace(m.SummaryModel),
+			Consented: make(map[string]bool),
+		}
+		state = meta.minutes
+		state.Consented = nil
+		meta.mu.Unlock()
+		h.broadcastMeetingMembers(roomID, room, model.MessageTypeMeetingMinutes, map[string]interface{}{"kind": "configured", "minutes": state}, "")
+	case "start":
+		if meta.Host != client.UserID {
+			h.sendError(client, 403, "仅主持人可以启动会议纪要")
+			return
+		}
+		meta.mu.Lock()
+		if !meta.minutes.Configured {
+			meta.mu.Unlock()
+			h.sendError(client, 409, "请先配置会议纪要来源")
+			return
+		}
+		meta.minutes.Running = true
+		state = meta.minutes
+		state.Consented = nil
+		meta.mu.Unlock()
+		h.broadcastMeetingMembers(roomID, room, model.MessageTypeMeetingMinutes, map[string]interface{}{"kind": "started", "minutes": state}, "")
+	case "stop":
+		if meta.Host != client.UserID {
+			h.sendError(client, 403, "仅主持人可以停止会议纪要")
+			return
+		}
+		meta.mu.Lock()
+		meta.minutes.Running = false
+		state = meta.minutes
+		state.Consented = nil
+		meta.mu.Unlock()
+		h.broadcastMeetingMembers(roomID, room, model.MessageTypeMeetingMinutes, map[string]interface{}{"kind": "stopped", "minutes": state}, "")
+	case "consent":
+		meta.mu.Lock()
+		meta.minutes.Consented[client.UserID] = m.Accepted
+		meta.mu.Unlock()
+		h.broadcastMeetingMembers(roomID, room, model.MessageTypeMeetingMinutes, map[string]interface{}{"kind": "consent", "userId": client.UserID, "accepted": m.Accepted}, "")
+	case "segment":
+		meta.mu.Lock()
+		running := meta.minutes.Running
+		requireConsent := meta.minutes.RequireConsent
+		consented := meta.minutes.Consented[client.UserID]
+		meta.mu.Unlock()
+		if !running {
+			h.sendError(client, 409, "会议纪要尚未启动")
+			return
+		}
+		if requireConsent && !consented {
+			h.sendError(client, 403, "璇峰厛鍚屾剰浼氳绾褰曢煶杞啓")
+			return
+		}
+		text := strings.TrimSpace(m.Text)
+		if text == "" || len(text) > 4000 {
+			h.sendError(client, 400, "转写片段为空或过长")
+			return
+		}
+		segmentID := strings.TrimSpace(m.SegmentID)
+		if segmentID == "" {
+			segmentID = fmt.Sprintf("%s:%d", client.UserID, time.Now().UnixNano())
+		}
+		speakerName := client.UserID
+		if index := strings.IndexByte(speakerName, ':'); index > 0 {
+			speakerName = speakerName[:index]
+		}
+		h.broadcastMeetingMembers(roomID, room, model.MessageTypeMeetingMinutes, map[string]interface{}{
+			"kind": "segment", "segmentId": segmentID, "from": client.UserID, "speakerName": speakerName,
+			"text": text, "startMs": m.StartMs, "endMs": m.EndMs, "final": m.Final,
+		}, "")
+	case "summary":
+		if meta.Host != client.UserID {
+			h.sendError(client, 403, "仅主持人可以提交会议摘要")
+			return
+		}
+		if len(m.Summary) > 128*1024 {
+			h.sendError(client, 400, "会议摘要过长")
+			return
+		}
+		meta.mu.Lock()
+		meta.minutes.Summary = strings.TrimSpace(m.Summary)
+		meta.minutes.Running = false
+		state = meta.minutes
+		state.Consented = nil
+		meta.mu.Unlock()
+		h.broadcastMeetingMembers(roomID, room, model.MessageTypeMeetingMinutes, map[string]interface{}{"kind": "summary", "summary": state.Summary, "minutes": state}, "")
+	default:
+		h.sendError(client, 400, "meeting:minutes 未知 action")
+	}
+}
+
+// broadcastMeetingMembers 只向已登记 SFU 参与者投递会议协作事件。
+// 会议频道可能同时被原始房间/旧客户端订阅，不能把“订阅频道”误当成“会议成员”。
+func (h *WebSocketHandler) broadcastMeetingMembers(roomID string, room *sfu.Room, msgType string, payload interface{}, exclude string) {
+	if room == nil {
+		return
+	}
+	for _, participant := range room.Participants() {
+		if participant == nil || participant.ID == "" || participant.ID == exclude {
+			continue
+		}
+		h.wsService.SendDirectedToUser(roomID, participant.ID, "signal:"+participant.ID, msgType, payload)
+	}
+}
+
+type meetingPresentationMsg struct {
+	Action    string `json:"action"`    // claim / release
+	Mode      string `json:"mode"`      // screen / whiteboard
+	BoardMode string `json:"boardMode"` // basic / excalidraw
+}
+
+// handleMeetingPresentation 是展示主持权的唯一写入口：同一时刻只有一名
+// owner，任意会议成员可以 claim（抢占旧 owner），当前 owner 或房主可以 release。
+func (h *WebSocketHandler) handleMeetingPresentation(client *model.Client, message *model.WebSocketMessage) {
+	roomID := message.Channel
+	if roomID == "" {
+		h.sendError(client, 400, "meeting:presentation 缺少房间")
+		return
+	}
+	v, ok := h.activeMeetingRooms.Load(roomID)
+	if !ok {
+		h.sendError(client, 404, "会议不存在")
+		return
+	}
+	meta, _ := v.(*meetingMeta)
+	room, roomOK := h.sfuManager.GetRoom(roomID)
+	if meta == nil || !roomOK || !meetingParticipantIDs(room)[client.UserID] {
+		h.sendError(client, 403, "meeting:presentation 发送者不是该会议成员")
+		return
+	}
+	var m meetingPresentationMsg
+	if err := json.Unmarshal(message.Data, &m); err != nil {
+		h.sendError(client, 400, "meeting:presentation 数据格式错误")
+		return
+	}
+	if m.Action != "claim" && m.Action != "release" {
+		h.sendError(client, 400, "meeting:presentation 未知 action")
+		return
+	}
+	if m.Action == "claim" && m.Mode != "screen" && m.Mode != "whiteboard" {
+		h.sendError(client, 400, "meeting:presentation 未知 mode")
+		return
+	}
+	if m.Action == "claim" && m.Mode == "whiteboard" && m.BoardMode != "basic" && m.BoardMode != "excalidraw" {
+		m.BoardMode = "excalidraw"
+	}
+
+	meta.mu.Lock()
+	state := meta.presentation
+	switch m.Action {
+	case "claim":
+		if state.OwnerID != client.UserID || state.Mode != m.Mode || state.BoardMode != m.BoardMode {
+			state.Epoch++
+			state.OwnerID = client.UserID
+			state.Mode = m.Mode
+			state.BoardMode = ""
+			if m.Mode == "whiteboard" {
+				state.BoardMode = m.BoardMode
+			}
+		}
+		meta.presentation = state
+	case "release":
+		if state.OwnerID != client.UserID && meta.Host != client.UserID {
+			meta.mu.Unlock()
+			h.sendError(client, 403, "只有当前展示者或房主可以停止展示")
+			return
+		}
+		if state.OwnerID != "" || state.Mode != "" {
+			state.Epoch++
+			state.OwnerID = ""
+			state.Mode = ""
+			state.BoardMode = ""
+		}
+		meta.presentation = state
+	}
+	meta.mu.Unlock()
+	h.broadcastMeetingMembers(roomID, room, model.MessageTypeMeetingPresentation, state, "")
+}
+
+type meetingExcalidrawMsg struct {
+	Action   string          `json:"action"` // update / request
+	Revision uint64          `json:"revision"`
+	Scene    json.RawMessage `json:"scene"`
+}
+
+// handleMeetingExcalidraw 保存受限大小的最新场景快照并只向真实会议成员
+// 广播。服务端生成 revision；客户端 revision 过期时不得覆盖最新场景。
+func (h *WebSocketHandler) handleMeetingExcalidraw(client *model.Client, message *model.WebSocketMessage) {
+	roomID := message.Channel
+	room, ok := h.sfuManager.GetRoom(roomID)
+	if !ok {
+		h.sendError(client, 400, "meeting:excalidraw 尚未加入该会议房间")
+		return
+	}
+	if !meetingParticipantIDs(room)[client.UserID] {
+		h.sendError(client, 403, "meeting:excalidraw 发送者不是该会议成员")
+		return
+	}
+	v, loaded := h.activeMeetingRooms.Load(roomID)
+	meta, metaOK := v.(*meetingMeta)
+	if !loaded || !metaOK || meta == nil {
+		h.sendError(client, 404, "会议不存在")
+		return
+	}
+	var m meetingExcalidrawMsg
+	if err := json.Unmarshal(message.Data, &m); err != nil {
+		h.sendError(client, 400, "meeting:excalidraw 数据格式错误")
+		return
+	}
+	if m.Action == "request" {
+		meta.mu.Lock()
+		scene := append(json.RawMessage(nil), meta.excalidraw.Scene...)
+		revision := meta.excalidraw.Revision
+		meta.mu.Unlock()
+		if len(scene) > 0 {
+			h.wsService.SendDirectedToUser(roomID, client.UserID, "signal:"+client.UserID, model.MessageTypeMeetingExcalidraw, map[string]interface{}{
+				"action": "snapshot", "revision": revision, "scene": json.RawMessage(scene),
+			})
+		}
+		return
+	}
+	if m.Action != "update" || len(m.Scene) == 0 || len(m.Scene) > meetingExcalidrawMaxSceneBytes {
+		h.sendError(client, 400, "meeting:excalidraw 场景为空或超过大小限制")
+		return
+	}
+	var scene struct {
+		Elements json.RawMessage `json:"elements"`
+	}
+	if err := json.Unmarshal(m.Scene, &scene); err != nil || len(bytes.TrimSpace(scene.Elements)) == 0 || bytes.TrimSpace(scene.Elements)[0] != '[' {
+		h.sendError(client, 400, "meeting:excalidraw 场景必须包含 elements 数组")
+		return
+	}
+	meta.mu.Lock()
+	meta.excalidraw.Revision++
+	revision := meta.excalidraw.Revision
+	meta.excalidraw.Scene = append(json.RawMessage(nil), m.Scene...)
+	stored := append(json.RawMessage(nil), meta.excalidraw.Scene...)
+	meta.mu.Unlock()
+	h.broadcastMeetingMembers(roomID, room, model.MessageTypeMeetingExcalidraw, map[string]interface{}{
+		"action": "snapshot", "revision": revision, "scene": json.RawMessage(stored),
+	}, "")
+}
+
+func (h *WebSocketHandler) releaseMeetingPresentation(roomID, userID string) {
+	v, loaded := h.activeMeetingRooms.Load(roomID)
+	meta, metaOK := v.(*meetingMeta)
+	if !loaded || !metaOK || meta == nil {
+		return
+	}
+	meta.mu.Lock()
+	state := meta.presentation
+	if state.OwnerID != userID {
+		meta.mu.Unlock()
+		return
+	}
+	state.Epoch++
+	state.OwnerID = ""
+	state.Mode = ""
+	state.BoardMode = ""
+	meta.presentation = state
+	meta.mu.Unlock()
+	if room, ok := h.sfuManager.GetRoom(roomID); ok {
+		h.broadcastMeetingMembers(roomID, room, model.MessageTypeMeetingPresentation, state, "")
+	}
 }
 
 // handleMeetingBreakout 分组讨论：
 //   - action=create（房主）：登记 breakout 子房间（Parent=主会议号），向每个成员定向下发 invite。
 //   - action=recall（房主）：向所有 breakout 房间成员定向下发召回，并拆除子房间。
-//   成员侧收到 invite/recall 后自行切换房间（leave + join 复用既有流程）。
+//     成员侧收到 invite/recall 后自行切换房间（leave + join 复用既有流程）。
 func (h *WebSocketHandler) handleMeetingBreakout(client *model.Client, message *model.WebSocketMessage) {
 	roomID := message.Channel
 	if roomID == "" {
@@ -1047,6 +1734,11 @@ func (h *WebSocketHandler) handleMeetingBreakout(client *model.Client, message *
 	meta, _ := v.(*meetingMeta)
 	if meta == nil || meta.Host != client.UserID {
 		h.sendError(client, 403, "仅房主可管理分组讨论")
+		return
+	}
+	mainRoom, mainRoomOK := h.sfuManager.GetRoom(roomID)
+	if !mainRoomOK || !meetingParticipantIDs(mainRoom)[client.UserID] {
+		h.sendError(client, 403, "房主尚未加入主会场")
 		return
 	}
 	var m struct {
@@ -1067,18 +1759,37 @@ func (h *WebSocketHandler) handleMeetingBreakout(client *model.Client, message *
 			return
 		}
 		sent := 0
+		assigned := map[string]bool{}
+		mainMembers := meetingParticipantIDs(mainRoom)
 		for _, a := range m.Assignments {
 			if a.Room == "" || !strings.HasPrefix(a.Room, roomID) || a.Room == roomID || len(a.Members) == 0 {
 				continue
 			}
-			// 幂等登记：重复 create 同名房间不覆盖
-			if _, exists := h.activeMeetingRooms.LoadOrStore(a.Room, &meetingMeta{Host: meta.Host, Parent: roomID}); exists {
+			members := make([]string, 0, len(a.Members))
+			for _, uid := range a.Members {
+				if uid == meta.Host || !mainMembers[uid] || assigned[uid] {
+					continue
+				}
+				assigned[uid] = true
+				members = append(members, uid)
+			}
+			if len(members) == 0 {
 				continue
 			}
-			for _, uid := range a.Members {
-				if uid == meta.Host {
-					continue // 房主留守主会场
-				}
+			breakoutMembers := make(map[string]bool, len(members))
+			for _, uid := range members {
+				breakoutMembers[uid] = true
+			}
+			// 幂等登记：重复 create 同名房间不覆盖
+			if _, exists := h.activeMeetingRooms.LoadOrStore(a.Room, &meetingMeta{
+				Host: meta.Host,
+				Parent: roomID,
+				BreakoutMembers: breakoutMembers,
+				minutes: meetingMinutesState{RequireConsent: true},
+			}); exists {
+				continue
+			}
+			for _, uid := range members {
 				if h.wsService.SendDirectedToUser(roomID, uid, "signal:"+uid, model.MessageTypeMeetingBreakout, map[string]interface{}{
 					"action": "invite", "room": a.Room, "main": roomID,
 				}) {
@@ -1115,6 +1826,203 @@ func (h *WebSocketHandler) handleMeetingBreakout(client *model.Client, message *
 	default:
 		h.sendError(client, 400, "meeting:breakout 未知 action")
 	}
+}
+
+// handleMeetingInvite 会议邀请（仅原始房间在线名单中的定向投递，绝不广播）：
+//   - action=invite（房主上行）：校验房主身份 / 发送者与目标同属原始房间 / 会议有效，
+//     生成 inviteId 并把邀请定向送达目标用户，随后给房主 sent 回执。
+//   - action=accept|reject（被邀请方上行）：校验邀请归属与有效期，把结果定向回执双方。
+func (h *WebSocketHandler) handleMeetingInvite(client *model.Client, message *model.WebSocketMessage) {
+	var m meetingInviteMsg
+	if len(message.Data) > 0 {
+		if err := json.Unmarshal(message.Data, &m); err != nil {
+			h.sendError(client, 400, "meeting:invite 数据格式错误")
+			return
+		}
+	}
+	switch m.Action {
+	case "invite":
+		h.handleMeetingInviteSend(client, message, m)
+	case "accept", "reject":
+		h.handleMeetingInviteRespond(client, m.Action, m.InviteID)
+	default:
+		h.sendError(client, 400, "meeting:invite 未知 action")
+	}
+}
+
+// handleMeetingInviteSend 房主发起定向邀请：from 由服务器取自连接身份，杜绝伪造。
+func (h *WebSocketHandler) handleMeetingInviteSend(client *model.Client, message *model.WebSocketMessage, m meetingInviteMsg) {
+	roomID := message.Channel
+	if roomID == "" {
+		h.sendError(client, 400, "meeting:invite 缺少会议号")
+		return
+	}
+	v, ok := h.activeMeetingRooms.Load(roomID)
+	if !ok {
+		h.sendError(client, 404, "会议不存在或已结束")
+		return
+	}
+	meta, _ := v.(*meetingMeta)
+	if meta == nil || meta.Host != client.UserID {
+		h.sendError(client, 403, "仅房主可发送会议邀请")
+		return
+	}
+	if m.To == "" || m.To == client.UserID {
+		h.sendError(client, 400, "meeting:invite 目标用户无效")
+		return
+	}
+	sourceRoom := m.SourceRoom
+	if sourceRoom == "" {
+		h.sendError(client, 400, "meeting:invite 缺少原始房间号")
+		return
+	}
+	// 发送者必须当前仍在原始房间（原始房间只提供在线名单与投递通道）。
+	if !h.wsService.RoomHasUserID(sourceRoom, client.UserID) {
+		h.sendError(client, 403, "未连接到原始房间，无法发送邀请")
+		return
+	}
+	// 同一（会议, 目标）已存在未过期且待处理的邀请时拒绝重复发送。
+	now := time.Now()
+	h.inviteMu.Lock()
+	dup := false
+	h.activeMeetingInvites.Range(func(_, value any) bool {
+		inv, ok := value.(*meetingInvite)
+		if !ok || inv.MeetingID != roomID || inv.To != m.To {
+			return true
+		}
+		inv.mu.Lock()
+		if inv.Status == "pending" && now.Before(inv.ExpiresAt) {
+			dup = true
+		}
+		inv.mu.Unlock()
+		return !dup
+	})
+	if dup {
+		h.inviteMu.Unlock()
+		h.sendError(client, 409, "该用户已有待处理的邀请")
+		return
+	}
+	inviteID := uuid.New().String()
+	expiresAt := now.Add(meetingInviteTTL)
+	payload := map[string]interface{}{
+		"kind":         "invite",
+		"inviteId":     inviteID,
+		"meetingId":    roomID,
+		"sourceRoomId": sourceRoom,
+		"title":        meta.Title,
+		"from":         client.UserID,
+		"fromName":     displayNameFromUniqID(client.UserID),
+		"to":           m.To,
+		"inviteUrl":    m.InviteURL,
+		"createdAt":    now.UnixMilli(),
+		"expiresAt":    expiresAt.UnixMilli(),
+	}
+	// 仅定向送达目标用户：SendDirectedToUser 要求目标在原始房间成员表内，天然校验在线与同房。
+	// Reserve before delivery: the target may accept immediately after receiving
+	// the frame, so storing after SendDirectedToUser would race the response.
+	invite := &meetingInvite{
+		InviteID:   inviteID,
+		MeetingID:  roomID,
+		From:       client.UserID,
+		To:         m.To,
+		SourceRoom: sourceRoom,
+		ExpiresAt:  expiresAt,
+		Status:     "pending",
+	}
+	h.activeMeetingInvites.Store(inviteID, invite)
+	h.inviteMu.Unlock()
+	if !h.wsService.SendDirectedToUser(sourceRoom, m.To, "signal:"+m.To, model.MessageTypeMeetingInvite, payload) {
+		h.activeMeetingInvites.Delete(inviteID)
+		h.sendError(client, 404, "目标用户不在线或不在同一房间")
+		return
+	}
+	// 受理回执：房主据此把该目标行从「发送中」推进为「已发送/等待回应」。
+	h.wsService.SendDirectedToUser(sourceRoom, client.UserID, "signal:"+client.UserID, model.MessageTypeMeetingInvite, map[string]interface{}{
+		"kind": "status", "action": "sent", "inviteId": inviteID, "meetingId": roomID, "userId": m.To,
+	})
+	logrus.WithFields(logrus.Fields{
+		"meeting":   roomID,
+		"from":      client.UserID,
+		"to":        m.To,
+		"invite_id": inviteID,
+	}).Info("会议邀请已定向发送")
+}
+
+// handleMeetingInviteRespond 被邀请方响应：校验归属、有效期与会议存续后，向双方定向回执。
+func (h *WebSocketHandler) handleMeetingInviteRespond(client *model.Client, action, inviteID string) {
+	if inviteID == "" {
+		h.sendError(client, 400, "meeting:invite 缺少 inviteId")
+		return
+	}
+	v, loaded := h.activeMeetingInvites.Load(inviteID)
+	if !loaded {
+		h.sendError(client, 404, "邀请不存在或已处理")
+		return
+	}
+	inv, _ := v.(*meetingInvite)
+	if inv == nil {
+		h.sendError(client, 404, "邀请不存在或已处理")
+		return
+	}
+	inv.mu.Lock()
+	if inv.To != client.UserID {
+		inv.mu.Unlock()
+		h.sendError(client, 403, "无权响应此邀请")
+		return
+	}
+	if inv.Status != "pending" {
+		inv.mu.Unlock()
+		h.sendError(client, 409, "邀请已处理: "+inv.Status)
+		return
+	}
+	now := time.Now()
+	if !now.Before(inv.ExpiresAt) {
+		inv.Status = "expired"
+		inv.mu.Unlock()
+		h.notifyInviteStatus(inv, "expired")
+		return
+	}
+	inv.Status = action // accepted / rejected
+	logMeetingID, logInviteID, logTo := inv.MeetingID, inv.InviteID, inv.To
+	inv.mu.Unlock()
+
+	// 会议已结束/释放：按过期语义回执，双方显示 expired，不允许继续加入。
+	if !h.hasRegistered(logMeetingID) {
+		inv.mu.Lock()
+		inv.Status = "expired"
+		inv.mu.Unlock()
+		h.notifyInviteStatus(inv, "expired")
+		return
+	}
+	h.notifyInviteStatus(inv, action)
+	logrus.WithFields(logrus.Fields{
+		"meeting":   logMeetingID,
+		"invite_id": logInviteID,
+		"to":        logTo,
+		"action":    action,
+	}).Info("会议邀请已响应")
+}
+
+// notifyInviteStatus 邀请状态变化定向回执双方：被邀请方更新/关闭来电弹窗，房主更新邀请行状态。
+func (h *WebSocketHandler) notifyInviteStatus(inv *meetingInvite, action string) {
+	inv.mu.Lock()
+	inviteID, meetingID, sourceRoom, from, to := inv.InviteID, inv.MeetingID, inv.SourceRoom, inv.From, inv.To
+	inv.mu.Unlock()
+	payload := map[string]interface{}{
+		"kind": "status", "action": action, "inviteId": inviteID, "meetingId": meetingID, "userId": to,
+	}
+	// 被邀请方（expired 时其弹窗翻转为过期态；accept/reject 为其自身动作的回执）
+	h.wsService.SendDirectedToUser(sourceRoom, to, "signal:"+to, model.MessageTypeMeetingInvite, payload)
+	// 房主
+	h.wsService.SendDirectedToUser(sourceRoom, from, "signal:"+from, model.MessageTypeMeetingInvite, payload)
+}
+
+// displayNameFromUniqID 从 uniqId（"name:uuid"）取展示名前缀；无分隔符时原样返回。
+func displayNameFromUniqID(uniqID string) string {
+	if i := strings.Index(uniqID, ":"); i > 0 {
+		return uniqID[:i]
+	}
+	return uniqID
 }
 
 // sendMessage 发送消息给客户端
@@ -1282,13 +2190,13 @@ func (h *WebSocketHandler) handleMediaFrame(client *model.Client, frame []byte) 
 		}
 		if err := h.wsService.WriteBinaryToClient(target, frame); err != nil {
 			logrus.WithFields(logrus.Fields{
-				"operation":    "media.forward",
-				"call_id":      callID,
-				"seq":          seq,
-				"track":        track,
-				"target":       target.UserID,
-				"room":         roomName,
-				"error":        err.Error(),
+				"operation": "media.forward",
+				"call_id":   callID,
+				"seq":       seq,
+				"track":     track,
+				"target":    target.UserID,
+				"room":      roomName,
+				"error":     err.Error(),
 			}).Debug("媒体帧转发失败")
 			continue
 		}
