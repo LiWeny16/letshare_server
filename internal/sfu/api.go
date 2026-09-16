@@ -1,6 +1,8 @@
 package sfu
 
 import (
+	"net"
+	"strings"
 	"time"
 
 	"github.com/pion/ice/v4"
@@ -32,6 +34,23 @@ func NewAPI(se *webrtc.SettingEngine) (*API, error) {
 		webrtc.WithSettingEngine(*se),
 	)
 	return &API{webrtc: api}, nil
+}
+
+// PublicSettingEngine configures the production SFU to advertise its public
+// address instead of container/private interface candidates.  Browsers join
+// through the public websocket endpoint, so advertising 172.x/10.x host ICE
+// candidates makes the signaling path look healthy while every media PC stays
+// disconnected.  Tests that run entirely in-process must continue using
+// OfflineSettingEngine instead.
+func PublicSettingEngine(publicIP string) *webrtc.SettingEngine {
+	se := &webrtc.SettingEngine{}
+	publicIP = strings.TrimSpace(publicIP)
+	if net.ParseIP(publicIP) == nil {
+		return se
+	}
+	se.SetNAT1To1IPs([]string{publicIP}, webrtc.ICECandidateTypeHost)
+	se.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
+	return se
 }
 
 // NewPeerConnection 用本 API 创建一个 PeerConnection。

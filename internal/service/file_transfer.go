@@ -19,14 +19,18 @@ import (
 
 // FileTransferService 文件传输服务
 type FileTransferService struct {
-	sessions          map[string]*model.FileTransferSession // transferID -> session
-	sessionsMutex     sync.RWMutex
-	chunkLedgers      map[string]*transferChunkLedger
-	chunkLedgersMutex sync.RWMutex
-	wsService         *WebSocketService
-	maxFileSize       int64 // 最大文件大小(PRO 统一上限 3GB)
-	chunkSize         int   // 默认分块大小
-	spoolDir          string
+	sessions            map[string]*model.FileTransferSession // transferID -> session
+	sessionsMutex       sync.RWMutex
+	chunkLedgers        map[string]*transferChunkLedger
+	chunkLedgersMutex   sync.RWMutex
+	wsService           *WebSocketService
+	maxFileSize         int64 // 最大文件大小(PRO 统一上限 3GB)
+	chunkSize           int   // 默认分块大小
+	spoolDir            string
+	virtualRoomResolver func(roomName, userID string) (*model.Client, bool)
+	cleanupStop         chan struct{}
+	cleanupDone         chan struct{}
+	cleanupOnce         sync.Once
 }
 
 var ErrRelayReceiverUnavailable = errors.New("relay receiver unavailable")
@@ -39,6 +43,12 @@ const (
 
 func IsRelayReceiverUnavailable(err error) bool {
 	return errors.Is(err, ErrRelayReceiverUnavailable)
+}
+
+// SetVirtualRoomResolver lets a domain such as Meeting resolve its own
+// membership without copying members into ordinary room presence.
+func (fts *FileTransferService) SetVirtualRoomResolver(resolver func(roomName, userID string) (*model.Client, bool)) {
+	fts.virtualRoomResolver = resolver
 }
 
 type transferChunkLedger struct {
@@ -60,6 +70,8 @@ func NewFileTransferService(wsService *WebSocketService, maxFileSize int64, chun
 		maxFileSize:  maxFileSize,
 		chunkSize:    chunkSize,
 		spoolDir:     defaultRelaySpoolDir(),
+		cleanupStop:  make(chan struct{}),
+		cleanupDone:  make(chan struct{}),
 	}
 
 	// 启动会话清理
@@ -728,8 +740,8 @@ func (fts *FileTransferService) SendMessageToUser(userID, roomName string, messa
 // findClientForSession resolves the websocket bound to an accepted transfer before falling back to user lookup.
 func (fts *FileTransferService) findClientForSession(clientID, userID, roomName string) (*model.Client, error) {
 	if clientID != "" {
-		if client, exists := fts.wsService.GetClientInRoom(clientID, roomName); exists {
-			if client.UserID == userID {
+		if client, exists := fts.wsService.GetClient(clientID); exists {
+			if client.UserID == userID || client.UniqID == userID {
 				return client, nil
 			}
 			logrus.WithFields(logrus.Fields{
@@ -744,11 +756,16 @@ func (fts *FileTransferService) findClientForSession(clientID, userID, roomName 
 
 func (fts *FileTransferService) findClientByUserID(userID, roomName string) (*model.Client, error) {
 	for attempt := 0; attempt < 3; attempt++ {
+		if fts.virtualRoomResolver != nil {
+			if client, ok := fts.virtualRoomResolver(roomName, userID); ok && client != nil {
+				return client, nil
+			}
+		}
 		fts.wsService.clientsMutex.RLock()
 		var found *model.Client
 		var clientsSnapshot []string
 		for _, client := range fts.wsService.clients {
-			if client.UserID == userID {
+			if client.UserID == userID || client.UniqID == userID {
 				clientsSnapshot = append(clientsSnapshot, fmt.Sprintf("%s(rooms=%v,status=connected)", client.ID, client.Rooms))
 				if client.Rooms[roomName] && (found == nil || client.LastPing.After(found.LastPing)) {
 					found = client
@@ -805,10 +822,50 @@ func (fts *FileTransferService) sendProgressUpdate(session *model.FileTransferSe
 func (fts *FileTransferService) startSessionCleanup() {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
+	defer close(fts.cleanupDone)
 
-	for range ticker.C {
-		fts.cleanupStaleSessions()
+	for {
+		select {
+		case <-ticker.C:
+			fts.cleanupStaleSessions()
+		case <-fts.cleanupStop:
+			return
+		}
 	}
+}
+
+// Shutdown stops the cleanup worker and removes all in-memory transfer state
+// and private spool files owned by this service instance.
+func (fts *FileTransferService) Shutdown() {
+	if fts == nil {
+		return
+	}
+	fts.cleanupOnce.Do(func() {
+		close(fts.cleanupStop)
+		<-fts.cleanupDone
+
+		fts.sessionsMutex.Lock()
+		transferIDs := make([]string, 0, len(fts.sessions))
+		for transferID := range fts.sessions {
+			transferIDs = append(transferIDs, transferID)
+		}
+		fts.sessions = make(map[string]*model.FileTransferSession)
+		fts.sessionsMutex.Unlock()
+
+		fts.chunkLedgersMutex.RLock()
+		ledgerIDs := make([]string, 0, len(fts.chunkLedgers))
+		for transferID := range fts.chunkLedgers {
+			ledgerIDs = append(ledgerIDs, transferID)
+		}
+		fts.chunkLedgersMutex.RUnlock()
+
+		for _, transferID := range transferIDs {
+			fts.removeChunkLedger(transferID)
+		}
+		for _, transferID := range ledgerIDs {
+			fts.removeChunkLedger(transferID)
+		}
+	})
 }
 
 // cleanupStaleSessions 清理过期会话
@@ -818,10 +875,11 @@ func (fts *FileTransferService) cleanupStaleSessions() {
 
 	// 收集过期会话信息（避免锁内发送消息）
 	type staleInfo struct {
-		transferID string
-		roomName   string
-		fromUserID string
-		toUserID   string
+		transferID   string
+		roomName     string
+		fromUserID   string
+		toUserID     string
+		lastActivity time.Time
 	}
 
 	fts.sessionsMutex.Lock()
@@ -830,10 +888,11 @@ func (fts *FileTransferService) cleanupStaleSessions() {
 		// 清理超过10分钟无活动的会话
 		if now.Sub(session.LastActivity) > timeout {
 			staleSessions = append(staleSessions, staleInfo{
-				transferID: transferID,
-				roomName:   session.RoomName,
-				fromUserID: session.FromUserID,
-				toUserID:   session.ToUserID,
+				transferID:   transferID,
+				roomName:     session.RoomName,
+				fromUserID:   session.FromUserID,
+				toUserID:     session.ToUserID,
+				lastActivity: session.LastActivity,
 			})
 		}
 	}
@@ -855,9 +914,18 @@ func (fts *FileTransferService) cleanupStaleSessions() {
 
 		// 删除会话
 		fts.sessionsMutex.Lock()
-		delete(fts.sessions, s.transferID)
+		current, exists := fts.sessions[s.transferID]
+		stillStale := exists && current.LastActivity.Equal(s.lastActivity) && now.Sub(current.LastActivity) > timeout
+		if stillStale {
+			delete(fts.sessions, s.transferID)
+		}
 		fts.sessionsMutex.Unlock()
-		fts.removeChunkLedger(s.transferID)
+		if stillStale {
+			fts.removeChunkLedger(s.transferID)
+		} else {
+			logrus.WithField("transfer_id", s.transferID).Debug("跳过已恢复活动的文件传输会话")
+			continue
+		}
 
 		logrus.WithFields(logrus.Fields{
 			"operation":   "relay.session_timeout",

@@ -51,6 +51,7 @@ func (r *Room) AddParticipant(participantID string) (*Participant, error) {
 		room:          r,
 		pc:            pc,
 		tracks:        map[string]*webrtc.TrackRemote{},
+		fanouts:       map[string]*trackFanout{},
 		subscriptions: map[string]*Subscriber{},
 	}
 

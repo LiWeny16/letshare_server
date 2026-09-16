@@ -122,6 +122,86 @@ func assertNoInvite(t *testing.T, r *wsRPC, window time.Duration) {
 	}
 }
 
+func waitRoomMembershipSnapshot(r *wsRPC, timeout time.Duration) (model.WebSocketMessage, error) {
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case m := <-r.roomMembership:
+		return m, nil
+	case <-t.C:
+		return model.WebSocketMessage{}, fmt.Errorf("等待普通房间 membership:snapshot 超时")
+	}
+}
+
+func waitMeetingMembershipSnapshot(r *wsRPC, timeout time.Duration) (model.WebSocketMessage, error) {
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case m := <-r.membership:
+		return m, nil
+	case <-t.C:
+		return model.WebSocketMessage{}, fmt.Errorf("等待会议 membership:snapshot 超时")
+	}
+}
+
+func TestMeetingPresenceIsIncludedInLateRoomMembershipSnapshot(t *testing.T) {
+	ts := newMeetingTestServer(t)
+	defer ts.Close()
+
+	const sourceRoom = "late-room"
+	host := newWSRPC(t, ts.srv, "late-host:uuid-1")
+	if err := host.sendJSON(model.WebSocketMessage{Type: "meeting:create"}); err != nil {
+		t.Fatalf("发送 meeting:create 失败: %v", err)
+	}
+	meetingID, err := host.waitCreate(5 * time.Second)
+	if err != nil {
+		t.Fatalf("等待 meeting:create 失败: %v", err)
+	}
+	if err := host.sendJSON(model.WebSocketMessage{Type: "subscribe", Channel: sourceRoom, Event: "signal:all"}); err != nil {
+		t.Fatalf("host 订阅原始房间失败: %v", err)
+	}
+	if err := host.waitSubscribed(5 * time.Second); err != nil {
+		t.Fatalf("host 等待原始房间订阅失败: %v", err)
+	}
+	joinData, _ := json.Marshal(map[string]string{"sourceRoomId": sourceRoom, "userName": "Late Host"})
+	if err := host.sendJSON(model.WebSocketMessage{Type: "meeting:join", Channel: meetingID, Data: joinData}); err != nil {
+		t.Fatalf("host 加入会议失败: %v", err)
+	}
+	if _, err := waitMeetingMembershipSnapshot(host, 5*time.Second); err != nil {
+		t.Fatalf("等待 host 会议成员快照失败: %v", err)
+	}
+
+	late := newWSRPC(t, ts.srv, "late-joiner:uuid-2")
+	if err := late.sendJSON(model.WebSocketMessage{Type: "subscribe", Channel: sourceRoom, Event: "signal:all"}); err != nil {
+		t.Fatalf("late joiner 订阅原始房间失败: %v", err)
+	}
+	if err := late.waitSubscribed(5 * time.Second); err != nil {
+		t.Fatalf("late joiner 等待原始房间订阅失败: %v", err)
+	}
+	snapshot, err := waitRoomMembershipSnapshot(late, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Members []struct {
+			UniqID      string `json:"uniqId"`
+			MeetingRoom string `json:"meetingRoom"`
+		} `json:"members"`
+	}
+	if err := json.Unmarshal(snapshot.Data, &payload); err != nil {
+		t.Fatalf("解析 membership:snapshot 失败: %v", err)
+	}
+	for _, member := range payload.Members {
+		if member.UniqID == "late-host:uuid-1" {
+			if member.MeetingRoom != meetingID {
+				t.Fatalf("晚加入者拿到的会议状态错误: got %q want %q", member.MeetingRoom, meetingID)
+			}
+			return
+		}
+	}
+	t.Fatalf("membership:snapshot 未包含 host 的会议状态: %+v", payload.Members)
+}
+
 // TestMeetingInvite_DirectedDelivery 验证邀请只定向送达目标用户：
 // 房主发送 → 被邀请方收到 kind=invite 完整载荷 → 房主收到 sent 回执 → 房间内第三人无任何消息。
 func TestMeetingInvite_DirectedDelivery(t *testing.T) {
@@ -173,12 +253,43 @@ func TestMeetingInvite_DirectedDelivery(t *testing.T) {
 	if got := invitePayloadField(t, ack, "action"); got != "sent" {
 		t.Fatalf("回执 action 应为 sent，实际 %v", got)
 	}
-	if got := invitePayloadField(t, ack, "userId"); got != "guestB:uuid-2" {
+	if got := invitePayloadField(t, ack, "uniqId"); got != "guestB:uuid-2" {
 		t.Fatalf("回执 userId 应为目标用户，实际 %v", got)
 	}
 
 	// 原始房间第三人不得收到任何会议邀请（不广播）
 	assertNoInvite(t, bystander, 1500*time.Millisecond)
+}
+
+func TestMeetingInvite_AnyMeetingMemberCanInvite(t *testing.T) {
+	ts, _, guest, target, meetingID, sourceRoom := meetingInviteFlow(t)
+	joinData, _ := json.Marshal(map[string]interface{}{"roomId": meetingID, "userName": "guestB"})
+	if err := guest.sendJSON(model.WebSocketMessage{Type: model.MessageTypeMeetingJoin, Channel: meetingID, Data: joinData}); err != nil {
+		t.Fatalf("guest 加入会议失败: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := ts.handler.meetings.clientForUniqID(meetingID, "guestB:uuid-2"); ok {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, ok := ts.handler.meetings.clientForUniqID(meetingID, "guestB:uuid-2"); !ok {
+		t.Fatal("guest 未进入会议成员表")
+	}
+
+	data, _ := json.Marshal(map[string]interface{}{
+		"action": "invite", "to": "watcherC:uuid-3", "sourceRoomId": sourceRoom,
+	})
+	if err := guest.sendJSON(model.WebSocketMessage{Type: model.MessageTypeMeetingInvite, Channel: meetingID, Data: data}); err != nil {
+		t.Fatalf("普通会议成员发送邀请失败: %v", err)
+	}
+	if _, err := waitInvite(target, "invite", 5*time.Second); err != nil {
+		t.Fatalf("普通成员发出的邀请未送达: %v", err)
+	}
+	if _, err := waitInviteStatus(guest, "sent", 5*time.Second); err != nil {
+		t.Fatalf("普通成员未收到 sent 回执: %v", err)
+	}
 }
 
 // TestMeetingInvite_AcceptAndReject 回执链路：接受/拒绝都定向回执房主，且带 userId。
@@ -213,7 +324,7 @@ func TestMeetingInvite_AcceptAndReject(t *testing.T) {
 	if got := invitePayloadField(t, st, "action"); got != "accept" {
 		t.Fatalf("回执 action 应为 accept，实际 %v", got)
 	}
-	if got := invitePayloadField(t, st, "userId"); got != "guestB:uuid-2" {
+	if got := invitePayloadField(t, st, "uniqId"); got != "guestB:uuid-2" {
 		t.Fatalf("回执 userId 应为响应者，实际 %v", got)
 	}
 
@@ -325,5 +436,86 @@ func TestMeetingInvite_ExpiredRespond(t *testing.T) {
 	}
 	if got := invitePayloadField(t, st, "action"); got != "expired" {
 		t.Fatalf("被邀请方回执 action 应为 expired，实际 %v", got)
+	}
+}
+
+func waitApplicationStatus(r *wsRPC, action string, requestID string, timeout time.Duration) (model.WebSocketMessage, error) {
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	for {
+		select {
+		case m := <-r.invite:
+			var data map[string]interface{}
+			_ = json.Unmarshal(m.Data, &data)
+			if data["kind"] == "apply-status" && data["action"] == action && data["requestId"] == requestID {
+				return m, nil
+			}
+		case <-t.C:
+			return model.WebSocketMessage{}, fmt.Errorf("等待申请状态 %s 超时", action)
+		}
+	}
+}
+
+func TestMeetingApplication_RejectAndApproveAreCorrelated(t *testing.T) {
+	ts, host, applicant, _, meetingID, sourceRoom := meetingInviteFlow(t)
+	joinData, _ := json.Marshal(map[string]interface{}{"roomId": meetingID, "userName": "hostA"})
+	if err := host.sendJSON(model.WebSocketMessage{Type: model.MessageTypeMeetingJoin, Channel: meetingID, Data: joinData}); err != nil {
+		t.Fatalf("host 加入会议失败: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := ts.handler.meetings.clientForUniqID(meetingID, "hostA:uuid-1"); ok {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, ok := ts.handler.meetings.clientForUniqID(meetingID, "hostA:uuid-1"); !ok {
+		t.Fatal("host 未登记为会议成员")
+	}
+
+	apply := func(requestID string) {
+		data, _ := json.Marshal(map[string]interface{}{
+			"action": "apply", "to": meetingID, "sourceRoomId": sourceRoom, "requestId": requestID,
+		})
+		if err := applicant.sendJSON(model.WebSocketMessage{Type: model.MessageTypeMeetingInvite, Channel: meetingID, Data: data}); err != nil {
+			t.Fatalf("发送入会申请失败: %v", err)
+		}
+		if _, err := waitApplicationStatus(applicant, "pending", requestID, 5*time.Second); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	apply("apply-reject-1")
+	request, err := waitInvite(host, "apply", 5*time.Second)
+	if err != nil {
+		t.Fatalf("host 未收到入会申请: %v", err)
+	}
+	if got := invitePayloadField(t, request, "requestId"); got != "apply-reject-1" {
+		t.Fatalf("申请 requestId 丢失: %v", got)
+	}
+	reject, _ := json.Marshal(map[string]interface{}{"action": "apply-response", "requestId": "apply-reject-1", "decision": "reject"})
+	if err := host.sendJSON(model.WebSocketMessage{Type: model.MessageTypeMeetingInvite, Channel: meetingID, Data: reject}); err != nil {
+		t.Fatalf("发送拒绝回执失败: %v", err)
+	}
+	if _, err := waitApplicationStatus(applicant, "rejected", "apply-reject-1", 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	apply("apply-accept-1")
+	if _, err := waitInvite(host, "apply", 5*time.Second); err != nil {
+		t.Fatalf("host 未收到第二个入会申请: %v", err)
+	}
+	accept, _ := json.Marshal(map[string]interface{}{
+		"action": "apply-response", "requestId": "apply-accept-1", "decision": "accept",
+		"inviteUrl": "https://letshare.fun/#/meeting?room=" + meetingID + "&source=" + sourceRoom,
+	})
+	if err := host.sendJSON(model.WebSocketMessage{Type: model.MessageTypeMeetingInvite, Channel: meetingID, Data: accept}); err != nil {
+		t.Fatalf("发送接受回执失败: %v", err)
+	}
+	if _, err := waitApplicationStatus(host, "approved", "apply-accept-1", 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := waitApplicationStatus(applicant, "approved", "apply-accept-1", 5*time.Second); err != nil {
+		t.Fatalf("批准后申请方未收到直接入会回执: %v", err)
 	}
 }

@@ -74,7 +74,7 @@ func TestMeetingMinutes_HostConfigAndSegmentIsolation(t *testing.T) {
 	// be reflected in a public state frame.
 	sendMinutes(t, host, meetingID, map[string]interface{}{
 		"action": "configure", "requireConsent": true,
-		"asrSource": "browser-speech", "asrModel": "browser-network",
+		"asrSource": "mimo-asr", "asrModel": "mimo-v2.5-asr",
 		"summaryProvider": "mimo", "summaryModel": "mimo-v2.5-pro",
 		"apiKey": "must-not-leak",
 	})
@@ -110,16 +110,18 @@ func TestMeetingMinutes_HostConfigAndSegmentIsolation(t *testing.T) {
 	sendMinutes(t, member, meetingID, map[string]interface{}{
 		"action": "segment", "segmentId": "client-controlled-id", "text": "鍐冲畾涓嬪懆瀹屾垚楠屾敹", "startMs": 10, "endMs": 20, "final": true,
 	})
-	segment, err := waitMinutesKind(host, "segment", 3*time.Second)
+	segment, err := waitMinutesKind(host, "segments", 3*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	segmentPayload := minutesPayload(t, segment)
-	if segmentPayload["kind"] != "segment" || segmentPayload["from"] != "bob:chat-2" {
+	batch, ok := segmentPayload["segments"].([]interface{})
+	if segmentPayload["kind"] != "segments" || !ok || len(batch) != 1 {
 		t.Fatalf("unexpected segment payload: %#v", segmentPayload)
 	}
-	if segmentPayload["speakerName"] != "bob" {
-		t.Fatalf("server should canonicalize speakerName, got %#v", segmentPayload["speakerName"])
+	first, _ := batch[0].(map[string]interface{})
+	if first["from"] != "bob:chat-2" || first["speakerName"] != "bob" {
+		t.Fatalf("server should canonicalize speakerName, got %#v", first)
 	}
 
 	sendMinutes(t, host, meetingID, map[string]interface{}{"action": "summary", "summary": "验收安排已确认"})
@@ -147,5 +149,45 @@ func TestMeetingMinutes_NonHostCannotConfigureOrStart(t *testing.T) {
 	// panic or disconnect the WebSocket.
 	if _, err := waitMinutes(member, 3*time.Second); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestMeetingMinutes_BatchesSegmentsToHostOnly(t *testing.T) {
+	_, host, member, _, meetingID := meetingChatFlow(t)
+
+	sendMinutes(t, host, meetingID, map[string]interface{}{
+		"action": "configure", "requireConsent": false,
+		"asrSource": "browser-speech", "summaryProvider": "mimo",
+	})
+	if _, err := waitMinutesKind(member, "configured", 3*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	sendMinutes(t, host, meetingID, map[string]interface{}{"action": "start"})
+	if _, err := waitMinutesKind(member, "started", 3*time.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	sendMinutes(t, member, meetingID, map[string]interface{}{
+		"action": "segments",
+		"segments": []map[string]interface{}{
+			{"segmentId": "s-1", "text": "第一段", "startMs": 10, "endMs": 20, "final": true},
+			{"segmentId": "s-2", "text": "第二段", "startMs": 30, "endMs": 40, "final": true},
+		},
+	})
+	batch, err := waitMinutesKind(host, "segments", 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := minutesPayload(t, batch)
+	segments, ok := payload["segments"].([]interface{})
+	if !ok || len(segments) != 2 {
+		t.Fatalf("expected two segments in one host batch, got %#v", payload["segments"])
+	}
+	first, _ := segments[0].(map[string]interface{})
+	if first["speakerName"] != "bob" || first["from"] != "bob:chat-2" {
+		t.Fatalf("server should attach canonical speaker identity, got %#v", first)
+	}
+	if _, err := waitMinutesKind(member, "segments", 250*time.Millisecond); err == nil {
+		t.Fatal("raw transcript batch should not be broadcast to members")
 	}
 }

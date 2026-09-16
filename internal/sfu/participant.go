@@ -30,10 +30,12 @@ type Participant struct {
 
 	mu            sync.RWMutex
 	tracks        map[string]*webrtc.TrackRemote // 该参与者 publish 的权威 track（id -> track）
-	subscriptions map[string]*Subscriber         // publisherID -> 扇出给本参与者的订阅连接
+	fanouts       map[string]*trackFanout
+	subscriptions map[string]*Subscriber // publisherID -> 扇出给本参与者的订阅连接
 	closed        atomic.Bool
 
 	onICECandidate func(*webrtc.ICECandidate)
+	pendingICE     []*webrtc.ICECandidate
 }
 
 // IsClosed reports whether the participant's primary PeerConnection has been
@@ -174,7 +176,12 @@ func (p *Participant) OnICECandidate(cb func(*webrtc.ICECandidate)) {
 	}
 	p.mu.Lock()
 	p.onICECandidate = cb
+	pending := append([]*webrtc.ICECandidate(nil), p.pendingICE...)
+	p.pendingICE = nil
 	p.mu.Unlock()
+	for _, candidate := range pending {
+		cb(candidate)
+	}
 }
 
 // emitICECandidate 把本地候选分发给已注册回调（供房间内部使用）。
@@ -182,6 +189,16 @@ func (p *Participant) emitICECandidate(c *webrtc.ICECandidate) {
 	p.mu.RLock()
 	cb := p.onICECandidate
 	p.mu.RUnlock()
+	if cb == nil {
+		p.mu.Lock()
+		if p.onICECandidate == nil && !p.closed.Load() {
+			p.pendingICE = append(p.pendingICE, c)
+			p.mu.Unlock()
+			return
+		}
+		cb = p.onICECandidate
+		p.mu.Unlock()
+	}
 	if cb != nil {
 		cb(c)
 	}
@@ -203,7 +220,15 @@ func (p *Participant) registerPublishedTrack(track *webrtc.TrackRemote) {
 		return
 	}
 	p.mu.Lock()
+	if _, exists := p.tracks[track.ID()]; exists {
+		p.mu.Unlock()
+		return
+	}
 	p.tracks[track.ID()] = track
+	if p.fanouts == nil {
+		p.fanouts = make(map[string]*trackFanout)
+	}
+	p.fanouts[track.ID()] = newTrackFanout(track)
 	p.mu.Unlock()
 	log.WithFields(log.Fields{
 		"sfu":           "participant",
@@ -212,6 +237,12 @@ func (p *Participant) registerPublishedTrack(track *webrtc.TrackRemote) {
 		"trackID":       track.ID(),
 		"kind":          track.Kind().String(),
 	}).Info("参与者发布了媒体 track")
+}
+
+func (p *Participant) trackFanout(trackID string) *trackFanout {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.fanouts[trackID]
 }
 
 // PublishedTracks 返回该参与者当前所有已发布的 track（快照）。
@@ -385,6 +416,15 @@ func (p *Participant) Close() error {
 		subs = append(subs, s)
 	}
 	p.mu.Unlock()
+	p.mu.RLock()
+	fanouts := make([]*trackFanout, 0, len(p.fanouts))
+	for _, fanout := range p.fanouts {
+		fanouts = append(fanouts, fanout)
+	}
+	p.mu.RUnlock()
+	for _, fanout := range fanouts {
+		fanout.close()
+	}
 	for _, s := range subs {
 		_ = s.Close()
 	}

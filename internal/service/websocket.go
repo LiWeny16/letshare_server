@@ -23,16 +23,23 @@ type WebSocketService struct {
 	maxRoomUsers       int
 	roomService        *RoomService
 	onClientDisconnect func(clientID string) // 客户端断开时的回调钩子
+	maintenanceStop    chan struct{}
+	maintenanceDone    chan struct{}
+	maintenanceOnce    sync.Once
+	maintenanceHooksMu sync.RWMutex
+	maintenanceHooks   []func()
 }
 
 const websocketWriteTimeout = 60 * time.Second
 
 func NewWebSocketService(maxRoomUsers int) *WebSocketService {
 	ws := &WebSocketService{
-		clients:      make(map[string]*model.Client),
-		rooms:        make(map[string]*model.Room),
-		maxRoomUsers: maxRoomUsers,
-		roomService:  NewRoomService(),
+		clients:         make(map[string]*model.Client),
+		rooms:           make(map[string]*model.Room),
+		maxRoomUsers:    maxRoomUsers,
+		roomService:     NewRoomService(),
+		maintenanceStop: make(chan struct{}),
+		maintenanceDone: make(chan struct{}),
 	}
 
 	// 启动定期清理
@@ -44,6 +51,17 @@ func NewWebSocketService(maxRoomUsers int) *WebSocketService {
 // SetOnClientDisconnect 注册客户端断开连接的回调钩子
 func (ws *WebSocketService) SetOnClientDisconnect(handler func(clientID string)) {
 	ws.onClientDisconnect = handler
+}
+
+// AddMaintenanceHook attaches bounded periodic cleanup to the WebSocket
+// service lifecycle. Hooks stop with WebSocketService.Shutdown.
+func (ws *WebSocketService) AddMaintenanceHook(hook func()) {
+	if ws == nil || hook == nil {
+		return
+	}
+	ws.maintenanceHooksMu.Lock()
+	ws.maintenanceHooks = append(ws.maintenanceHooks, hook)
+	ws.maintenanceHooksMu.Unlock()
 }
 
 // AddClient 添加新客户端
@@ -140,6 +158,17 @@ func (ws *WebSocketService) GetClient(clientID string) (*model.Client, bool) {
 	return client, exists
 }
 
+// SendToClientID delivers a message through the transport without consulting
+// ordinary room membership. Meeting traffic uses this as its domain boundary.
+func (ws *WebSocketService) SendToClientID(clientID string, message *model.WebSocketMessage) bool {
+	client, ok := ws.GetClient(clientID)
+	if !ok || client == nil || client.Connection == nil {
+		return false
+	}
+	ws.sendToClient(client, message)
+	return true
+}
+
 func (ws *WebSocketService) GetClientInRoom(clientID, roomName string) (*model.Client, bool) {
 	ws.clientsMutex.RLock()
 	defer ws.clientsMutex.RUnlock()
@@ -211,6 +240,23 @@ func (ws *WebSocketService) FindClientByUserID(userID, roomName string) *model.C
 	var found *model.Client
 	for _, client := range ws.clients {
 		if client.UserID == userID && client.Rooms != nil && client.Rooms[roomName] && client.Connection != nil {
+			if found == nil || client.LastPing.After(found.LastPing) {
+				found = client
+			}
+		}
+	}
+	return found
+}
+
+// FindClientByUniqID resolves the stable browser/device identity. Meeting
+// invites use this path so a display-name change never changes the target.
+func (ws *WebSocketService) FindClientByUniqID(uniqID, roomName string) *model.Client {
+	ws.clientsMutex.RLock()
+	defer ws.clientsMutex.RUnlock()
+
+	var found *model.Client
+	for _, client := range ws.clients {
+		if client.UniqID == uniqID && client.Rooms != nil && client.Rooms[roomName] && client.Connection != nil {
 			if found == nil || client.LastPing.After(found.LastPing) {
 				found = client
 			}
@@ -498,6 +544,23 @@ func (ws *WebSocketService) SendDirectedToUser(roomName, toUserID, event, msgTyp
 	return true
 }
 
+// SendDirectedToUniqID is the Meeting-domain equivalent of
+// SendDirectedToUser. It intentionally resolves only by stable uniqID.
+func (ws *WebSocketService) SendDirectedToUniqID(roomName, toUniqID, event, msgType string, data interface{}) bool {
+	client := ws.FindClientByUniqID(toUniqID, roomName)
+	if client == nil {
+		logrus.WithFields(logrus.Fields{
+			"room":  roomName,
+			"to":    toUniqID,
+			"event": event,
+		}).Debug("stable uniqID target is not present in room")
+		return false
+	}
+	msg := model.NewWebSocketMessage(msgType, roomName, event, data)
+	ws.sendToClient(client, msg)
+	return true
+}
+
 // RoomHasUserID 判断房间内是否仍有指定 userID 的活跃连接（用于离场广播去重：多标签页时同 userID 其它连接仍在则不下发 leave）。
 // roomClientIDsSnapshot copies the live room membership under roomsMutex so
 // callers never iterate ClientIDs while another connection mutates it.
@@ -526,6 +589,24 @@ func (ws *WebSocketService) RoomHasUserID(roomName, userID string) bool {
 	defer ws.clientsMutex.RUnlock()
 	for _, clientID := range clientIDs {
 		if client, ok := ws.clients[clientID]; ok && client.UserID == userID && client.Connection != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// RoomHasUniqID checks the stable identity independently of the legacy
+// account/userID field used by ordinary room and file-transfer code.
+func (ws *WebSocketService) RoomHasUniqID(roomName, uniqID string) bool {
+	clientIDs, exists := ws.roomClientIDsSnapshot(roomName)
+	if !exists {
+		return false
+	}
+
+	ws.clientsMutex.RLock()
+	defer ws.clientsMutex.RUnlock()
+	for _, clientID := range clientIDs {
+		if client, ok := ws.clients[clientID]; ok && client.UniqID == uniqID && client.Connection != nil {
 			return true
 		}
 	}
@@ -610,6 +691,36 @@ func (ws *WebSocketService) SendMembershipSnapshot(clientID, roomName string) {
 	}
 }
 
+// SendMembershipSnapshotWithMeetingRooms extends the ordinary membership
+// snapshot with the server-authoritative meeting state known for that room.
+func (ws *WebSocketService) SendMembershipSnapshotWithMeetingRooms(clientID, roomName string, meetingRooms map[string]string) {
+	members := make([]map[string]interface{}, 0)
+	ws.clientsMutex.RLock()
+	seen := make(map[string]bool)
+	for _, c := range ws.clients {
+		if c.Rooms == nil || !c.Rooms[roomName] || c.Connection == nil {
+			continue
+		}
+		if seen[c.UniqID] {
+			continue
+		}
+		seen[c.UniqID] = true
+		members = append(members, map[string]interface{}{
+			"uniqId":      c.UniqID,
+			"userName":    c.UserName,
+			"meetingRoom": meetingRooms[c.UniqID],
+		})
+	}
+	ws.clientsMutex.RUnlock()
+
+	msg := model.NewWebSocketMessage(model.MessageTypeMessage, roomName, "membership:snapshot", map[string]interface{}{
+		"members": members,
+	})
+	if client, ok := ws.GetClient(clientID); ok {
+		ws.sendToClient(client, msg)
+	}
+}
+
 // GetRoomInfo 获取房间信息
 func (ws *WebSocketService) GetRoomInfo(roomName string) map[string]interface{} {
 	ws.roomsMutex.RLock()
@@ -633,10 +744,22 @@ func (ws *WebSocketService) GetRoomInfo(roomName string) map[string]interface{} 
 func (ws *WebSocketService) startMaintenance() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
+	defer close(ws.maintenanceDone)
 
-	for range ticker.C {
-		ws.cleanupInactiveClients()
-		logger.CleanupLogs()
+	for {
+		select {
+		case <-ticker.C:
+			ws.cleanupInactiveClients()
+			logger.CleanupLogs()
+			ws.maintenanceHooksMu.RLock()
+			hooks := append([]func(){}, ws.maintenanceHooks...)
+			ws.maintenanceHooksMu.RUnlock()
+			for _, hook := range hooks {
+				hook()
+			}
+		case <-ws.maintenanceStop:
+			return
+		}
 	}
 }
 
@@ -662,25 +785,33 @@ func (ws *WebSocketService) cleanupInactiveClients() {
 
 // Shutdown 关闭服务
 func (ws *WebSocketService) Shutdown() {
-	logrus.Info("正在关闭WebSocket服务...")
+	ws.maintenanceOnce.Do(func() {
+		logrus.Info("正在关闭WebSocket服务...")
+		close(ws.maintenanceStop)
+		<-ws.maintenanceDone
+		ws.maintenanceHooksMu.Lock()
+		ws.maintenanceHooks = nil
+		ws.maintenanceHooksMu.Unlock()
 
-	ws.clientsMutex.Lock()
-	clientIDs := make([]string, 0, len(ws.clients))
-	for clientID := range ws.clients {
-		clientIDs = append(clientIDs, clientID)
-	}
-	ws.clientsMutex.Unlock()
+		ws.clientsMutex.Lock()
+		clientIDs := make([]string, 0, len(ws.clients))
+		for clientID := range ws.clients {
+			clientIDs = append(clientIDs, clientID)
+		}
+		ws.clientsMutex.Unlock()
 
-	// 逐个清理客户端
-	for _, clientID := range clientIDs {
-		ws.RemoveClient(clientID)
-	}
+		// 逐个清理客户端
+		for _, clientID := range clientIDs {
+			ws.RemoveClient(clientID)
+		}
 
-	ws.roomsMutex.Lock()
-	ws.rooms = make(map[string]*model.Room)
-	ws.roomsMutex.Unlock()
+		ws.roomsMutex.Lock()
+		ws.rooms = make(map[string]*model.Room)
+		ws.roomsMutex.Unlock()
+		ws.onClientDisconnect = nil
 
-	logrus.Info("WebSocket服务已关闭")
+		logrus.Info("WebSocket服务已关闭")
+	})
 }
 
 // GetStats 获取基本统计信息

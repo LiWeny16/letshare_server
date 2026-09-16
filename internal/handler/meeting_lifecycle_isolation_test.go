@@ -21,13 +21,11 @@ func TestMeetingEndDoesNotLeakToSubscribedNonMember(t *testing.T) {
 	if err != nil {
 		t.Fatalf("wait meeting:create: %v", err)
 	}
-	for _, r := range []*wsRPC{host, observer} {
-		if err := r.sendJSON(model.WebSocketMessage{Type: "subscribe", Channel: meetingID, Event: "signal:all"}); err != nil {
-			t.Fatalf("subscribe meeting room: %v", err)
-		}
-		if err := r.waitSubscribed(5 * time.Second); err != nil {
-			t.Fatalf("wait subscribed: %v", err)
-		}
+	if err := observer.sendJSON(model.WebSocketMessage{Type: "subscribe", Channel: meetingID, Event: "signal:all"}); err != nil {
+		t.Fatalf("subscribe meeting room: %v", err)
+	}
+	if msg, err := observer.waitError(5 * time.Second); err != nil || msg == "" {
+		t.Fatalf("ordinary room subscription to a meeting must be rejected: msg=%q err=%v", msg, err)
 	}
 	joinData, _ := json.Marshal(map[string]string{"roomId": meetingID})
 	if err := host.sendJSON(model.WebSocketMessage{Type: model.MessageTypeMeetingJoin, Channel: meetingID, Data: joinData}); err != nil {
@@ -47,10 +45,15 @@ func TestMeetingEndDoesNotLeakToSubscribedNonMember(t *testing.T) {
 	if err := host.sendJSON(model.WebSocketMessage{Type: model.MessageTypeMeetingLeave, Channel: meetingID, Data: []byte(`{}`)}); err != nil {
 		t.Fatalf("send meeting:leave: %v", err)
 	}
-	select {
-	case <-host.ended:
-	case <-time.After(2 * time.Second):
-		t.Fatal("host did not receive meeting:ended")
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		if _, ok := ts.handler.activeMeetingRooms.Load(meetingID); !ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("last explicit leave did not destroy the empty meeting")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	select {
 	case msg := <-observer.ended:

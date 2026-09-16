@@ -42,14 +42,6 @@ func TestMeetingLatePublisherAutoSubscribe(t *testing.T) {
 		t.Fatalf("等待 meeting:create 失败: %v", err)
 	}
 
-	for _, r := range []*wsRPC{a, b} {
-		if err := r.sendJSON(model.WebSocketMessage{Type: "subscribe", Channel: room, Event: "signal:all"}); err != nil {
-			t.Fatal(err)
-		}
-		if err := r.waitSubscribed(5 * time.Second); err != nil {
-			t.Fatal(err)
-		}
-	}
 	join := func(r *wsRPC) {
 		data, _ := json.Marshal(map[string]interface{}{"roomId": room})
 		if err := r.sendJSON(model.WebSocketMessage{Type: "meeting:join", Channel: room, Data: data}); err != nil {

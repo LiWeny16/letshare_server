@@ -16,9 +16,14 @@ const (
 	testChunkSize   = 65536
 )
 
-func newTestFTS() *FileTransferService {
+func newTestFTS(t *testing.T) *FileTransferService {
 	ws := NewWebSocketService(10)
-	return NewFileTransferService(ws, testMaxFileSize, testChunkSize)
+	fts := NewFileTransferService(ws, testMaxFileSize, testChunkSize)
+	t.Cleanup(func() {
+		fts.Shutdown()
+		ws.Shutdown()
+	})
+	return fts
 }
 
 func validRequest() *model.FileTransferRequest {
@@ -66,7 +71,7 @@ func TestCreateTransferSession_ProLimits(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			fts := newTestFTS()
+			fts := newTestFTS(t)
 			req := &model.FileTransferRequest{
 				TransferID: "tf-pro-" + strings.ReplaceAll(tt.name, " ", "-"),
 				FileName:   "pro-test.bin",
@@ -95,7 +100,7 @@ func TestCreateTransferSession_ProLimits(t *testing.T) {
 }
 
 func TestUpdateSessionStatus_ResendFromTransferring(t *testing.T) {
-	fts := newTestFTS()
+	fts := newTestFTS(t)
 	req := validRequest()
 	req.TransferID = "tf-resend"
 	createSession(t, fts, req, true)
@@ -107,7 +112,7 @@ func TestUpdateSessionStatus_ResendFromTransferring(t *testing.T) {
 }
 
 func TestUpdateSessionStatus_AllTransitions(t *testing.T) {
-	fts := newTestFTS()
+	fts := newTestFTS(t)
 	tests := []struct {
 		setup, expected, new string
 		wantErr              bool
@@ -148,14 +153,14 @@ func TestUpdateSessionStatus_AllTransitions(t *testing.T) {
 }
 
 func TestUpdateSessionStatus_NonExistentSession(t *testing.T) {
-	fts := newTestFTS()
+	fts := newTestFTS(t)
 	if err := fts.UpdateSessionStatus("nope", "pending", "accepted"); err == nil || !strings.Contains(err.Error(), "不存在") {
 		t.Fatal("expected 'exists not' error")
 	}
 }
 
 func TestFileTransferSession_Lifecycle(t *testing.T) {
-	fts := newTestFTS()
+	fts := newTestFTS(t)
 	req := validRequest()
 	req.TransferID = "tf-lifecycle"
 	createSession(t, fts, req, true)
@@ -172,7 +177,7 @@ func TestFileTransferSession_Lifecycle(t *testing.T) {
 }
 
 func TestRelayChunkLedgerResumeState(t *testing.T) {
-	fts := newTestFTS()
+	fts := newTestFTS(t)
 	fts.spoolDir = t.TempDir()
 
 	req := validRequest()
@@ -247,7 +252,7 @@ func TestFileTransferServiceUsesConfiguredSpoolDir(t *testing.T) {
 	customSpoolDir := filepath.Join(t.TempDir(), "relay-spool")
 	t.Setenv(relaySpoolDirEnv, customSpoolDir)
 
-	fts := newTestFTS()
+	fts := newTestFTS(t)
 
 	if fts.spoolDir != customSpoolDir {
 		t.Fatalf("spoolDir = %q, want %q", fts.spoolDir, customSpoolDir)
@@ -255,7 +260,7 @@ func TestFileTransferServiceUsesConfiguredSpoolDir(t *testing.T) {
 }
 
 func TestGetResumeStateRejectsUnauthorizedUser(t *testing.T) {
-	fts := newTestFTS()
+	fts := newTestFTS(t)
 	req := validRequest()
 	req.TransferID = "tf-resume-auth"
 	createSession(t, fts, req, false)
@@ -273,7 +278,7 @@ func TestGetResumeStateRejectsUnauthorizedUser(t *testing.T) {
 }
 
 func TestHandleClientDisconnectMarksInterruptedAndKeepsSession(t *testing.T) {
-	fts := newTestFTS()
+	fts := newTestFTS(t)
 	req := validRequest()
 	req.TransferID = "tf-interrupted"
 	createSession(t, fts, req, false)
@@ -294,7 +299,7 @@ func TestHandleClientDisconnectMarksInterruptedAndKeepsSession(t *testing.T) {
 }
 
 func TestCreateTransferSession_RequiredFields(t *testing.T) {
-	fts := newTestFTS()
+	fts := newTestFTS(t)
 	tests := []struct{ from, to, errMsg string }{
 		{"", "", "发送者"},
 		{"", "r", "发送者"},
@@ -312,7 +317,7 @@ func TestCreateTransferSession_RequiredFields(t *testing.T) {
 }
 
 func TestCreateTransferSession_ChunkCalculation(t *testing.T) {
-	fts := newTestFTS()
+	fts := newTestFTS(t)
 	tests := []struct {
 		name       string
 		fileSize   int64
@@ -339,7 +344,7 @@ func TestCreateTransferSession_ChunkCalculation(t *testing.T) {
 }
 
 func TestGetStats_SessionCounts(t *testing.T) {
-	fts := newTestFTS()
+	fts := newTestFTS(t)
 	for i := 0; i < 3; i++ {
 		req := validRequest()
 		req.TransferID = fmt.Sprintf("tf-stats-%d", i)
@@ -352,7 +357,7 @@ func TestGetStats_SessionCounts(t *testing.T) {
 }
 
 func TestCreateTransferSession_Concurrent(t *testing.T) {
-	fts := newTestFTS()
+	fts := newTestFTS(t)
 	ch := make(chan error, 20)
 	for i := 0; i < 20; i++ {
 		go func(idx int) {
@@ -376,7 +381,7 @@ func TestHandleClientDisconnect_UsesCorrectErrorType(t *testing.T) {
 }
 
 func TestUpdateSessionStatus_SkipCAS(t *testing.T) {
-	fts := newTestFTS()
+	fts := newTestFTS(t)
 	req := validRequest()
 	req.TransferID = "tf-skip-cas"
 	createSession(t, fts, req, true)

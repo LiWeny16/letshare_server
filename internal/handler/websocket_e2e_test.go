@@ -365,7 +365,11 @@ func (ts *testServer) sendError(client *model.Client, code int, message string) 
 	}
 }
 
-func (ts *testServer) Close() { ts.srv.Close(); ts.wsService.Shutdown() }
+func (ts *testServer) Close() {
+	ts.srv.Close()
+	ts.fts.Shutdown()
+	ts.wsService.Shutdown()
+}
 
 // ============ Tests ============
 

@@ -2,9 +2,9 @@ package sfu
 
 import (
 	"errors"
-	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
@@ -17,6 +17,8 @@ type subTrack struct {
 	remote *webrtc.TrackRemote
 	local  *webrtc.TrackLocalStaticRTP
 	sender *webrtc.RTPSender
+	fanout *trackFanout
+	key    string
 }
 
 // Subscriber 是一条“订阅连接”：服务器据此把发布者的 track 扇出给某位订阅者。
@@ -49,6 +51,7 @@ type Subscriber struct {
 	off  atomic.Bool
 
 	onICECandidate func(*webrtc.ICECandidate)
+	pendingICE     []*webrtc.ICECandidate
 }
 
 // Offer 返回需要信令给订阅者客户端的 SDP offer。
@@ -117,7 +120,7 @@ func (s *Subscriber) SetRemoteDescription(sd webrtc.SessionDescription) error {
 		// Ask the publisher for a fresh keyframe after the delivery PC is
 		// negotiated. This closes the join-after-keyframe gap even before the
 		// browser emits its first PLI.
-		go s.requestPublisherKeyframes()
+		go s.requestPublisherKeyframesBurst()
 	}
 	return nil
 }
@@ -181,7 +184,12 @@ func (s *Subscriber) OnICECandidate(cb func(*webrtc.ICECandidate)) {
 	}
 	s.mu.Lock()
 	s.onICECandidate = cb
+	pending := append([]*webrtc.ICECandidate(nil), s.pendingICE...)
+	s.pendingICE = nil
 	s.mu.Unlock()
+	for _, candidate := range pending {
+		cb(candidate)
+	}
 }
 
 // emitICECandidate 分发给已注册回调（供内部使用）。
@@ -189,6 +197,20 @@ func (s *Subscriber) emitICECandidate(c *webrtc.ICECandidate) {
 	s.mu.RLock()
 	cb := s.onICECandidate
 	s.mu.RUnlock()
+	if cb == nil {
+		s.mu.Lock()
+		// Candidate gathering can begin while SubscribeTo is still creating
+		// the initial offer. Keep early candidates until the handler has
+		// installed the signaling callback; otherwise the browser receives a
+		// valid-looking SDP offer but can never establish the subscriber PC.
+		if s.onICECandidate == nil && !s.off.Load() {
+			s.pendingICE = append(s.pendingICE, c)
+			s.mu.Unlock()
+			return
+		}
+		cb = s.onICECandidate
+		s.mu.Unlock()
+	}
 	if cb != nil {
 		cb(c)
 	}
@@ -210,63 +232,29 @@ func (s *Subscriber) addForwardTrack(remote *webrtc.TrackRemote) error {
 		Channels:     c.Channels,
 		SDPFmtpLine:  c.SDPFmtpLine,
 		RTCPFeedback: c.RTCPFeedback,
-	}, remote.ID()+"-fwd", remote.StreamID())
+	}, remote.ID(), remote.StreamID())
 	if err != nil {
 		return err
+	}
+	publisher, ok := s.forParticipant.room.GetParticipant(s.publisherID)
+	if !ok {
+		return errors.New("sfu: 发布者已离开")
+	}
+	fanout := publisher.trackFanout(remote.ID())
+	if fanout == nil {
+		return errors.New("sfu: 发布轨道 fanout 不存在")
 	}
 	sender, err := s.pc.AddTrack(local)
 	if err != nil {
 		return err
 	}
+	outputKey := s.forParticipant.ID + ":" + remote.ID()
 	s.mu.Lock()
-	s.locTracks[remote.ID()] = &subTrack{remote: remote, local: local, sender: sender}
+	s.locTracks[remote.ID()] = &subTrack{remote: remote, local: local, sender: sender, fanout: fanout, key: outputKey}
 	s.mu.Unlock()
-
-	s.startForwarder(remote, local)
+	fanout.add(outputKey, local)
 	s.startRTCPDrain(sender)
 	return nil
-}
-
-// startForwarder 起一个 goroutine：从发布者远端 track 读 RTP，写入订阅者本地轨道。
-// 全程错误局部化：任何读/写错误都只结束本转发 goroutine，不影响其它轨道/参与者。
-func (s *Subscriber) startForwarder(remote *webrtc.TrackRemote, local *webrtc.TrackLocalStaticRTP) {
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.WithFields(log.Fields{
-					"sfu":           "subscriber",
-					"roomID":        s.forParticipant.room.ID,
-					"participantID": s.forParticipant.ID,
-					"publisherID":   s.publisherID,
-				}).WithField("panic", r).Error("订阅转发轨道异常结束")
-			}
-		}()
-		for {
-			select {
-			case <-s.stop:
-				return
-			default:
-			}
-			pkt, _, err := remote.ReadRTP()
-			if err != nil {
-				if !errors.Is(err, io.EOF) && !s.off.Load() {
-					log.WithError(err).WithFields(log.Fields{
-						"sfu":    "subscriber",
-						"roomID": s.forParticipant.room.ID,
-					}).Warn("订阅转发：读取发布者 RTP 失败")
-				}
-				return
-			}
-			if err := local.WriteRTP(pkt); err != nil {
-				if !s.off.Load() {
-					log.WithError(err).WithFields(log.Fields{
-						"sfu": "subscriber",
-					}).Warn("订阅转发：写入订阅者 RTP 失败")
-				}
-				return
-			}
-		}
-	}()
 }
 
 // startRTCPDrain 显式处理订阅连接的 RTCP：订阅者侧（receiver report / PLI / NACK）
@@ -334,6 +322,33 @@ func (s *Subscriber) requestPublisherKeyframes() {
 	}
 }
 
+// requestPublisherKeyframesBurst handles the join-after-keyframe race and
+// the equivalent race when a camera/screen sender is added by renegotiation.
+// A single PLI can arrive before the publisher has switched to the new
+// negotiated sender, so request a small, bounded sequence. The subscriber
+// stop channel makes the timers disappear with the subscription.
+func (s *Subscriber) requestPublisherKeyframesBurst() {
+	for _, delay := range []time.Duration{0, 250 * time.Millisecond, 1 * time.Second, 2 * time.Second} {
+		if delay == 0 {
+			s.requestPublisherKeyframes()
+			continue
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+			if s.off.Load() {
+				return
+			}
+			s.requestPublisherKeyframes()
+		case <-s.stop:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return
+		}
+	}
+}
+
 func (s *Subscriber) videoTracks() []*subTrack {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -356,6 +371,15 @@ func (s *Subscriber) Close() error {
 	s.once.Do(func() {
 		s.off.Store(true)
 		close(s.stop)
+		s.mu.RLock()
+		tracks := make([]*subTrack, 0, len(s.locTracks))
+		for _, track := range s.locTracks {
+			tracks = append(tracks, track)
+		}
+		s.mu.RUnlock()
+		for _, track := range tracks {
+			track.fanout.remove(track.key)
+		}
 		err = s.pc.Close()
 	})
 	s.forParticipant.forgetClosedSubscription(s.publisherID, s)

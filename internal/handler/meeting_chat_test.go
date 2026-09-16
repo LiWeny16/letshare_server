@@ -33,20 +33,7 @@ func meetingChatFlow(t *testing.T) (ts *meetingTestServer, a, b, c *wsRPC, meeti
 	}
 	meetingID = room
 
-	// 三人订阅会议房间（C 只订阅、不 join —— 非 SFU 成员）
-	subscribe := func(r *wsRPC) {
-		if err := r.sendJSON(model.WebSocketMessage{Type: "subscribe", Channel: meetingID, Event: "signal:all"}); err != nil {
-			t.Fatalf("发送 subscribe 失败: %v", err)
-		}
-		if err := r.waitSubscribed(5 * time.Second); err != nil {
-			t.Fatalf("订阅会议房间失败: %v", err)
-		}
-	}
-	subscribe(a)
-	subscribe(b)
-	subscribe(c)
-
-	// A、B 加入会议（成为 SFU 参与者 = 会议成员权威名单）
+	// A、B 通过会议域 join（成为会议成员权威名单）；C 保持普通连接但不入会。
 	join := func(r *wsRPC) {
 		data, _ := json.Marshal(map[string]interface{}{"roomId": meetingID})
 		if err := r.sendJSON(model.WebSocketMessage{Type: "meeting:join", Channel: meetingID, Data: data}); err != nil {
@@ -101,6 +88,10 @@ func sendChat(r *wsRPC, meetingID, text, to string) error {
 	return r.sendJSON(model.WebSocketMessage{Type: model.MessageTypeMeetingChat, Channel: meetingID, Data: data})
 }
 
+func requestChatHistory(r *wsRPC, meetingID string) error {
+	return r.sendJSON(model.WebSocketMessage{Type: model.MessageTypeMeetingChatHistory, Channel: meetingID, Data: []byte(`{}`)})
+}
+
 // 公聊：A 广播 → B（已入会成员）收到；发送者自身不回环（本地回显）。
 func TestMeetingChat_Broadcast(t *testing.T) {
 	_, a, b, _, meetingID := meetingChatFlow(t)
@@ -120,6 +111,26 @@ func TestMeetingChat_Broadcast(t *testing.T) {
 	}
 	if got, exists := chatPayloadField(t, m, "to").(string); exists && got != "" {
 		t.Fatalf("公聊不应携带 to: %v", got)
+	}
+}
+
+func TestMeetingChat_HistoryReplaysWithinMeetingLifetime(t *testing.T) {
+	_, a, b, _, meetingID := meetingChatFlow(t)
+	if err := sendChat(a, meetingID, "保留到会议结束", ""); err != nil {
+		t.Fatalf("发送历史消息失败: %v", err)
+	}
+	if _, err := waitChat(b, 2*time.Second); err != nil {
+		t.Fatalf("等待实时聊天失败: %v", err)
+	}
+	if err := requestChatHistory(b, meetingID); err != nil {
+		t.Fatalf("请求会议聊天历史失败: %v", err)
+	}
+	history, err := waitChat(b, 2*time.Second)
+	if err != nil {
+		t.Fatalf("会议聊天历史没有回放: %v", err)
+	}
+	if got := chatPayloadField(t, history, "text"); got != "保留到会议结束" {
+		t.Fatalf("回放的聊天内容不符: %v", got)
 	}
 }
 
@@ -219,5 +230,34 @@ func TestMeetingDraw_RejectsNonMemberSender(t *testing.T) {
 			t.Fatalf("未授权画板操作不应投递给 %s: %v", name, m)
 		case <-time.After(300 * time.Millisecond):
 		}
+	}
+}
+
+func TestMeetingDraw_RelaysLaserPointerWithoutSenderEcho(t *testing.T) {
+
+	_, a, b, _, meetingID := meetingChatFlow(t)
+	payload := []byte(`{"op":"laser","phase":"move","x":0.123,"y":0.456,"seq":7}`)
+	if err := a.sendJSON(model.WebSocketMessage{Type: model.MessageTypeMeetingDraw, Channel: meetingID, Data: payload}); err != nil {
+		t.Fatalf("发送 laser pointer 失败: %v", err)
+	}
+	select {
+	case message := <-b.draw:
+		var got map[string]interface{}
+		if err := json.Unmarshal(message.Data, &got); err != nil {
+			t.Fatalf("解析 laser pointer 失败: %v", err)
+		}
+		if got["op"] != "laser" || got["phase"] != "move" || got["from"] != "alice:chat-1" {
+			t.Fatalf("laser pointer relay payload 不完整: %#v", got)
+		}
+		if got["x"] != 0.123 || got["y"] != 0.456 || got["seq"] != float64(7) {
+			t.Fatalf("laser pointer relay 修改了压缩坐标或序号: %#v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("等待 laser pointer relay 超时")
+	}
+	select {
+	case message := <-a.draw:
+		t.Fatalf("laser pointer 不应回环给发送者: %#v", message)
+	case <-time.After(300 * time.Millisecond):
 	}
 }

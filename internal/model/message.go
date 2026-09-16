@@ -22,19 +22,31 @@ const (
 	MessageTypeMeetingCreate = "meeting:create"
 	MessageTypeMeetingUpdate = "meeting:update"
 	// 会议控制/协作消息（服务器校验后转发或广播）
-	MessageTypeMeetingEnd          = "meeting:end"           // 房主结束会议（全员退出并释放资源）
-	MessageTypeMeetingKick         = "meeting:kick"          // 房主移出成员
-	MessageTypeMeetingKicked       = "meeting:kicked"        // 被移出通知（下行）
-	MessageTypeMeetingEnded        = "meeting:ended"         // 会议已结束通知（下行）
-	MessageTypeMeetingChat         = "meeting:chat"          // 会议内实时聊天（纯转发，不落盘）
-	MessageTypeMeetingDraw         = "meeting:draw"          // 协作画板笔画（纯转发，不落盘）
-	MessageTypeMeetingBreakout     = "meeting:breakout"      // 分组讨论（create 召集 / invite 定向 / recall 召回）
-	MessageTypeMeetingInfo         = "meeting:info"          // 加入成功后的会议信息定向通知（host/title）
-	MessageTypeMeetingMediaControl = "meeting:media-control" // 房主媒体控制（全员静音/请求开麦）
-	MessageTypeMeetingInvite       = "meeting:invite"        // 房主定向会议邀请
-	MessageTypeMeetingPresentation = "meeting:presentation"  // 单一展示主持权（screen/whiteboard）
-	MessageTypeMeetingExcalidraw   = "meeting:excalidraw"    // Excalidraw 场景同步
-	MessageTypeMeetingMinutes      = "meeting:minutes"       // AI 会议纪要配置、同意、转写与摘要
+	MessageTypeMeetingEnd                = "meeting:end"           // 房主结束会议（全员退出并释放资源）
+	MessageTypeMeetingKick               = "meeting:kick"          // 房主移出成员
+	MessageTypeMeetingHost               = "meeting:host"          // 房主设置新的主持人
+	MessageTypeMeetingKicked             = "meeting:kicked"        // 被移出通知（下行）
+	MessageTypeMeetingEnded              = "meeting:ended"         // 会议已结束通知（下行）
+	MessageTypeMeetingChat               = "meeting:chat"          // 会议内实时聊天
+	MessageTypeMeetingChatHistory        = "meeting:chat-history"  // 请求回放当前会议聊天历史
+	MessageTypeMeetingDraw               = "meeting:draw"          // 协作画板笔画（纯转发，不落盘）
+	MessageTypeMeetingBreakout           = "meeting:breakout"      // 分组讨论（create 召集 / invite 定向 / recall 召回）
+	MessageTypeMeetingInfo               = "meeting:info"          // 加入成功后的会议信息定向通知（host/title）
+	MessageTypeMeetingMediaControl       = "meeting:media-control" // 房主媒体控制（全员静音/请求开麦）
+	MessageTypeMeetingInvite             = "meeting:invite"        // 房主定向会议邀请
+	MessageTypeMeetingPresentation       = "meeting:presentation"  // 独立的屏幕共享 + 白板会话状态
+	MessageTypeMeetingExcalidraw         = "meeting:excalidraw"    // Excalidraw 场景同步
+	MessageTypeMeetingMinutes            = "meeting:minutes"       // AI 会议纪要配置、同意、转写与摘要
+	MessageTypeMeetingHeartbeat          = "meeting:heartbeat"     // 会议连接保活（不进入普通房间状态）
+	MessageTypeMeetingMediaState         = "meeting:media-state"
+	MessageTypeMeetingMembershipSnapshot = "meeting:membership:snapshot"
+	MessageTypeMeetingMembershipChanged  = "meeting:membership:changed"
+	MessageTypeMeetingHostChanged        = "meeting:host-changed"
+	MessageTypeMeetingSharingRequest     = "meeting:sharing-request"
+	// Direct one-to-one calls reuse the meeting SFU publish/subscribe path,
+	// but use a short-lived call_<id> room with a two-participant limit.
+	MessageTypeCallSFUJoin  = "call:sfu:join"
+	MessageTypeCallSFULeave = "call:sfu:leave"
 	// 文件传输相关消息类型
 	MessageTypeFileTransferRequest     = "file:transfer:request"      // 发起文件传输请求
 	MessageTypeFileTransferAccept      = "file:transfer:accept"       // 接受文件传输
@@ -70,8 +82,12 @@ type ErrorInfo struct {
 
 // Client 表示WebSocket客户端
 type Client struct {
-	ID         string                 `json:"id"`
-	UserID     string                 `json:"user_id"`
+	ID string `json:"id"`
+	// UserID is retained for legacy room/file-transfer compatibility.
+	UserID string `json:"user_id"`
+	// UniqID is the stable browser/device identity used by Meeting and media signaling.
+	UniqID     string                 `json:"uniq_id"`
+	UserName   string                 `json:"user_name"`
 	Connection interface{}            `json:"-"` // WebSocket连接
 	ConnMutex  sync.Mutex             `json:"-"` // 保护连接写入
 	Rooms      map[string]bool        `json:"rooms"`
@@ -120,9 +136,20 @@ func NewErrorMessage(code int, message string) *WebSocketMessage {
 
 // NewClient 创建新客户端
 func NewClient(id, userID string, conn interface{}) *Client {
+	return NewClientWithIdentity(id, userID, userID, "", conn)
+}
+
+// NewClientWithIdentity keeps the legacy account field separate from the
+// stable uniqID used by the application and Meeting domains.
+func NewClientWithIdentity(id, userID, uniqID, userName string, conn interface{}) *Client {
+	if uniqID == "" {
+		uniqID = userID
+	}
 	return &Client{
 		ID:         id,
 		UserID:     userID,
+		UniqID:     uniqID,
+		UserName:   userName,
 		Connection: conn,
 		Rooms:      make(map[string]bool),
 		Events:     make(map[string]bool),
