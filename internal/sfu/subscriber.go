@@ -147,12 +147,25 @@ func (s *Subscriber) PendingOffer() (webrtc.SessionDescription, bool, error) {
 // createOfferLocked 必须在 offerMu 持有时调用。
 func (s *Subscriber) createOfferLocked() (webrtc.SessionDescription, error) {
 	var empty webrtc.SessionDescription
+	gatheringComplete := webrtc.GatheringCompletePromise(s.pc)
 	offer, err := s.pc.CreateOffer(nil)
 	if err != nil {
 		return empty, err
 	}
 	if err := s.pc.SetLocalDescription(offer); err != nil {
 		return empty, err
+	}
+	// Send the subscriber offer with the SFU's host candidates embedded. The
+	// browser may still send trickled candidates, but this removes the critical
+	// dependency on the first server-side candidate callback reaching the
+	// subscriber over signaling before ICE can start.
+	select {
+	case <-gatheringComplete:
+	case <-time.After(5 * time.Second):
+		log.WithField("publisher", s.publisherID).Warn("SFU subscriber ICE gathering timed out; using gathered candidates so far")
+	}
+	if local := s.pc.LocalDescription(); local != nil {
+		offer = *local
 	}
 	s.mu.Lock()
 	s.offer = offer
