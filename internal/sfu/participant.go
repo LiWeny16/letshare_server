@@ -28,11 +28,12 @@ type Participant struct {
 	pc   *webrtc.PeerConnection
 	pcMu sync.RWMutex
 
-	mu            sync.RWMutex
-	tracks        map[string]*webrtc.TrackRemote // 该参与者 publish 的权威 track（id -> track）
-	fanouts       map[string]*trackFanout
-	subscriptions map[string]*Subscriber // publisherID -> 扇出给本参与者的订阅连接
-	closed        atomic.Bool
+	mu                sync.RWMutex
+	tracks            map[string]*webrtc.TrackRemote // 该参与者 publish 的权威 track（id -> track）
+	fanouts           map[string]*trackFanout
+	subscriptions     map[string]*Subscriber // publisherID -> 扇出给本参与者的订阅连接
+	subscriptionLocks map[string]*sync.Mutex // publisherID -> serialize concurrent subscription creation
+	closed            atomic.Bool
 
 	onICECandidate func(*webrtc.ICECandidate)
 	pendingICE     []*webrtc.ICECandidate
@@ -283,6 +284,12 @@ func (p *Participant) SubscribeTo(publisherID string) (*Subscriber, bool, error)
 	if publisherID == p.ID {
 		return nil, false, fmt.Errorf("sfu: 参与者不能订阅自己: %q", p.ID)
 	}
+	creationLock := p.subscriptionCreationLock(publisherID)
+	creationLock.Lock()
+	defer creationLock.Unlock()
+	if p.closed.Load() {
+		return nil, false, fmt.Errorf("sfu: participant %q is closed", p.ID)
+	}
 	pub, ok := p.room.GetParticipant(publisherID)
 	if !ok {
 		return nil, false, fmt.Errorf("sfu: 房间内不存在发布者 %q", publisherID)
@@ -318,6 +325,20 @@ func (p *Participant) SubscribeTo(publisherID string) (*Subscriber, bool, error)
 	p.subscriptions[publisherID] = sub
 	p.mu.Unlock()
 	return sub, true, nil
+}
+
+func (p *Participant) subscriptionCreationLock(publisherID string) *sync.Mutex {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.subscriptionLocks == nil {
+		p.subscriptionLocks = make(map[string]*sync.Mutex)
+	}
+	lock := p.subscriptionLocks[publisherID]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		p.subscriptionLocks[publisherID] = lock
+	}
+	return lock
 }
 
 // buildSubscriber 创建一条把发布者 track 转发给本参与者的 PeerConnection。

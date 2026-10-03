@@ -2,6 +2,7 @@ package sfu
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -248,13 +249,17 @@ func (s *Subscriber) addForwardTrack(remote *webrtc.TrackRemote) error {
 	if err != nil {
 		return err
 	}
-	outputKey := s.forParticipant.ID + ":" + remote.ID()
+	outputKey := fanoutOutputKey(s, remote.ID())
 	s.mu.Lock()
 	s.locTracks[remote.ID()] = &subTrack{remote: remote, local: local, sender: sender, fanout: fanout, key: outputKey}
 	s.mu.Unlock()
 	fanout.add(outputKey, local)
 	s.startRTCPDrain(sender)
 	return nil
+}
+
+func fanoutOutputKey(subscriber *Subscriber, trackID string) string {
+	return fmt.Sprintf("%s:%p:%s", subscriber.forParticipant.ID, subscriber, trackID)
 }
 
 // startRTCPDrain 显式处理订阅连接的 RTCP：订阅者侧（receiver report / PLI / NACK）
