@@ -623,6 +623,8 @@ func (h *WebSocketHandler) processMessage(client *model.Client, message *model.W
 		h.handleMeetingMediaControl(client, message)
 	case model.MessageTypeMeetingMediaState:
 		h.handleMeetingMediaState(client, message)
+	case model.MessageTypeMeetingRename:
+		h.handleMeetingRename(client, message)
 	case model.MessageTypeMeetingChat:
 		h.handleMeetingChat(client, message)
 	case model.MessageTypeMeetingChatHistory:
@@ -1166,6 +1168,39 @@ func (h *WebSocketHandler) handleMeetingMediaState(client *model.Client, message
 		if member.ClientID != client.ID {
 			h.sendMeetingToClient(member.ClientID, roomID, model.MessageTypeMeetingMediaState, state)
 		}
+	}
+}
+
+func (h *WebSocketHandler) handleMeetingRename(client *model.Client, message *model.WebSocketMessage) {
+	roomID := message.Channel
+	if roomID == "" || !h.requireMeetingMember(client, roomID, model.MessageTypeMeetingRename) {
+		return
+	}
+	var payload struct {
+		UserName string `json:"userName"`
+	}
+	if err := json.Unmarshal(message.Data, &payload); err != nil {
+		h.sendError(client, 400, "meeting:rename 数据格式错误")
+		return
+	}
+	userName := strings.TrimSpace(payload.UserName)
+	if userName == "" {
+		h.sendError(client, 400, "meeting:rename 缺少名称")
+		return
+	}
+	if len(userName) > 64 {
+		userName = userName[:64]
+	}
+	if !h.meetings.updateName(roomID, client.UniqID, client.ID, userName) {
+		h.sendError(client, 403, "meeting:rename 不是当前会议连接")
+		return
+	}
+	client.UserName = userName
+	for _, member := range h.meetings.members(roomID) {
+		h.sendMeetingToClient(member.ClientID, roomID, model.MessageTypeMeetingRename, map[string]interface{}{
+			"uniqId":   client.UniqID,
+			"userName": userName,
+		})
 	}
 }
 

@@ -39,6 +39,7 @@ const (
 	MessageTypeMeetingMinutes            = "meeting:minutes"       // AI 会议纪要配置、同意、转写与摘要
 	MessageTypeMeetingHeartbeat          = "meeting:heartbeat"     // 会议连接保活（不进入普通房间状态）
 	MessageTypeMeetingMediaState         = "meeting:media-state"
+	MessageTypeMeetingRename             = "meeting:rename"
 	MessageTypeMeetingMembershipSnapshot = "meeting:membership:snapshot"
 	MessageTypeMeetingMembershipChanged  = "meeting:membership:changed"
 	MessageTypeMeetingHostChanged        = "meeting:host-changed"

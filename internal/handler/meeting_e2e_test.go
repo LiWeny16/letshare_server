@@ -109,6 +109,7 @@ type wsRPC struct {
 	chat           chan model.WebSocketMessage
 	mediaControl   chan model.WebSocketMessage
 	mediaState     chan model.WebSocketMessage
+	rename         chan model.WebSocketMessage
 	fileTransfer   chan model.WebSocketMessage
 	draw           chan model.WebSocketMessage
 	presentation   chan model.WebSocketMessage
@@ -163,6 +164,8 @@ func (r *wsRPC) dispatch() {
 			r.mediaControl <- m
 		case "meeting:media-state":
 			r.mediaState <- m
+		case model.MessageTypeMeetingRename:
+			r.rename <- m
 		case model.MessageTypeFileTransferRequest, model.MessageTypeFileTransferAccept,
 			model.MessageTypeFileTransferReject, model.MessageTypeFileTransferStart,
 			model.MessageTypeFileTransferEnd, model.MessageTypeFileTransferComplete,
@@ -281,6 +284,7 @@ func newWSRPC(t *testing.T, srv *httptest.Server, userID string) *wsRPC {
 		chat:           make(chan model.WebSocketMessage, 64),
 		mediaControl:   make(chan model.WebSocketMessage, 64),
 		mediaState:     make(chan model.WebSocketMessage, 64),
+		rename:         make(chan model.WebSocketMessage, 16),
 		fileTransfer:   make(chan model.WebSocketMessage, 64),
 		draw:           make(chan model.WebSocketMessage, 64),
 		presentation:   make(chan model.WebSocketMessage, 64),

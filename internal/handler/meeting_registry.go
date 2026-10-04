@@ -86,6 +86,23 @@ func (r *meetingRegistry) updateMedia(roomID, uniqID, clientID string, media mee
 	return true
 }
 
+func (r *meetingRegistry) updateName(roomID, uniqID, clientID, userName string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	room := r.rooms[roomID]
+	if room == nil {
+		return false
+	}
+	member, ok := room.byUniqID[uniqID]
+	if !ok || member.ClientID != clientID {
+		return false
+	}
+	member.UserName = userName
+	member.LastSeen = time.Now()
+	room.byUniqID[uniqID] = member
+	return true
+}
+
 func (r *meetingRegistry) touch(roomID, clientID string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
