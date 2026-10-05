@@ -98,6 +98,8 @@ func (ts *meetingTestServer) Close() {
 // wsRPC 模拟一个会议客户端：单 reader 将每条 WS 消息推入 in，
 // dispatcher 把 meeting:ice 应用到对应 PC、把 subscribed / meeting:sdp 送入相应通道。
 type wsRPC struct {
+	writeMu        sync.Mutex
+	pcMu           sync.RWMutex
 	conn           *websocket.Conn
 	in             chan model.WebSocketMessage
 	subs           chan struct{}
@@ -196,18 +198,40 @@ func (r *wsRPC) dispatch() {
 			var init webrtc.ICECandidateInit
 			_ = json.Unmarshal(d.Candidate, &init)
 			if d.To == "" {
-				if r.pubPC != nil {
-					_ = r.pubPC.AddICECandidate(init)
+				r.pcMu.RLock()
+				pc := r.pubPC
+				r.pcMu.RUnlock()
+				if pc != nil {
+					_ = pc.AddICECandidate(init)
 				}
-			} else if r.subPC != nil {
-				_ = r.subPC.AddICECandidate(init)
+			} else {
+				r.pcMu.RLock()
+				pc := r.subPC
+				r.pcMu.RUnlock()
+				if pc != nil {
+					_ = pc.AddICECandidate(init)
+				}
 			}
 		}
 	}
 }
 
+func (r *wsRPC) setPubPC(pc *webrtc.PeerConnection) {
+	r.pcMu.Lock()
+	r.pubPC = pc
+	r.pcMu.Unlock()
+}
+
+func (r *wsRPC) setSubPC(pc *webrtc.PeerConnection) {
+	r.pcMu.Lock()
+	r.subPC = pc
+	r.pcMu.Unlock()
+}
+
 // sendJSON 发送一条 JSON 消息到该 WS。
 func (r *wsRPC) sendJSON(m model.WebSocketMessage) error {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
 	return r.conn.WriteJSON(m)
 }
 
@@ -378,7 +402,7 @@ func TestMeetingE2E_AC001_AC009_OfferAnswerMediaAndSubscriberRestart(t *testing.
 	if _, err := pubA.AddTrack(trA); err != nil {
 		t.Fatalf("A AddTrack 失败: %v", err)
 	}
-	a.pubPC = pubA
+	a.setPubPC(pubA)
 
 	offerA, err := pubA.CreateOffer(nil)
 	if err != nil {
@@ -432,7 +456,7 @@ func TestMeetingE2E_AC001_AC009_OfferAnswerMediaAndSubscriberRestart(t *testing.
 		t.Fatalf("创建 B 接收 PC 失败: %v", err)
 	}
 	defer recvB.Close()
-	b.subPC = recvB
+	b.setSubPC(recvB)
 
 	received := make(chan *rtp.Packet, 64)
 	recvB.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
