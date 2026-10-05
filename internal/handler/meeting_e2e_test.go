@@ -331,7 +331,7 @@ func makeOpusTrack(t *testing.T, api *sfu.API, id, streamID string) *webrtc.Trac
 
 // TestMeetingE2E_OfferAnswerAndMediaForward 验证一条真 WS 信令闭环：
 // A 发布 offer → 服务器回 answer；A 注流 → B 订阅 A → 服务器扇出 → B 收到转发媒体。
-func TestMeetingE2E_OfferAnswerAndMediaForward(t *testing.T) {
+func TestMeetingE2E_AC001_AC009_OfferAnswerMediaAndSubscriberRestart(t *testing.T) {
 	ts := newMeetingTestServer(t)
 	defer ts.Close()
 
@@ -497,6 +497,7 @@ func TestMeetingE2E_OfferAnswerAndMediaForward(t *testing.T) {
 	}
 
 	deadline := time.Now().Add(10 * time.Second)
+receiveLoop:
 	for {
 		select {
 		case p := <-received:
@@ -504,13 +505,50 @@ func TestMeetingE2E_OfferAnswerAndMediaForward(t *testing.T) {
 				t.Fatalf("转发包 PT 应为 111，实际 %d", p.PayloadType)
 			}
 			t.Logf("B 订阅端收到被服务器转发的 RTP（PT=%d, seq=%d, len=%d）", p.PayloadType, p.SequenceNumber, len(p.Payload))
-			return
+			break receiveLoop
 		default:
 			if time.Now().After(deadline) {
 				t.Fatal("超时：B 未收到经 SFU 转发的媒体帧")
 			}
 			time.Sleep(20 * time.Millisecond)
 		}
+	}
+
+	// AC-009: A client with a stuck downlink requests a replacement. The server
+	// must create a new delivery PC, then replay that same pending offer when the
+	// identical request is retried after a lost WebSocket response.
+	restartRequest, _ := json.Marshal(map[string]interface{}{
+		"type": "offer", "to": userA, "restartId": "ac009-recovery-1",
+	})
+	if err := b.sendJSON(model.WebSocketMessage{Type: "meeting:sdp", Channel: room, Data: restartRequest}); err != nil {
+		t.Fatalf("B 发送订阅重建请求失败: %v", err)
+	}
+	waitRestartOffer := func() model.WebSocketMessage {
+		t.Helper()
+		msg, err := b.waitSDP(func(m model.WebSocketMessage) bool {
+			var d map[string]interface{}
+			_ = json.Unmarshal(m.Data, &d)
+			return d["type"] == "offer" && d["to"] == userA && d["sdp"] != "" && d["restartId"] == "ac009-recovery-1"
+		}, 8*time.Second)
+		if err != nil {
+			t.Fatalf("等待重建订阅 offer 失败: %v", err)
+		}
+		return msg
+	}
+	firstRestartOffer := waitRestartOffer()
+	var firstRestartData map[string]interface{}
+	_ = json.Unmarshal(firstRestartOffer.Data, &firstRestartData)
+	if firstRestartData["sdp"] == subOfferD["sdp"] {
+		t.Fatal("重建下行订阅必须由新的 SFU PeerConnection 生成 offer")
+	}
+	if err := b.sendJSON(model.WebSocketMessage{Type: "meeting:sdp", Channel: room, Data: restartRequest}); err != nil {
+		t.Fatalf("B 重试订阅重建请求失败: %v", err)
+	}
+	duplicateRestartOffer := waitRestartOffer()
+	var duplicateRestartData map[string]interface{}
+	_ = json.Unmarshal(duplicateRestartOffer.Data, &duplicateRestartData)
+	if duplicateRestartData["sdp"] != firstRestartData["sdp"] {
+		t.Fatal("相同 restartId 的重试必须复用原 pending offer，不能再创建 PeerConnection")
 	}
 }
 

@@ -278,6 +278,23 @@ func (p *Participant) GetPublishedTrack(id string) (*webrtc.TrackRemote, bool) {
 // idle，引发 ICE 永不连接、摄像头/麦克风/共享屏幕全部失效的级联。
 // 已关闭的旧订阅（发布者重进等场景）会被替换为新订阅，不得复用 closed 连接。
 func (p *Participant) SubscribeTo(publisherID string) (*Subscriber, bool, error) {
+	return p.subscribeTo(publisherID, "")
+}
+
+// RestartSubscription replaces the subscriber connection for a client-driven
+// downlink recovery. Repeated delivery of the same request ID reuses the
+// replacement instead of closing a connection whose offer may already be in flight.
+func (p *Participant) RestartSubscription(publisherID, restartID string) (*Subscriber, bool, error) {
+	if restartID == "" {
+		return nil, false, fmt.Errorf("sfu: 订阅重建请求缺少 id")
+	}
+	if len(restartID) > 128 {
+		return nil, false, fmt.Errorf("sfu: 订阅重建请求 id 过长")
+	}
+	return p.subscribeTo(publisherID, restartID)
+}
+
+func (p *Participant) subscribeTo(publisherID, restartID string) (*Subscriber, bool, error) {
 	if p.closed.Load() {
 		return nil, false, fmt.Errorf("sfu: 参与者 %q 已关闭", p.ID)
 	}
@@ -296,14 +313,20 @@ func (p *Participant) SubscribeTo(publisherID string) (*Subscriber, bool, error)
 	}
 
 	p.mu.Lock()
-	if existing := p.subscriptions[publisherID]; existing != nil {
-		if !existing.IsClosed() {
+	existing := p.subscriptions[publisherID]
+	if existing != nil && !existing.IsClosed() {
+		if restartID == "" || existing.restartID == restartID {
 			p.mu.Unlock()
 			return existing, false, nil
 		}
 		delete(p.subscriptions, publisherID)
+	} else if existing != nil {
+		delete(p.subscriptions, publisherID)
 	}
 	p.mu.Unlock()
+	if existing != nil && !existing.IsClosed() {
+		_ = existing.Close()
+	}
 
 	tracks := pub.PublishedTracks()
 	if len(tracks) == 0 {
@@ -314,6 +337,7 @@ func (p *Participant) SubscribeTo(publisherID string) (*Subscriber, bool, error)
 	if err != nil {
 		return nil, false, err
 	}
+	sub.restartID = restartID
 
 	p.mu.Lock()
 	// 并发重复建订阅：先到者胜出，后建者关闭丢弃。

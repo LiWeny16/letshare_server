@@ -51,7 +51,7 @@ func TestRoomRemovesClosedParticipantFromMap(t *testing.T) {
 // 会再次发起 SubscribeTo —— 服务器必须返回既有订阅而不是 400
 // 「已订阅 …，请先 UnsubscribeFrom」——该通用 error 帧曾把 joining 重置为 idle，
 // 引发整条级联（ICE 永不连接、摄像头/麦克风/共享屏幕失效）。
-func TestSubscribeToIsIdempotent(t *testing.T) {
+func TestSubscribeToIsIdempotentAndAC009RestartReplacesSubscription(t *testing.T) {
 	mgr := MustNewManager(OfflineSettingEngine())
 	room := mgr.JoinRoom("idempotent-room")
 
@@ -135,6 +135,24 @@ func TestSubscribeToIsIdempotent(t *testing.T) {
 	}
 	if got, ok := subB.GetSubscriber("pubA"); !ok || got != sub3 {
 		t.Fatal("订阅表应指向新订阅实例")
+	}
+
+	// AC-009: A browser-side downlink can remain connecting while the SFU-side
+	// subscriber is still open. A restart request must replace it, and retries
+	// carrying the same request ID must reuse the replacement.
+	restarted, created, err := subB.RestartSubscription("pubA", "recovery-1")
+	if err != nil {
+		t.Fatalf("重建下行订阅失败: %v", err)
+	}
+	if !created || restarted == sub3 || !sub3.IsClosed() {
+		t.Fatal("重建请求必须关闭旧订阅并创建新实例")
+	}
+	retried, created, err := subB.RestartSubscription("pubA", "recovery-1")
+	if err != nil {
+		t.Fatalf("幂等重试重建请求失败: %v", err)
+	}
+	if created || retried != restarted {
+		t.Fatal("相同重建请求 ID 必须幂等复用新订阅")
 	}
 }
 

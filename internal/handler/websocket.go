@@ -771,9 +771,10 @@ func (h *WebSocketHandler) handlePublish(client *model.Client, message *model.We
 //   服务器侧每条 PC 的本地候选经 Participant/Subscriber 的 OnICECandidate 定向回发客户端。
 
 type meetingSDPMsg struct {
-	Type string `json:"type"`
-	SDP  string `json:"sdp"`
-	To   string `json:"to"`
+	Type      string `json:"type"`
+	SDP       string `json:"sdp"`
+	To        string `json:"to"`
+	RestartID string `json:"restartId,omitempty"`
 }
 
 type meetingJoinMsg struct {
@@ -1549,7 +1550,14 @@ func (h *WebSocketHandler) handleMeetingSDP(client *model.Client, message *model
 
 	case m.Type == "offer" && m.To != "":
 		// 订阅请求：订阅者要求订阅 m.To 发布者；服务器建 Subscriber 并把其 offer 回发订阅者
-		sub, created, err := part.SubscribeTo(m.To)
+		var sub *sfu.Subscriber
+		var created bool
+		var err error
+		if m.RestartID != "" {
+			sub, created, err = part.RestartSubscription(m.To, m.RestartID)
+		} else {
+			sub, created, err = part.SubscribeTo(m.To)
+		}
 		if err != nil {
 			h.sendError(client, 400, "meeting:sdp 订阅失败: "+err.Error())
 			// 发布者可能正在加入或刚完成 publish；不要让一次早到的请求
@@ -1561,7 +1569,7 @@ func (h *WebSocketHandler) handleMeetingSDP(client *model.Client, message *model
 			// 幂等重试：若首个 offer 可能在网络中丢失，只重发仍在等待 answer
 			// 的同一个 offer；稳定连接不重复协商。
 			if offer, pending := sub.OfferForRetry(); pending {
-				h.sendMeetingSubscriberOffer(message.Channel, client.UniqID, m.To, offer)
+				h.sendMeetingSubscriberOfferWithRestartID(message.Channel, client.UniqID, m.To, offer, m.RestartID)
 			}
 			return
 		}
@@ -1569,7 +1577,7 @@ func (h *WebSocketHandler) handleMeetingSDP(client *model.Client, message *model
 		sub.OnICECandidate(func(c *webrtc.ICECandidate) {
 			h.forwardMeetingICE(message.Channel, client.UniqID, c, m.To)
 		})
-		h.sendMeetingSubscriberOffer(message.Channel, client.UniqID, m.To, sub.Offer())
+		h.sendMeetingSubscriberOfferWithRestartID(message.Channel, client.UniqID, m.To, sub.Offer(), m.RestartID)
 
 	case m.Type == "answer" && m.To != "":
 		// 订阅者回 answer（订阅 PC）：按发布者 m.To 找到对应 Subscriber
@@ -1759,15 +1767,23 @@ func (h *WebSocketHandler) reconcileMeetingSubscriptions(roomID, publisherID str
 
 // sendMeetingSubscriberOffer 统一发送订阅方向 offer，避免不同入口遗漏 to/channel。
 func (h *WebSocketHandler) sendMeetingSubscriberOffer(roomID, subscriberID, publisherID string, offer webrtc.SessionDescription) {
+	h.sendMeetingSubscriberOfferWithRestartID(roomID, subscriberID, publisherID, offer, "")
+}
+
+func (h *WebSocketHandler) sendMeetingSubscriberOfferWithRestartID(roomID, subscriberID, publisherID string, offer webrtc.SessionDescription, restartID string) {
 	if offer.SDP == "" {
 		return
 	}
 	logrus.WithFields(logrus.Fields{
 		"room": roomID, "subscriber": subscriberID, "publisher": publisherID, "sdpLength": len(offer.SDP),
 	}).Info("meeting subscriber offer sent")
-	h.sendMeetingToUser(roomID, subscriberID, model.MessageTypeMeetingSDP, map[string]interface{}{
+	data := map[string]interface{}{
 		"type": "offer", "sdp": offer.SDP, "to": publisherID,
-	})
+	}
+	if restartID != "" {
+		data["restartId"] = restartID
+	}
+	h.sendMeetingToUser(roomID, subscriberID, model.MessageTypeMeetingSDP, data)
 }
 
 // forwardMeetingICE 把服务器侧某条 PC 的本地候选定向回发给客户端。

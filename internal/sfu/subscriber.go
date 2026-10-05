@@ -32,6 +32,7 @@ type subTrack struct {
 //  4. 服务器从发布者 track 读 RTP 并 WriteRTP 给订阅者。
 type Subscriber struct {
 	publisherID    string
+	restartID      string
 	forParticipant *Participant
 	pc             *webrtc.PeerConnection
 
