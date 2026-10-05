@@ -255,19 +255,33 @@ func (s *Subscriber) addForwardTrack(remote *webrtc.TrackRemote) error {
 	if !ok {
 		return errors.New("sfu: 发布者已离开")
 	}
+	if publisher.IsClosed() {
+		return errors.New("sfu: 发布者已关闭")
+	}
 	fanout := publisher.trackFanout(remote.ID())
 	if fanout == nil {
 		return errors.New("sfu: 发布轨道 fanout 不存在")
+	}
+	// fanout 可能已经 close（发布者 PC 已失效/轨道读取循环已退出）。在已停摆的
+	// fanout 上注册本地轨会让订阅 PC 协商成功却永远收不到 RTP，必须显式拒绝，
+	// 让上层重建订阅而不是交付一条死轨。
+	if fanout.isClosed() {
+		return errors.New("sfu: 发布轨道 fanout 已关闭")
 	}
 	sender, err := s.pc.AddTrack(local)
 	if err != nil {
 		return err
 	}
 	outputKey := fanoutOutputKey(s, remote.ID())
+	// 登记必须在 AddTrack 之后（需要 sender），但 fanout 可能在两步之间关闭。
+	// add 返回 false 时回滚已添加的 sender，避免留下一条永不出声的本地轨。
+	if !fanout.add(outputKey, local) {
+		_ = s.pc.RemoveTrack(sender)
+		return errors.New("sfu: 发布轨道 fanout 已关闭")
+	}
 	s.mu.Lock()
 	s.locTracks[remote.ID()] = &subTrack{remote: remote, local: local, sender: sender, fanout: fanout, key: outputKey}
 	s.mu.Unlock()
-	fanout.add(outputKey, local)
 	s.startRTCPDrain(sender)
 	return nil
 }

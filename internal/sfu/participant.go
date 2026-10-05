@@ -311,6 +311,12 @@ func (p *Participant) subscribeTo(publisherID, restartID string) (*Subscriber, b
 	if !ok {
 		return nil, false, fmt.Errorf("sfu: 房间内不存在发布者 %q", publisherID)
 	}
+	// 关闭中的发布者绝不能再被订阅：它的 fanout 已停摆，订阅 PC 能协商成功
+	// 但一个 RTP 包都不会到达（表现为「订阅成功却永远收不到音频」）。
+	// 必须在销毁既有订阅之前判定，避免「先拆旧订阅、再发现发布者不可用」。
+	if pub.IsClosed() {
+		return nil, false, fmt.Errorf("sfu: 发布者 %q 已关闭", publisherID)
+	}
 
 	p.mu.Lock()
 	existing := p.subscriptions[publisherID]
@@ -473,13 +479,19 @@ func (p *Participant) Close() error {
 	for _, s := range subs {
 		_ = s.Close()
 	}
-	if err := p.currentPeerConnection().Close(); err != nil {
-		return err
-	}
-	// 自摘除：PC failed/closed 的参与者不得残留在房间 map —— GetParticipant
-	// 返回 closed participant 是「参与者已关闭」「暂无已发布 track」永久报错、
-	// 以及重连后新会话复用 closed participant 的根因。
+	// 自摘除必须先于 pc.Close()：Pion 对已 failed 的连接 Close() 常返回非 nil
+	// （DTLS/ICE/SRTP 已拆），若据此提前 return，forgetClosedParticipant 永不执行，
+	// 参与者会带着 closed=true 永久残留房间 map（GetParticipant 命中僵尸、
+	// 重连被判「已加入」、订阅被绑到已停摆 fanout）。
 	p.room.forgetClosedParticipant(p)
+	if err := p.currentPeerConnection().Close(); err != nil {
+		// 连接已经失效：残留清理已完成，这里只记录，不再向上冒错。
+		log.WithError(err).WithFields(log.Fields{
+			"sfu":           "participant",
+			"roomID":        p.room.ID,
+			"participantID": p.ID,
+		}).Debug("关闭参与者主连接返回错误（连接已失效，可忽略）")
+	}
 	log.WithFields(log.Fields{
 		"sfu":           "participant",
 		"roomID":        p.room.ID,

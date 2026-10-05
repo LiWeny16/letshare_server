@@ -1028,7 +1028,13 @@ func (h *WebSocketHandler) handleMeetingJoin(client *model.Client, message *mode
 		h.releaseMeetingPresentation(message.Channel, uniqID)
 		_ = room.RemoveParticipant(uniqID)
 	}
-	if _, ok := room.GetParticipant(uniqID); ok {
+	// 已关闭的参与者（PC failed/closed）必须显式摘除后才能重建：它的 fanout 已停摆，
+	// 若复用，重连方会拿到一个「已关闭」的 participant，发布 offer 被拒、订阅绑到死轨，
+	// 永远无法恢复（表现为接通方一直听不到对端、重连后仍静音直到挂断）。
+	if stale, ok := room.GetParticipant(uniqID); ok && stale.IsClosed() {
+		_ = room.RemoveParticipant(uniqID)
+	}
+	if existing, ok := room.GetParticipant(uniqID); ok && !existing.IsClosed() {
 		_, previous := h.meetings.join(message.Channel, uniqID, userName, client.ID)
 		h.sendMeetingMembershipSnapshot(client.ID, message.Channel)
 		if len(previous) > 0 {
@@ -1513,23 +1519,23 @@ func (h *WebSocketHandler) handleMeetingSDP(client *model.Client, message *model
 		return
 	}
 	if !h.meetings.owns(message.Channel, client.UniqID, client.ID) {
-		h.sendError(client, 403, "meeting:sdp 不是当前会议连接")
+		h.sendChannelError(client, message.Channel, 403, "meeting:sdp 不是当前会议连接")
 		return
 	}
 	var m meetingSDPMsg
 	if err := json.Unmarshal(message.Data, &m); err != nil {
-		h.sendError(client, 400, "meeting:sdp 数据格式错误: "+err.Error())
+		h.sendChannelError(client, message.Channel, 400, "meeting:sdp 数据格式错误: "+err.Error())
 		return
 	}
 
 	room, ok := h.sfuManager.GetRoom(message.Channel)
 	if !ok {
-		h.sendError(client, 400, "meeting:sdp 尚未加入该会议房间")
+		h.sendChannelError(client, message.Channel, 400, "meeting:sdp 尚未加入该会议房间")
 		return
 	}
 	part, ok := room.GetParticipant(client.UniqID)
 	if !ok {
-		h.sendError(client, 400, "meeting:sdp 请先 meeting:join")
+		h.sendChannelError(client, message.Channel, 400, "meeting:sdp 请先 meeting:join")
 		return
 	}
 
@@ -1539,7 +1545,7 @@ func (h *WebSocketHandler) handleMeetingSDP(client *model.Client, message *model
 		offer := webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: m.SDP}
 		answer, err := part.Offer(offer)
 		if err != nil {
-			h.sendError(client, 500, "meeting:sdp 生成 answer 失败: "+err.Error())
+			h.sendChannelError(client, message.Channel, 500, "meeting:sdp 生成 answer 失败: "+err.Error())
 			return
 		}
 		reply := map[string]interface{}{"type": "answer", "sdp": answer.SDP, "to": client.UniqID}
@@ -1559,7 +1565,7 @@ func (h *WebSocketHandler) handleMeetingSDP(client *model.Client, message *model
 			sub, created, err = part.SubscribeTo(m.To)
 		}
 		if err != nil {
-			h.sendError(client, 400, "meeting:sdp 订阅失败: "+err.Error())
+			h.sendChannelError(client, message.Channel, 400, "meeting:sdp 订阅失败: "+err.Error())
 			// 发布者可能正在加入或刚完成 publish；不要让一次早到的请求
 			// 决定最终结果，后续由 SFU 侧 reconcile 在 track 就绪后补推 offer。
 			go h.reconcileMeetingSubscriptionsEventually(message.Channel, m.To)
@@ -1583,17 +1589,17 @@ func (h *WebSocketHandler) handleMeetingSDP(client *model.Client, message *model
 		// 订阅者回 answer（订阅 PC）：按发布者 m.To 找到对应 Subscriber
 		sub, ok := part.GetSubscriber(m.To)
 		if !ok {
-			h.sendError(client, 400, fmt.Sprintf("meeting:sdp 未找到订阅 %s 的连接", m.To))
+			h.sendChannelError(client, message.Channel, 400, fmt.Sprintf("meeting:sdp 未找到订阅 %s 的连接", m.To))
 			return
 		}
 		if err := sub.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: m.SDP}); err != nil {
-			h.sendError(client, 500, "meeting:sdp answer 设置失败: "+err.Error())
+			h.sendChannelError(client, message.Channel, 500, "meeting:sdp answer 设置失败: "+err.Error())
 			return
 		}
 		// 新轨道可能在上一 offer 等待 answer 期间到达。answer 确认后，
 		// 生成并发送一个合并后的后续 offer，闭合音频/摄像头/屏幕的迟发布窗口。
 		if next, ok, err := sub.PendingOffer(); err != nil {
-			h.sendError(client, 500, "meeting:sdp 后续 offer 生成失败: "+err.Error())
+			h.sendChannelError(client, message.Channel, 500, "meeting:sdp 后续 offer 生成失败: "+err.Error())
 			return
 		} else if ok {
 			h.sendMeetingSubscriberOffer(message.Channel, client.UniqID, m.To, next)
@@ -1602,12 +1608,12 @@ func (h *WebSocketHandler) handleMeetingSDP(client *model.Client, message *model
 	case m.Type == "answer" && m.To == "":
 		// 发布 PC 的重协商 answer（少见）
 		if err := part.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: m.SDP}); err != nil {
-			h.sendError(client, 500, "meeting:sdp answer 设置失败: "+err.Error())
+			h.sendChannelError(client, message.Channel, 500, "meeting:sdp answer 设置失败: "+err.Error())
 			return
 		}
 
 	default:
-		h.sendError(client, 400, "meeting:sdp 未知的 type/direction 组合")
+		h.sendChannelError(client, message.Channel, 400, "meeting:sdp 未知的 type/direction 组合")
 	}
 }
 
@@ -1621,16 +1627,16 @@ func (h *WebSocketHandler) requireMeetingMember(client *model.Client, roomID, ki
 
 func (h *WebSocketHandler) handleMeetingICE(client *model.Client, message *model.WebSocketMessage) {
 	if message.Channel == "" {
-		h.sendError(client, 400, "meeting:ice 缺少房间")
+		h.sendChannelError(client, message.Channel, 400, "meeting:ice 缺少房间")
 		return
 	}
 	if !h.meetings.owns(message.Channel, client.UniqID, client.ID) {
-		h.sendError(client, 403, "meeting:ice 不是当前会议连接")
+		h.sendChannelError(client, message.Channel, 403, "meeting:ice 不是当前会议连接")
 		return
 	}
 	var m meetingICEMsg
 	if err := json.Unmarshal(message.Data, &m); err != nil {
-		h.sendError(client, 400, "meeting:ice 数据格式错误: "+err.Error())
+		h.sendChannelError(client, message.Channel, 400, "meeting:ice 数据格式错误: "+err.Error())
 		return
 	}
 	var init webrtc.ICECandidateInit
@@ -1640,19 +1646,19 @@ func (h *WebSocketHandler) handleMeetingICE(client *model.Client, message *model
 
 	room, ok := h.sfuManager.GetRoom(message.Channel)
 	if !ok {
-		h.sendError(client, 400, "meeting:ice 尚未加入该会议房间")
+		h.sendChannelError(client, message.Channel, 400, "meeting:ice 尚未加入该会议房间")
 		return
 	}
 	part, ok := room.GetParticipant(client.UniqID)
 	if !ok {
-		h.sendError(client, 400, "meeting:ice 请先 meeting:join")
+		h.sendChannelError(client, message.Channel, 400, "meeting:ice 请先 meeting:join")
 		return
 	}
 
 	if m.To == "" {
 		// 发布 PC 候选
 		if err := part.AddICECandidate(init); err != nil {
-			h.sendError(client, 500, "meeting:ice 添加失败: "+err.Error())
+			h.sendChannelError(client, message.Channel, 500, "meeting:ice 添加失败: "+err.Error())
 			return
 		}
 		return
@@ -1660,11 +1666,11 @@ func (h *WebSocketHandler) handleMeetingICE(client *model.Client, message *model
 	// 订阅 PC 候选（to=发布者）
 	sub, ok := part.GetSubscriber(m.To)
 	if !ok {
-		h.sendError(client, 400, fmt.Sprintf("meeting:ice 未找到订阅 %s 的连接", m.To))
+		h.sendChannelError(client, message.Channel, 400, fmt.Sprintf("meeting:ice 未找到订阅 %s 的连接", m.To))
 		return
 	}
 	if err := sub.AddICECandidate(init); err != nil {
-		h.sendError(client, 500, "meeting:ice 添加失败: "+err.Error())
+		h.sendChannelError(client, message.Channel, 500, "meeting:ice 添加失败: "+err.Error())
 		return
 	}
 }
@@ -3674,6 +3680,27 @@ func (h *WebSocketHandler) sendError(client *model.Client, code int, message str
 
 	errorMsg := model.NewErrorMessage(code, message)
 	h.sendMessage(client, errorMsg)
+}
+
+// sendChannelError 发送带频道的错误消息，用于媒体信令（meeting:sdp / meeting:ice）。
+//
+// 与 sendError 的唯一区别是携带 channel：客户端据此把错误路由到正确的会话
+// （c_* 通话会话 vs 数字会议号会话），否则通话错误会被当成普通会议错误吞掉。
+func (h *WebSocketHandler) sendChannelError(client *model.Client, channel string, code int, message string) {
+	if channel == "" {
+		h.sendError(client, code, message)
+		return
+	}
+	if h.errorRateLimiter != nil && !h.errorRateLimiter.Allow(client.ID) {
+		return
+	}
+	logrus.WithFields(logrus.Fields{
+		"client_id": client.ID,
+		"channel":   channel,
+		"code":      code,
+		"message":   message,
+	}).Warn("发送错误消息（带频道）")
+	h.sendMessage(client, model.NewChannelErrorMessage(code, channel, message))
 }
 
 // sendFileTransferError 发送文件传输错误消息（使用"file:transfer:error"类型，客户端可识别）

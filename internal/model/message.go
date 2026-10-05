@@ -135,6 +135,18 @@ func NewErrorMessage(code int, message string) *WebSocketMessage {
 	}
 }
 
+// NewChannelErrorMessage 创建带频道的错误消息。
+//
+// 媒体信令（meeting:sdp / meeting:ice）的错误必须携带 channel，客户端才能按
+// 频道把错误路由到正确的会话（c_* 通话会话 vs 会议会话）。不带 channel 的
+// 错误会被客户端当成普通会议错误，在通话场景下被瞬时过滤规则吞掉，
+// 使「订阅被拒/ICE 找不到连接」静默丢失，只能白等看门狗超时。
+func NewChannelErrorMessage(code int, channel, message string) *WebSocketMessage {
+	msg := NewErrorMessage(code, message)
+	msg.Channel = channel
+	return msg
+}
+
 // NewClient 创建新客户端
 func NewClient(id, userID string, conn interface{}) *Client {
 	return NewClientWithIdentity(id, userID, userID, "", conn)

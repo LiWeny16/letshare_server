@@ -2,6 +2,7 @@ package sfu
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/pion/webrtc/v4"
 	log "github.com/sirupsen/logrus"
@@ -18,6 +19,7 @@ type trackFanout struct {
 	outputs map[string]*webrtc.TrackLocalStaticRTP
 	stop    chan struct{}
 	once    sync.Once
+	closed  atomic.Bool
 }
 
 func newTrackFanout(remote *webrtc.TrackRemote) *trackFanout {
@@ -30,14 +32,25 @@ func newTrackFanout(remote *webrtc.TrackRemote) *trackFanout {
 	return fanout
 }
 
-func (f *trackFanout) add(key string, local *webrtc.TrackLocalStaticRTP) {
+// add 把订阅者的本地转发轨登记到本 fanout。
+//
+// 返回 false 表示 fanout 已关闭（读取循环已退出），调用方必须放弃这条订阅：
+// 在停摆的 fanout 上登记 local track 会让订阅 PC 协商成功却永远收不到 RTP。
+func (f *trackFanout) add(key string, local *webrtc.TrackLocalStaticRTP) bool {
 	if local == nil || key == "" {
-		return
+		return false
 	}
 	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed.Load() {
+		return false
+	}
 	f.outputs[key] = local
-	f.mu.Unlock()
+	return true
 }
+
+// isClosed 报告 fanout 是否已关闭（其读取循环已退出，不再转发任何 RTP）。
+func (f *trackFanout) isClosed() bool { return f.closed.Load() }
 
 func (f *trackFanout) remove(key string) {
 	if key == "" {
@@ -50,6 +63,7 @@ func (f *trackFanout) remove(key string) {
 
 func (f *trackFanout) close() {
 	f.once.Do(func() {
+		f.closed.Store(true)
 		close(f.stop)
 		_ = f.remote.SetReadDeadline(noReadDeadline())
 	})
