@@ -35,6 +35,9 @@ type Participant struct {
 	subscriptionLocks map[string]*sync.Mutex // publisherID -> serialize concurrent subscription creation
 	closed            atomic.Bool
 
+	// connTrace 支撑断连因果链日志（上一状态 + 持续时长），固定大小不累积。
+	connTrace connStateTrace
+
 	onICECandidate func(*webrtc.ICECandidate)
 	pendingICE     []*webrtc.ICECandidate
 }
@@ -60,12 +63,7 @@ func (p *Participant) isCurrentPeerConnection(candidate *webrtc.PeerConnection) 
 // 所以这些回调必须同时绑定到新连接；旧连接关闭时也不能误关闭新连接。
 func (p *Participant) bindPeerConnection(pc *webrtc.PeerConnection) {
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		log.WithFields(log.Fields{
-			"sfu":           "participant",
-			"roomID":        p.room.ID,
-			"participantID": p.ID,
-			"state":         state.String(),
-		}).Debug("参与者的主连接状态变化")
+		p.logConnectionStateChange(pc, state)
 		if (state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed) && p.isCurrentPeerConnection(pc) {
 			_ = p.Close()
 		}

@@ -57,12 +57,7 @@ func (r *Room) AddParticipant(participantID string) (*Participant, error) {
 
 	// 监测连接态，异常仅记录并局部化，不影响房间其它参与者。
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		log.WithFields(log.Fields{
-			"sfu":           "participant",
-			"roomID":        r.ID,
-			"participantID": participantID,
-			"state":         state.String(),
-		}).Debug("参与者的主连接状态变化")
+		p.logConnectionStateChange(pc, state)
 		if (state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed) && p.isCurrentPeerConnection(pc) {
 			_ = p.Close()
 		}
