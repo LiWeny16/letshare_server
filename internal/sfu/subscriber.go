@@ -54,6 +54,9 @@ type Subscriber struct {
 
 	onICECandidate func(*webrtc.ICECandidate)
 	pendingICE     []*webrtc.ICECandidate
+
+	// connTrace 支撑订阅连接断连因果链日志（上一状态 + 持续时长），固定大小不累积。
+	connTrace connStateTrace
 }
 
 // Offer 返回需要信令给订阅者客户端的 SDP offer。

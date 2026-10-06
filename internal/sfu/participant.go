@@ -203,11 +203,6 @@ func (p *Participant) emitICECandidate(c *webrtc.ICECandidate) {
 	}
 }
 
-// OnConnectionStateChange 注册连接态变化回调。
-func (p *Participant) OnConnectionStateChange(cb func(webrtc.PeerConnectionState)) {
-	p.currentPeerConnection().OnConnectionStateChange(cb)
-}
-
 // ConnectionState 返回主连接的 PeerConnection 状态（供测试 / 监控使用）。
 func (p *Participant) ConnectionState() webrtc.PeerConnectionState {
 	return p.currentPeerConnection().ConnectionState()
@@ -383,7 +378,10 @@ func (p *Participant) buildSubscriber(pub *Participant) (*Subscriber, error) {
 		stop:           make(chan struct{}),
 	}
 
+	// F16 已消灭：不再暴露透传到 Pion 单槽 handler 的导出方法；订阅侧观测（含 publisherID）见 diagnostics_subscriber.go。
+	log.WithFields(log.Fields{"sfu": "subscriber", "roomID": p.roomIDForLog(), "participantID": p.ID, "publisherID": pub.ID}).Info("订阅连接已创建") // 观测：创建态日志，堵住订阅 PC 停在 new 的零日志盲区
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		sub.logConnectionStateChange(pc, state)
 		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed {
 			_ = sub.Close()
 		}

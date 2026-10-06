@@ -3,8 +3,8 @@ package sfu
 import (
 	"sync"
 
-	log "github.com/sirupsen/logrus"
 	"github.com/pion/webrtc/v4"
+	log "github.com/sirupsen/logrus"
 )
 
 // Manager 按 roomID 管理多个 Room，是 SFU 的顶层入口。
@@ -68,8 +68,19 @@ func (m *Manager) GetRoom(roomID string) (*Room, bool) {
 	return r, ok
 }
 
-// RemoveRoom 移除并关闭指定 Room。不存在时静默返回。
+// RemoveRoom 移除并关闭指定 Room。不存在时静默返回。拆除原因未知时的兼容入口。
+// 当前零调用（生产路径一律走 RemoveRoomWithReason）：保留作兼容入口，勿删。
 func (m *Manager) RemoveRoom(roomID string) {
+	m.removeRoom(roomID, "unspecified")
+}
+
+// RemoveRoomWithReason 与 RemoveRoom 等价，但把拆除原因带进
+// "SFU 房间已关闭" 日志（纯观测扩展）。
+func (m *Manager) RemoveRoomWithReason(roomID, reason string) {
+	m.removeRoom(roomID, reason)
+}
+
+func (m *Manager) removeRoom(roomID, reason string) {
 	m.mu.Lock()
 	r, ok := m.rooms[roomID]
 	if ok {
@@ -77,7 +88,7 @@ func (m *Manager) RemoveRoom(roomID string) {
 	}
 	m.mu.Unlock()
 	if ok && r != nil {
-		_ = r.Close()
+		_ = r.closeWithReason(reason)
 	}
 }
 

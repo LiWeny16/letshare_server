@@ -157,8 +157,15 @@ func (r *Room) Count() int {
 	return len(r.participants)
 }
 
-// Close 关闭房间及其所有参与者的 PeerConnection。
+// Close 关闭房间及其所有参与者的 PeerConnection。拆除原因未知时的兼容入口。
+// 当前生产零调用（仅存量测试在用；生产路径一律走 closeWithReason / RemoveRoomWithReason）：保留作兼容入口，勿删。
 func (r *Room) Close() error {
+	return r.closeWithReason("unspecified")
+}
+
+// closeWithReason 与 Close 行为完全一致，但把拆除原因带进
+// "SFU 房间已关闭" 日志（V0.1 归因缺口①：此前 Info 不带 reason）。
+func (r *Room) closeWithReason(reason string) error {
 	if !r.closed.CompareAndSwap(false, true) {
 		return nil
 	}
@@ -172,7 +179,10 @@ func (r *Room) Close() error {
 	for _, p := range parts {
 		_ = p.Close()
 	}
-	log.WithField("roomID", r.ID).Info("SFU 房间已关闭")
+	log.WithFields(log.Fields{
+		"roomID": r.ID,
+		"reason": reason,
+	}).Info("SFU 房间已关闭")
 	return nil
 }
 
