@@ -240,9 +240,7 @@ func TestMeetingHostLeaveTransfersHostAndPreservesMeeting(t *testing.T) {
 }
 
 func TestMeetingUnexpectedLastDisconnectHasReconnectGrace(t *testing.T) {
-	oldGrace := hostLeaveGrace
-	hostLeaveGrace = 500 * time.Millisecond
-	t.Cleanup(func() { hostLeaveGrace = oldGrace })
+	injectMeetingGrace(t, 500*time.Millisecond)
 
 	ts := newMeetingTestServer(t)
 	defer ts.Close()

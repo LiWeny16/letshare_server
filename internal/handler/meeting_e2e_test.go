@@ -64,7 +64,7 @@ func newMeetingTestServer(t *testing.T) *meetingTestServer {
 
 		go func() {
 			defer func() {
-				recover()
+				serverPanics.record(ts, recover())
 				conn.Close()
 				wsService.RemoveClient(client.ID)
 				ts.handler.cleanupMeetingState(client)

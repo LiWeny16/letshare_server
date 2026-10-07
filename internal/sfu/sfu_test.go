@@ -296,7 +296,7 @@ func TestParticipantIsolation(t *testing.T) {
 	}
 
 	// 关闭 A，模拟其不可用
-	if err := room.RemoveParticipant("A"); err != nil {
+	if err := room.RemoveParticipant("A", "test-teardown"); err != nil {
 		t.Fatalf("RemoveParticipant(A) 失败: %v", err)
 	}
 	if _, ok := room.GetParticipant("A"); ok {

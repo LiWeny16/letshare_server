@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"letshare-server/internal/meeting"
 	"letshare-server/internal/model"
 	"letshare-server/internal/service"
 	"letshare-server/internal/sfu"
@@ -128,21 +129,29 @@ type WebSocketHandler struct {
 	meetingLifecycleMu sync.Mutex
 }
 
-// meetingMeta 会议元数据：房主权威 + breakout 父子关系 + 房主断线宽限定时器。
+// meetingMeta 会议元数据：房主权威 + breakout 父子关系 + 空置宽限定时器 + 相位状态机。
 // 挂在 activeMeetingRooms 的 value 上（指针），自身细粒度加锁，避免全局锁竞争。
 type meetingMeta struct {
 	// BreakoutMembers is immutable after child-room creation and restricts
 	// direct joins to users explicitly assigned by the host.
-	BreakoutMembers   map[string]bool
-	Host              string // 房主 UserID（uniqId）
-	HostClientID      string // websocket session that owns the host lifecycle
-	SourceRoom        string // original LetShare room used for presence snapshots
-	Title             string // 会议标题（可选，≤64 字）
-	Parent            string // breakout 房间指向主会议号；主会议为空
-	mu                sync.Mutex
-	endTimer          *time.Timer // 房主断线宽限期后自动结束会议（刷新场景由重入取消）
-	reservationTimer  *time.Timer
-	joined            bool
+	BreakoutMembers map[string]bool
+	// hostMu 仅保护 Host / HostClientID（房主席位）。与 meta.mu 的锁序恒为 meta.mu → hostMu，
+	// 因此 isMeetingHost 可在 presentation 等 meta.mu 临界区内安全调用（不会自锁）。
+	hostMu       sync.Mutex
+	Host         string // 房主 UserID（uniqId）
+	HostClientID string // websocket session that owns the host lifecycle
+	SourceRoom   string // original LetShare room used for presence snapshots
+	Title        string // 会议标题（可选，≤64 字）
+	Parent       string // breakout 房间指向主会议号；主会议为空
+	mu           sync.Mutex
+	// emptyTimer 会议唯一的空置宽限定时器（D1 一个概念一个计时器；DIVERGENCE F10 的
+	// 两定时器守卫对齐即出在此）。由 meetingLifecycleMu 保护：PhaseReserved 武装
+	// meetingReservationTTL，PhaseGrace 重新武装 meetingGrace，成员加入（PhaseLive）停表。
+	emptyTimer *time.Timer
+	emptyGen   uint64 // 递增代次：已被替换/停掉的陈旧回调据此作废，不得拆除新计时器保护的会议
+	// life 相位状态机（reserved/live/grace/ended），唯一写者 internal/meeting（A1/A2），
+	// 唯一构造入口 newMeetingMeta（防「生产漏字段 / 测试接缝补齐」分叉）。
+	life              *meeting.Machine
 	presentation      meetingPresentationState
 	excalidraw        meetingExcalidrawState
 	minutes           meetingMinutesState
@@ -245,12 +254,27 @@ const meetingExcalidrawOperationCacheSize = 2048
 
 const meetingChatHistoryMax = 200
 
-// hostLeaveGrace 房主意外断线（刷新/网络抖动）后等待其重入的宽限期。
-// 到点仍未回到房间则结束会议并释放资源，防止僵尸会议占用会议号与 SFU 内存。
-// hostLeaveGrace is deliberately long enough to cover a mobile Wi-Fi handoff,
-// browser background resume, or a short reconnect storm. An explicit leave is
-// still immediate; this grace only applies to an unexpected transport loss.
-var hostLeaveGrace = 2 * time.Minute
+// meetingClockMu 串行化 TTL 的注入与读取：测试的时钟注入与后台定时器/异步清理的读取
+// 若不互斥即构成数据竞态（-race 实测）；var 存储保留以便注入，读写一律走下方方法。
+var meetingClockMu sync.Mutex
+
+// meetingGrace 空置宽限期（PhaseGrace TTL）：在册成员清零后（无论显式离开还是断线）
+// 等待重入的宽限窗口。到点仍空则 End，房间非空则重排下一次（C-19 / DIVERGENCE F10）。
+// 5 分钟覆盖移动网络切换、浏览器后台恢复、重连风暴等真实重入窗口
+// （V1 起取代 hostLeaveGrace 的 2 分钟：最后一个成员显式离开也不再立即回收会议号）。
+var meetingGrace = 5 * time.Minute
+
+func currentMeetingGrace() time.Duration {
+	meetingClockMu.Lock()
+	defer meetingClockMu.Unlock()
+	return meetingGrace
+}
+
+func currentMeetingReservationTTL() time.Duration {
+	meetingClockMu.Lock()
+	defer meetingClockMu.Unlock()
+	return meetingReservationTTL
+}
 
 // meetingReservationTTL bounds a created-but-never-joined meeting. Once a
 // participant joins, the reservation timer is stopped and normal meeting
@@ -821,29 +845,29 @@ func (h *WebSocketHandler) handleCallSFUJoin(client *model.Client, message *mode
 	}
 
 	h.meetingLifecycleMu.Lock()
-	defer h.meetingLifecycleMu.Unlock()
 	v, loaded := h.activeMeetingRooms.Load(roomID)
 	if !loaded {
-		meta := &meetingMeta{
+		meta := newMeetingMeta(meetingMetaInit{
 			Host:         client.UniqID,
 			HostClientID: client.ID,
 			SourceRoom:   strings.TrimSpace(joinData.SourceRoom),
-			joined:       true,
-			minutes:      meetingMinutesState{RequireConsent: true},
-		}
+		})
 		v = meta
 		h.activeMeetingRooms.Store(roomID, meta)
 	}
 	if meta, ok := v.(*meetingMeta); !ok || meta == nil {
+		h.meetingLifecycleMu.Unlock()
 		h.sendError(client, 500, "call:sfu:join 鎴块棿鐘舵€佹棤鏁堢殑")
 		return
 	}
 	if room, ok := h.sfuManager.GetRoom(roomID); ok && room.Count() >= 2 {
 		if _, alreadyJoined := room.GetParticipant(client.UniqID); !alreadyJoined {
+			h.meetingLifecycleMu.Unlock()
 			h.sendError(client, 409, "call:sfu:join 閫氳瘽鎴块棿宸叉弧")
 			return
 		}
 	}
+	h.meetingLifecycleMu.Unlock() // 信令锁不得跨入 handleMeetingJoin（join 内部要取同一把锁）
 
 	// Existing meeting handlers own participant registration, membership
 	// snapshots, SFU track reconciliation, SDP, ICE and cleanup.
@@ -874,12 +898,11 @@ func (h *WebSocketHandler) handleMeetingCreate(client *model.Client, message *mo
 	var meta *meetingMeta
 	for i := 0; i < 10000; i++ {
 		candidate := fmt.Sprintf("%04d", rand.Intn(10000))
-		candidateMeta := &meetingMeta{
+		candidateMeta := newMeetingMeta(meetingMetaInit{
 			Host:         client.UniqID,
 			HostClientID: client.ID,
 			Title:        title,
-			minutes:      meetingMinutesState{RequireConsent: true},
-		}
+		})
 		if _, loaded := h.activeMeetingRooms.LoadOrStore(candidate, candidateMeta); !loaded {
 			roomID = candidate
 			meta = candidateMeta
@@ -887,9 +910,8 @@ func (h *WebSocketHandler) handleMeetingCreate(client *model.Client, message *mo
 		}
 	}
 	if meta != nil {
-		meta.reservationTimer = time.AfterFunc(meetingReservationTTL, func() {
-			h.expireMeetingReservation(roomID, meta)
-		})
+		h.armEmptyTimerLocked(roomID, meta, currentMeetingReservationTTL())
+		logMeetingPhase("", meeting.PhaseReserved.String(), meetingEndReasonMeetingCreated, logrus.Fields{"roomID": roomID, "host": client.UniqID, "clientID": client.ID})
 	}
 	h.meetingLifecycleMu.Unlock()
 	if roomID == "" {
@@ -990,35 +1012,13 @@ func (h *WebSocketHandler) handleMeetingJoin(client *model.Client, message *mode
 		h.sendError(client, 403, "breakout 房间仅允许受邀成员加入")
 		return
 	}
-	// 任何成员成功加入都取消挂起的自动结束定时器（宽限期语义：空房等待重入）。
+	// 成员加入 = PhaseLive 停表：取消挂起的空置宽限定时器（宽限期语义：空房等待重入）。
+	// 相位跃迁与拆除互斥于 meetingLifecycleMu：陈旧的宽限回调不得拆掉正在加入的会议（C-17）。
 	if meta != nil {
-		meta.mu.Lock()
-		current, registered := h.activeMeetingRooms.Load(message.Channel)
-		if !registered || current != meta {
-			meta.mu.Unlock()
+		if !h.enterMeetingLive(message.Channel, uniqID, client.ID, sourceRoom, meta) {
 			h.sendError(client, 404, "会议不存在")
 			return
 		}
-		if meta.endTimer != nil {
-			meta.endTimer.Stop()
-			meta.endTimer = nil
-		}
-		if meta.reservationTimer != nil {
-			meta.reservationTimer.Stop()
-			meta.reservationTimer = nil
-		}
-		// A browser reconnect creates a new websocket client session. Keep the
-		// host recipient bound to the current meeting connection; otherwise
-		// host-only planes (minutes batches, summaries and control messages)
-		// continue targeting the stale pre-reconnect client.
-		if meta.Host == uniqID {
-			meta.HostClientID = client.ID
-		}
-		if meta.SourceRoom == "" && meta.Host == client.UniqID && sourceRoom != "" && h.wsService.RoomHasUniqID(sourceRoom, client.UniqID) {
-			meta.SourceRoom = sourceRoom
-		}
-		meta.joined = true
-		meta.mu.Unlock()
 	}
 	room := h.sfuManager.JoinRoom(message.Channel)
 	// 发布者中途新增 track（屏幕共享等）→ 通知所有已订阅者重协商
@@ -1026,13 +1026,13 @@ func (h *WebSocketHandler) handleMeetingJoin(client *model.Client, message *mode
 	// 幂等：已存在则不重复建 PC
 	if owner, joined := h.meetings.clientForUniqID(message.Channel, uniqID); joined && owner != client.ID {
 		h.releaseMeetingPresentation(message.Channel, uniqID)
-		_ = room.RemoveParticipant(uniqID)
+		_ = room.RemoveParticipant(uniqID, "meeting-rebind")
 	}
 	// 已关闭的参与者（PC failed/closed）必须显式摘除后才能重建：它的 fanout 已停摆，
 	// 若复用，重连方会拿到一个「已关闭」的 participant，发布 offer 被拒、订阅绑到死轨，
 	// 永远无法恢复（表现为接通方一直听不到对端、重连后仍静音直到挂断）。
 	if stale, ok := room.GetParticipant(uniqID); ok && stale.IsClosed() {
-		_ = room.RemoveParticipant(uniqID)
+		_ = room.RemoveParticipant(uniqID, "meeting-stale-closed")
 	}
 	if existing, ok := room.GetParticipant(uniqID); ok && !existing.IsClosed() {
 		_, previous := h.meetings.join(message.Channel, uniqID, userName, client.ID)
@@ -1048,6 +1048,10 @@ func (h *WebSocketHandler) handleMeetingJoin(client *model.Client, message *mode
 	p, err := room.AddParticipant(uniqID)
 	if err != nil {
 		h.sendError(client, 500, "meeting:join 失败: "+err.Error())
+		// R2：失败出口也必须排下一次 —— 若此失败把会议留在无人状态，退回 PhaseGrace。
+		h.enterMeetingGrace(message.Channel, meetingEndReasonGraceArmed, logrus.Fields{
+			"trigger": "join-failed", "uniqID": uniqID, "clientID": client.ID,
+		})
 		return
 	}
 	// 接入该参与者发布 PC 的本地候选，定向回发给客户端
@@ -1116,7 +1120,7 @@ func (h *WebSocketHandler) meetingPresenceSnapshot(sourceRoom string) map[string
 			return true
 		}
 		meta.mu.Lock()
-		active := meta.joined && meta.SourceRoom == sourceRoom
+		active := meta.life.Phase() == meeting.PhaseLive && meta.SourceRoom == sourceRoom
 		meta.mu.Unlock()
 		if !active {
 			return true
@@ -1253,15 +1257,15 @@ func (h *WebSocketHandler) setMeetingHost(roomID, hostID, trigger string) bool {
 	if !found {
 		return false
 	}
-	meta.mu.Lock()
+	meta.hostMu.Lock()
 	if meta.Host == next.UniqID && meta.HostClientID == next.ClientID {
-		meta.mu.Unlock()
+		meta.hostMu.Unlock()
 		return true
 	}
 	prevHost, prevHostClient := meta.Host, meta.HostClientID
 	meta.Host = next.UniqID
 	meta.HostClientID = next.ClientID
-	meta.mu.Unlock()
+	meta.hostMu.Unlock()
 
 	// 观测：房主变更落日志（旧房主/新房主/触发原因），纯日志不参与控制流。
 	// 字段快照由纯函数 meetingHostChangeFields 构造；members 快照仍在同一时点读取。
@@ -1292,9 +1296,9 @@ func (h *WebSocketHandler) transferMeetingHost(roomID, leavingUniqID string) {
 	}
 	next := remaining[0]
 
-	meta.mu.Lock()
+	meta.hostMu.Lock()
 	isLeavingHost := meta.Host == leavingUniqID
-	meta.mu.Unlock()
+	meta.hostMu.Unlock()
 	if !isLeavingHost {
 		return
 	}
@@ -1302,14 +1306,14 @@ func (h *WebSocketHandler) transferMeetingHost(roomID, leavingUniqID string) {
 }
 
 // finishMeetingMemberLeave applies the authoritative cleanup path for both an
-// explicit leave and an unexpected websocket disconnect. The distinction is
-// important when this was the last participant: an explicit leave means the
-// meeting is over, while a transport loss keeps the meeting recoverable during
-// hostLeaveGrace.
+// explicit leave and an unexpected websocket disconnect. Since V1 both are
+// recoverable: the last member leaving empties the meeting into PhaseGrace
+// (emptyTimer re-armed), never an immediate teardown —— 会议号必须存活，
+// 重入必须成功（C-17/C-20）。room 为 nil（SFU 房间已不在）时同样必须留痕并走完判定。
 func (h *WebSocketHandler) finishMeetingMemberLeave(roomID string, member meetingMembership, clientID string, room *sfu.Room, explicitLeave bool) {
 	h.releaseMeetingPresentation(roomID, member.UniqID)
 	if room != nil {
-		_ = room.RemoveParticipant(member.UniqID)
+		_ = room.RemoveParticipant(member.UniqID, "meeting-member-leave")
 	}
 	h.broadcastMeetingMembership(roomID, "leave", member.UniqID, clientID)
 
@@ -1324,15 +1328,18 @@ func (h *WebSocketHandler) finishMeetingMemberLeave(roomID string, member meetin
 		"explicit_leave":    explicitLeave,
 		"members_remaining": membersRemaining,
 		"room_empty":        membersRemaining == 0,
+		"sfu_room_missing":  room == nil,
 	}
 	if membersRemaining == 0 {
+		// D4 核心修复：最后一个成员显式离开也不再立即回收会议号，一律进入 PhaseGrace。
+		reason := meetingEndReasonGraceArmed
 		if explicitLeave {
-			logMeetingEnd(meetingEndReasonLastMemberLeft, meetingActionDecision, leaveCtx)
-			h.teardownMeeting(roomID, false, meetingEndReasonLastMemberLeft)
-		} else {
-			leaveCtx["grace_ms"] = hostLeaveGrace.Milliseconds()
-			logMeetingEnd(meetingEndReasonGraceArmed, meetingActionScheduleGrace, leaveCtx)
-			h.scheduleMeetingEnd(roomID)
+			reason = meetingEndReasonLastMemberLeft
+		}
+		leaveCtx["grace_ms"] = currentMeetingGrace().Milliseconds()
+		if !h.enterMeetingGrace(roomID, reason, leaveCtx) {
+			// 与并发 join/End 竞争失败：按普通成员离场留痕，不得静默（P3）。
+			logMeetingEnd(meetingEndReasonMemberLeft, meetingActionMemberRemoved, leaveCtx)
 		}
 		return
 	}
@@ -1350,9 +1357,11 @@ func (h *WebSocketHandler) sendMeetingInfo(roomID, userID string, meta *meetingM
 	excalidrawRevision := meta.excalidraw.Revision
 	minutes := meta.minutes
 	minutes.Consented = nil
-	host := meta.Host
 	title := meta.Title
 	meta.mu.Unlock()
+	meta.hostMu.Lock()
+	host := meta.Host
+	meta.hostMu.Unlock()
 	h.sendMeetingToUser(roomID, userID, model.MessageTypeMeetingInfo, map[string]interface{}{
 		"roomId": roomID, "host": host, "title": title, "minutes": minutes,
 		"joined": true, "presentation": presentation,
@@ -1369,7 +1378,8 @@ func (h *WebSocketHandler) handleMeetingLeave(client *model.Client, message *mod
 	if roomName == "" {
 		return
 	}
-	// 房主显式离开 = 结束会议（无主机转移机制，避免留下无人管控的僵尸会议）。
+	// 显式离开：清空会议则进入 PhaseGrace 等待重入（V1 起不立即释放会议号）；
+	// 仍有成员则转移房主，会议继续。
 	member, left := h.meetings.leave(roomName, client.UniqID, client.ID)
 	if !left {
 		return
@@ -1378,102 +1388,67 @@ func (h *WebSocketHandler) handleMeetingLeave(client *model.Client, message *mod
 	h.finishMeetingMemberLeave(roomName, member, client.ID, room, true)
 }
 
-// endMeetingRoom 房主主动结束会议：通知房间内所有成员 + 级联拆除 breakout 子房间 + 释放资源。
-// reason 是广播给客户端的协议原因（语义不可改）；服务端日志另记稳定枚举 reason。
-func (h *WebSocketHandler) endMeetingRoom(roomID, reason string) {
-	// 观测：reason 此前只广播给客户端、不落服务端日志（事故复盘只能翻客户端日志）。
-	room, roomExists := h.sfuManager.GetRoom(roomID)
-	membersRemaining := 0
-	if roomExists {
-		membersRemaining = room.Count()
+// endMeetingRoom 客户端协议 reason（"timeout"/"host-ended"）→ 服务端稳定枚举 → End。
+// 广播（含协议 reason 字符串）由 End 统一发出；本函数只做协议映射（D3）。
+func (h *WebSocketHandler) endMeetingRoom(roomID, reason string, ctx logrus.Fields) {
+	if ctx == nil {
+		ctx = logrus.Fields{}
 	}
-	logMeetingEnd(meetingEndReasonFromClientReason(reason), meetingActionDecision, logrus.Fields{
-		"roomID":            roomID,
-		"client_reason":     reason,
-		"members_remaining": membersRemaining,
-		"room_empty":        membersRemaining == 0,
-	})
-	if roomExists && membersRemaining > 0 {
-		h.broadcastMeetingMembers(roomID, room, model.MessageTypeMeetingEnded, map[string]interface{}{
-			"roomId": roomID, "reason": reason,
-		}, "")
-	}
-	h.teardownMeeting(roomID, true, meetingEndReasonFromClientReason(reason))
+	ctx["client_reason"] = reason
+	h.End(roomID, meetingEndReasonFromClientReason(reason), ctx)
 }
 
-// teardownMeeting 拆除一个会议房间：停宽限定时器、关 SFU 房间（关闭所有 PC）、
-// 释放会议号，并级联拆除其 breakout 子房间。
-func (h *WebSocketHandler) teardownMeeting(roomID string, notify bool, reason string) {
+// End 会议拆除的唯一入口（ARCHITECTURE §4.6 / C-18 幂等）：停表 · 置 PhaseEnded ·
+// 通知成员 · RemoveRoomWithReason · meetings.clear · 级联拆除 breakout · 释放会议号。
+// 已是 PhaseEnded 或登记已释放时直接返回，不产生第二次副作用。ctx 携带触发上下文。
+func (h *WebSocketHandler) End(roomID, reason string, ctx ...logrus.Fields) {
 	h.meetingLifecycleMu.Lock()
 	defer h.meetingLifecycleMu.Unlock()
-	h.teardownMeetingLocked(roomID, notify, reason)
+	var extra logrus.Fields
+	if len(ctx) > 0 {
+		extra = ctx[0]
+	}
+	h.endMeetingLocked(roomID, reason, extra)
 }
 
-func (h *WebSocketHandler) teardownMeetingLocked(roomID string, notify bool, reason string) {
+func (h *WebSocketHandler) endMeetingLocked(roomID, reason string, ctx logrus.Fields) {
+	v, loaded := h.activeMeetingRooms.Load(roomID)
+	if !loaded {
+		return // C-18 幂等：登记已释放，不产生第二次副作用
+	}
+	meta, _ := v.(*meetingMeta)
+	if meta == nil || !meta.life.End() {
+		return // C-18 幂等：已是 PhaseEnded，不产生第二次副作用
+	}
 	// 观测快照（纯读取）：拆除前还剩多少成员、父房间是谁。
+	parentRoomID := meta.Parent
 	membersRemaining := len(h.meetings.members(roomID))
-	parentRoomID := ""
-	v, loaded := h.activeMeetingRooms.LoadAndDelete(roomID)
-	if loaded {
-		if meta, _ := v.(*meetingMeta); meta != nil {
-			parentRoomID = meta.Parent
-			meta.mu.Lock()
-			if meta.endTimer != nil {
-				meta.endTimer.Stop()
-				meta.endTimer = nil
-			}
-			if meta.reservationTimer != nil {
-				meta.reservationTimer.Stop()
-				meta.reservationTimer = nil
-			}
-			if meta.minutesFlushTimer != nil {
-				meta.minutesFlushTimer.Stop()
-				meta.minutesFlushTimer = nil
-			}
-			meta.minutesPending = nil
-			meta.mu.Unlock()
-		}
+	h.stopEmptyTimerLocked(meta)
+	meta.mu.Lock()
+	if meta.minutesFlushTimer != nil {
+		meta.minutesFlushTimer.Stop()
+		meta.minutesFlushTimer = nil
 	}
-	if notify {
-		if room, ok := h.sfuManager.GetRoom(roomID); ok && room.Count() > 0 {
-			h.broadcastMeetingMembers(roomID, room, model.MessageTypeMeetingEnded, map[string]interface{}{
-				"roomId": roomID, "reason": "ended",
-			}, "")
-		}
+	meta.minutesPending = nil
+	meta.mu.Unlock()
+	clientReason := meetingClientReasonForEnd(reason)
+	if clientReason != "" {
+		h.broadcastMeetingMembers(roomID, nil, model.MessageTypeMeetingEnded, map[string]interface{}{
+			"roomId": roomID, "reason": clientReason,
+		}, "")
 	}
+	h.activeMeetingRooms.Delete(roomID) // 释放会议号
 	h.sfuManager.RemoveRoomWithReason(roomID, reason)
 	h.meetings.clear(roomID)
-	// 观测：「会议没了」的权威记录——拆除确实发生了，带 reason 与拆除前上下文。
-	logMeetingTeardown(reason, roomID, parentRoomID, notify, loaded, membersRemaining)
+	// 观测：「会议没了」的权威记录 —— 每次 End 恰好一条 action=teardown。
+	logMeetingTeardown(reason, roomID, parentRoomID, clientReason != "", loaded, membersRemaining, ctx)
 	// 级联：拆除以本房间为父的 breakout 房间（递归深度恒为 1，Parent 指向主会议号）。
 	h.activeMeetingRooms.Range(func(key, value any) bool {
-		if meta, ok := value.(*meetingMeta); ok && meta.Parent == roomID {
-			h.teardownMeetingLocked(key.(string), notify, meetingEndReasonParentTeardown)
+		if child, ok := value.(*meetingMeta); ok && child.Parent == roomID {
+			h.endMeetingLocked(key.(string), meetingEndReasonParentTeardown, nil)
 		}
 		return true
 	})
-}
-
-// expireMeetingReservation releases a created meeting that never reached
-// meeting:join. The lifecycle lock prevents a four-digit room ID from being
-// reused between the identity check and teardown.
-func (h *WebSocketHandler) expireMeetingReservation(roomID string, expected *meetingMeta) {
-	h.meetingLifecycleMu.Lock()
-	defer h.meetingLifecycleMu.Unlock()
-
-	current, ok := h.activeMeetingRooms.Load(roomID)
-	if !ok || current != expected {
-		return
-	}
-	expected.mu.Lock()
-	if expected.joined || expected.reservationTimer == nil {
-		expected.mu.Unlock()
-		return
-	}
-	expected.reservationTimer = nil
-	expected.mu.Unlock()
-
-	h.teardownMeetingLocked(roomID, false, meetingEndReasonReservationExpired)
 }
 
 // hasRegistered 判断会议号是否仍登记（不区分 SFU 房间是否已建）。
@@ -1483,19 +1458,26 @@ func (h *WebSocketHandler) hasRegistered(roomID string) bool {
 }
 
 func (h *WebSocketHandler) isMeetingHost(roomID string, client *model.Client, meta *meetingMeta) bool {
-	if meta == nil || client == nil || meta.Host != client.UniqID {
+	if meta == nil || client == nil {
+		return false
+	}
+	meta.hostMu.Lock()
+	isHostOwner := meta.Host == client.UniqID
+	hostClientID := meta.HostClientID
+	meta.hostMu.Unlock()
+	if !isHostOwner {
 		return false
 	}
 	if owner, joined := h.meetings.clientForUniqID(roomID, client.UniqID); joined {
 		return owner == client.ID
 	}
-	return meta.HostClientID == client.ID
+	return hostClientID == client.ID
 }
 
 // cleanupMeetingState 客户端断线后的会议侧清理：
-//  1. 从所有 SFU 房间移除其参与者；房间变空则启动宽限定时（重入即取消），不立即回收——
+//  1. 从所有 SFU 房间移除其参与者；房间变空则进入 PhaseGrace（重入即停表），不立即回收——
 //     正常流程"创建→路由跳转(WS 弹跳)→join"依赖这一点。
-//  2. 房主登记了会议但从未进入（无 SFU 房间）：同样宽限后回收，防"创建即泄漏"。
+//  2. 房主登记了会议但从未进入（PhaseReserved）：同样进入宽限后回收，防"创建即泄漏"。
 func (h *WebSocketHandler) cleanupMeetingState(client *model.Client) {
 	if client == nil {
 		return
@@ -1510,71 +1492,36 @@ func (h *WebSocketHandler) cleanupMeetingState(client *model.Client) {
 func (h *WebSocketHandler) cleanupMeetingClientID(clientID string) {
 	removed := h.meetings.leaveClient(clientID)
 	for _, member := range removed {
-		roomID := member.RoomID
-		room, ok := h.sfuManager.GetRoom(roomID)
-		if !ok {
-			continue
-		}
-		h.finishMeetingMemberLeave(roomID, member, clientID, room, false)
+		// V0.1 无痕点②：SFU 房间已不在时成员级离场也必须留痕并走完生命周期判定。
+		room, _ := h.sfuManager.GetRoom(member.RoomID)
+		h.finishMeetingMemberLeave(member.RoomID, member, clientID, room, false)
 	}
-	// 登记但从未进入的会议（房主断线）：宽限后回收。
+	// 登记但从未进入的会议（房主断线）：进入 PhaseGrace，宽限后回收。
 	h.activeMeetingRooms.Range(func(key, value any) bool {
 		roomID, _ := key.(string)
 		meta, ok := value.(*meetingMeta)
-		if !ok || meta.HostClientID != clientID || meta.Parent != "" {
+		if !ok {
 			return true
 		}
-		if _, roomExists := h.sfuManager.GetRoom(roomID); !roomExists {
-			// 观测：房主登记了会议但从未进入就断线 → 宽限后回收（决策点留痕）。
-			logMeetingEnd(meetingEndReasonGraceArmed, meetingActionScheduleGrace, logrus.Fields{
-				"roomID":         roomID,
-				"trigger":        "host-never-joined",
-				"grace_ms":       hostLeaveGrace.Milliseconds(),
-				"room_empty":     true,
-				"explicit_leave": false,
-			})
-			h.scheduleMeetingEnd(roomID)
+		meta.hostMu.Lock()
+		skip := meta.HostClientID != clientID || meta.Parent != ""
+		meta.hostMu.Unlock()
+		if skip {
+			return true
 		}
+		if meta.life.Phase() != meeting.PhaseReserved {
+			return true // 已进入正常生命周期：宽限由「成员清零」路径武装
+		}
+		// 观测：房主登记了会议但从未进入就断线 → 进入宽限（决策点留痕）。
+		h.enterMeetingGrace(roomID, meetingEndReasonGraceArmed, logrus.Fields{
+			"roomID":         roomID,
+			"trigger":        "host-never-joined",
+			"grace_ms":       currentMeetingGrace().Milliseconds(),
+			"room_empty":     true,
+			"explicit_leave": false,
+		})
 		return true
 	})
-}
-
-// scheduleMeetingEnd 为会议安排宽限期后自动结束：到点时若房间已有成员（重入）则跳过，
-// 否则通知+拆除+释放会议号。幂等：已有定时器时不重复安排。
-func (h *WebSocketHandler) scheduleMeetingEnd(roomID string) {
-	v, ok := h.activeMeetingRooms.Load(roomID)
-	if !ok {
-		return
-	}
-	meta, _ := v.(*meetingMeta)
-	if meta == nil {
-		return
-	}
-	meta.mu.Lock()
-	if meta.endTimer == nil {
-		meta.endTimer = time.AfterFunc(hostLeaveGrace, func() {
-			if room, ok := h.sfuManager.GetRoom(roomID); ok && room.Count() > 0 {
-				// F10 现场：宽限到点但房间非空 → 会议继续，此前完全静默。
-				// 「决策了但不动作」的分支同样必须留痕。
-				logMeetingEnd(meetingEndReasonGraceSkipped, meetingActionSkip, logrus.Fields{
-					"roomID":            roomID,
-					"grace_expired":     true,
-					"room_empty":        false,
-					"members_remaining": room.Count(),
-					"grace_ms":          hostLeaveGrace.Milliseconds(),
-				})
-				return // 有人重入，会议继续
-			}
-			logMeetingEnd(meetingEndReasonGraceExpired, meetingActionDecision, logrus.Fields{
-				"roomID":        roomID,
-				"grace_expired": true,
-				"room_empty":    true,
-				"grace_ms":      hostLeaveGrace.Milliseconds(),
-			})
-			h.endMeetingRoom(roomID, "timeout")
-		})
-	}
-	meta.mu.Unlock()
 }
 
 func (h *WebSocketHandler) handleMeetingSDP(client *model.Client, message *model.WebSocketMessage) {
@@ -1882,14 +1829,11 @@ func (h *WebSocketHandler) handleMeetingEnd(client *model.Client, message *model
 		h.sendError(client, 403, "仅房主可结束会议")
 		return
 	}
-	// 观测：谁触发了终止（房主显式结束会议）。
-	logMeetingEnd(meetingEndReasonHostEnded, meetingActionDecision, logrus.Fields{
-		"roomID":  roomID,
+	h.endMeetingRoom(roomID, "host-ended", logrus.Fields{
 		"by":      client.UniqID,
 		"is_host": true,
 		"trigger": "host-end-request",
 	})
-	h.endMeetingRoom(roomID, "host-ended")
 }
 
 // handleMeetingKick 房主移出成员：目标收到定向 meeting:kicked，其余成员经成员表更新感知。
@@ -1916,7 +1860,7 @@ func (h *WebSocketHandler) handleMeetingKick(client *model.Client, message *mode
 		h.sendError(client, 403, "仅房主可移出成员")
 		return
 	}
-	if m.To == client.UniqID || m.To == meta.Host {
+	if m.To == client.UniqID || m.To == h.meetingHostUniqID(roomID) {
 		h.sendError(client, 400, "不能移出房主")
 		return
 	}
@@ -1933,9 +1877,13 @@ func (h *WebSocketHandler) handleMeetingKick(client *model.Client, message *mode
 	// 从 SFU 房间移除（断其上下行媒体）
 	if room, ok := h.sfuManager.GetRoom(roomID); ok {
 		h.releaseMeetingPresentation(roomID, m.To)
-		_ = room.RemoveParticipant(m.To)
+		_ = room.RemoveParticipant(m.To, "meeting-kick")
 	}
 	h.logMeetingKick(roomID, m.To, client.UniqID) // 观测：踢人是成员拆除路径之一，此前零日志（快照求值见该方法注释）
+	// 房主不在册时（仅持 HostClientID）也可踢人：踢走最后一人同样进入 PhaseGrace。
+	h.enterMeetingGrace(roomID, meetingEndReasonGraceArmed, logrus.Fields{
+		"trigger": "kick", "target": m.To, "by": client.UniqID, "explicit_leave": false,
+	})
 	// 广播成员表变更，让其余成员即时更新列表（被移出者随后 meeting:leave 幂等）
 	h.broadcastMeetingMembership(roomID, "leave", m.To, "")
 }
@@ -2248,8 +2196,10 @@ func (h *WebSocketHandler) flushMeetingMinutesSegments(roomID string, expected *
 	}
 	segments := append([]meetingMinutesSegment(nil), meta.minutesPending...)
 	meta.minutesPending = nil
-	hostClientID := meta.HostClientID
 	meta.mu.Unlock()
+	meta.hostMu.Lock()
+	hostClientID := meta.HostClientID
+	meta.hostMu.Unlock()
 
 	h.sendMeetingToClient(hostClientID, roomID, model.MessageTypeMeetingMinutes, map[string]interface{}{
 		"kind": "segments", "segments": segments,
@@ -3247,13 +3197,14 @@ func (h *WebSocketHandler) handleMeetingBreakout(client *model.Client, message *
 		sent := 0
 		assigned := map[string]bool{}
 		mainMembers := h.meetingParticipantIDs(roomID)
+		hostUniqID, hostClientID := meetingHostSeats(meta)
 		for _, a := range m.Assignments {
 			if a.Room == "" || !strings.HasPrefix(a.Room, roomID) || a.Room == roomID || len(a.Members) == 0 {
 				continue
 			}
 			members := make([]string, 0, len(a.Members))
 			for _, uid := range a.Members {
-				if uid == meta.Host || !mainMembers[uid] || assigned[uid] {
+				if uid == hostUniqID || !mainMembers[uid] || assigned[uid] {
 					continue
 				}
 				assigned[uid] = true
@@ -3262,18 +3213,14 @@ func (h *WebSocketHandler) handleMeetingBreakout(client *model.Client, message *
 			if len(members) == 0 {
 				continue
 			}
-			breakoutMembers := make(map[string]bool, len(members))
-			for _, uid := range members {
-				breakoutMembers[uid] = true
-			}
+			breakoutMembers := meetingUniqIDSet(members)
 			// 幂等登记：重复 create 同名房间不覆盖
-			if _, exists := h.activeMeetingRooms.LoadOrStore(a.Room, &meetingMeta{
-				Host:            meta.Host,
-				HostClientID:    meta.HostClientID,
+			if _, exists := h.activeMeetingRooms.LoadOrStore(a.Room, newMeetingMeta(meetingMetaInit{
+				Host:            hostUniqID,
+				HostClientID:    hostClientID,
 				Parent:          roomID,
 				BreakoutMembers: breakoutMembers,
-				minutes:         meetingMinutesState{RequireConsent: true},
-			}); exists {
+			})); exists {
 				continue
 			}
 			for _, uid := range members {
@@ -3307,7 +3254,7 @@ func (h *WebSocketHandler) handleMeetingBreakout(client *model.Client, message *
 					})
 				}
 			}
-			h.teardownMeeting(childID, false, meetingEndReasonBreakoutRecalled)
+			h.End(childID, meetingEndReasonBreakoutRecalled)
 			return true
 		})
 	default:
@@ -3372,7 +3319,7 @@ func (h *WebSocketHandler) handleMeetingApply(client *model.Client, message *mod
 		h.sendError(client, 409, "你已在该会议中")
 		return
 	}
-	hostUniqID := meta.Host
+	hostUniqID := h.meetingHostUniqID(roomID)
 	if hostUniqID == "" {
 		h.sendError(client, 503, "会议暂无主持人")
 		return

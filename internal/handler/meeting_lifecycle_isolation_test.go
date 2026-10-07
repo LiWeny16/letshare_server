@@ -8,7 +8,15 @@ import (
 	"letshare-server/internal/model"
 )
 
+// injectShortMeetingGrace 注入 300ms 短空置宽限。V1：最后一个成员显式离开不再立即拆除，
+// 改为进入 PhaseGrace（C-20）；短宽限便于测试观察到期释放。
+func injectShortMeetingGrace(t *testing.T) {
+	t.Helper()
+	injectMeetingGrace(t, 300*time.Millisecond)
+}
+
 func TestMeetingEndDoesNotLeakToSubscribedNonMember(t *testing.T) {
+	injectShortMeetingGrace(t)
 	ts := newMeetingTestServer(t)
 	t.Cleanup(ts.Close)
 	host := newWSRPC(t, ts.srv, "alice:end-1")
@@ -51,15 +59,11 @@ func TestMeetingEndDoesNotLeakToSubscribedNonMember(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("last explicit leave did not destroy the empty meeting")
+			t.Fatal("empty meeting was not released after the grace period")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	select {
-	case msg := <-observer.ended:
-		t.Fatalf("subscribed non-member received meeting:ended: %#v", msg)
-	case <-time.After(300 * time.Millisecond):
-	}
+	assertNoMeetingEnded(t, observer, 300*time.Millisecond, "subscribed non-member must not receive meeting:ended")
 }
 
 func TestMeetingBreakoutEnforcesMainMembersAndChildAllowlist(t *testing.T) {

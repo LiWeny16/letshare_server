@@ -331,7 +331,7 @@ func TestPublisherRemovalTearsDownSubscriberPCs(t *testing.T) {
 	}
 
 	// 发布者离开（房主移出 / 客户端断线清理同路径）
-	if err := room.RemoveParticipant("pubA"); err != nil {
+	if err := room.RemoveParticipant("pubA", "test-teardown"); err != nil {
 		t.Fatal(err)
 	}
 

@@ -97,8 +97,9 @@ func (r *Room) GetParticipant(participantID string) (*Participant, bool) {
 }
 
 // RemoveParticipant 断开并移除一位参与者；其所有订阅连接一并关闭。
+// reason 随「参与者离开 SFU 房间」日志落下（V0.1 无痕点③：此前移除零 reason）。
 // 异常仅局部化，不影响房间其它参与者。
-func (r *Room) RemoveParticipant(participantID string) error {
+func (r *Room) RemoveParticipant(participantID, reason string) error {
 	r.mu.Lock()
 	p, ok := r.participants[participantID]
 	if ok {
@@ -108,6 +109,12 @@ func (r *Room) RemoveParticipant(participantID string) error {
 	if !ok {
 		return nil
 	}
+	log.WithFields(log.Fields{
+		"sfu":           "room",
+		"roomID":        r.ID,
+		"participantID": participantID,
+		"reason":        reason,
+	}).Info("参与者离开 SFU 房间")
 	if err := p.Close(); err != nil {
 		return fmt.Errorf("sfu: 关闭参与者 %q 失败: %w", participantID, err)
 	}

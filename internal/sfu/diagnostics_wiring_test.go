@@ -177,7 +177,7 @@ func TestMainConnectionTransitionReachesLogrusWithCausalFields(t *testing.T) {
 	}
 
 	// 真实 Closed 跃迁（拆除参与者）同样必须经由同一接线落日志。
-	if err := room.RemoveParticipant("wiring-pub"); err != nil {
+	if err := room.RemoveParticipant("wiring-pub", "test-teardown"); err != nil {
 		t.Fatalf("RemoveParticipant 失败: %v", err)
 	}
 	closed := waitForLogEntry(t, hook, func(e capturedEntry) bool {

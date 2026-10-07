@@ -14,13 +14,14 @@ import (
 //
 // 本文件只定义枚举与落日志函数，不参与任何控制流；所有调用点均为纯观测。
 
-// 会议拆除/成员移除的稳定 reason 枚举（server 日志检索键，只增不改）。
+// 会议拆除/成员移除/相位跃迁的稳定 reason 枚举（server 日志检索键，只增不改）。
+// 全仓唯一一套 reason 词汇：End(reason) 与 PhaseGrace 触发原因共用本表。
 const (
-	meetingEndReasonLastMemberLeft     = "last-member-left"             // 显式离开清空会议 → 立即拆除
+	meetingEndReasonLastMemberLeft     = "last-member-left"             // 显式离开清空会议 → 进入 PhaseGrace（V1 起不再立即拆除）
 	meetingEndReasonMemberLeft         = "member-left"                  // 有成员离开但会议继续（房主可能转移）
-	meetingEndReasonGraceArmed         = "disconnect-grace-armed"       // 非显式离开清空会议 → 排定宽限期
-	meetingEndReasonGraceSkipped       = "grace-expired-room-not-empty" // 宽限到点但房间非空 → 跳过（DIVERGENCE F10 现场）
-	meetingEndReasonGraceExpired       = "host-left-grace-expired"      // 宽限到点且房间仍空 → 拆除
+	meetingEndReasonGraceArmed         = "disconnect-grace-armed"       // 非显式离开清空会议 → 进入 PhaseGrace（排定宽限期）
+	meetingEndReasonGraceSkipped       = "grace-expired-room-not-empty" // 宽限到点但房间非空 → 重排下一次（DIVERGENCE F10 修复）
+	meetingEndReasonGraceExpired       = "host-left-grace-expired"      // 宽限到点且房间仍空 → End
 	meetingEndReasonHostEnded          = "host-ended"                   // 房主显式结束会议
 	meetingEndReasonKicked             = "kicked"                       // 房主移出成员（成员拆除）
 	meetingEndReasonReservationExpired = "reservation-expired"          // 从未 join 的会议到期回收
@@ -28,14 +29,18 @@ const (
 	meetingEndReasonBreakoutRecalled   = "breakout-recalled"            // 房主召回 breakout，子房间拆除
 	// 当前不可达的防御性兜底：clientReason 实际取值域只有 "timeout"/"host-ended"（见 meetingEndReasonFromClientReason）。
 	meetingEndReasonServerTeardown = "server-teardown" // 其余服务端拆除（兜底，暂不可达，保留勿删）
+
+	// V1 相位跃迁 reason（与拆除 reason 同一词汇表，meeting-phase 日志使用）。
+	meetingEndReasonMeetingCreated = "meeting-created" // 会议号登记（进入 PhaseReserved）
+	meetingEndReasonMemberJoined   = "member-joined"   // 成员加入使会议回到 PhaseLive（停表）
 )
 
-// 拆除/决策动作枚举：区分「真拆除」与「决策了但不动作」。
+// 拆除/决策动作枚举：区分「真拆除」与「决策后重排」。
+// （V1 前的 decision/skip 两个动作随 D7.1 双 decision 合并与 F10「跳过→重排」修复
+// 不再产生，已从词汇表移除；旧日志的检索键不受影响。）
 const (
-	meetingActionDecision      = "decision"       // 评估通过，即将拆除/通知
-	meetingActionTeardown      = "teardown"       // 会议注册与 SFU 资源真被拆除
-	meetingActionSkip          = "skip"           // 决策了但不动作（必须留痕，F10 现场）
-	meetingActionScheduleGrace = "schedule-grace" // 排定宽限期后拆除
+	meetingActionTeardown      = "teardown"       // 会议注册与 SFU 资源真被拆除（每次 End 恰好一条）
+	meetingActionScheduleGrace = "schedule-grace" // 排定/重排空置宽限期
 	meetingActionMemberRemoved = "member-removed" // 仅移除一名成员
 )
 
@@ -61,15 +66,51 @@ func logMeetingEnd(reason, action string, fields logrus.Fields) {
 }
 
 // logMeetingTeardown 落一条「会议真的被拆除」的权威记录（回答「会议为什么没了」）。
-func logMeetingTeardown(reason, roomID, parentRoomID string, notify, wasRegistered bool, membersRemaining int) {
-	logMeetingEnd(reason, meetingActionTeardown, logrus.Fields{
+// 每次 End 恰好产生一条 action=teardown；extra 携带触发上下文（by/trigger 等）。
+func logMeetingTeardown(reason, roomID, parentRoomID string, notify, wasRegistered bool, membersRemaining int, extra logrus.Fields) {
+	fields := logrus.Fields{
 		"roomID":            roomID,
 		"parent_room_id":    parentRoomID,
 		"notified":          notify,
 		"was_registered":    wasRegistered,
 		"members_remaining": membersRemaining,
 		"room_empty":        membersRemaining == 0,
-	})
+	}
+	for key, value := range extra {
+		fields[key] = value
+	}
+	logMeetingEnd(reason, meetingActionTeardown, fields)
+}
+
+// logMeetingPhase 落一条相位跃迁 Info 日志（C-21；sessionId 由 V1b 补齐）。
+// 仅用于没有 meeting-end 记录的跃迁（创建 / 成员加入回 Live）；
+// 进入宽限与 End 的跃迁由 meeting-end:reason=<enum> 记录（含 phase_from/phase_to 字段）。
+func logMeetingPhase(from, to, reason string, fields logrus.Fields) {
+	merged := logrus.Fields{
+		"event":      "meeting-phase",
+		"phase_from": from,
+		"phase_to":   to,
+	}
+	for key, value := range fields {
+		merged[key] = value
+	}
+	logrus.WithFields(merged).Info("meeting-phase:reason=" + reason)
+}
+
+// meetingClientReasonForEnd 把服务端 End reason 映射回客户端协议 reason 字符串
+// （meetingEndReasonFromClientReason 的逆映射；协议字符串零变化）。
+// 返回空串表示该拆除路径不发 meeting:ended（breakout 召回走 meeting:breakout recall）。
+func meetingClientReasonForEnd(reason string) string {
+	switch reason {
+	case meetingEndReasonHostEnded:
+		return "host-ended"
+	case meetingEndReasonGraceExpired, meetingEndReasonReservationExpired:
+		return "timeout"
+	case meetingEndReasonBreakoutRecalled:
+		return ""
+	default:
+		return "ended"
+	}
 }
 
 // meetingHostChangeFields 纯函数：把房主变更日志的字段快照压成 logrus.Fields。
@@ -133,7 +174,7 @@ func (h *WebSocketHandler) meetingHostUniqID(roomID string) string {
 	if !loaded || !ok || meta == nil {
 		return ""
 	}
-	meta.mu.Lock()
-	defer meta.mu.Unlock()
+	meta.hostMu.Lock()
+	defer meta.hostMu.Unlock()
 	return meta.Host
 }

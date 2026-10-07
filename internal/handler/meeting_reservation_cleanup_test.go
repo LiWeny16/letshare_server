@@ -8,9 +8,7 @@ import (
 )
 
 func TestMeetingReservationExpiresBeforeJoin(t *testing.T) {
-	oldTTL := meetingReservationTTL
-	meetingReservationTTL = 50 * time.Millisecond
-	defer func() { meetingReservationTTL = oldTTL }()
+	injectMeetingReservationTTL(t, 50*time.Millisecond)
 
 	ts := newMeetingTestServer(t)
 	defer ts.Close()
