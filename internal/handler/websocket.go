@@ -1014,17 +1014,16 @@ func (h *WebSocketHandler) handleMeetingJoin(client *model.Client, message *mode
 	}
 	// 成员加入 = PhaseLive 停表：取消挂起的空置宽限定时器（宽限期语义：空房等待重入）。
 	// 相位跃迁与拆除互斥于 meetingLifecycleMu：陈旧的宽限回调不得拆掉正在加入的会议（C-17）。
-	if meta != nil {
-		if !h.enterMeetingLive(message.Channel, uniqID, client.ID, sourceRoom, meta) {
-			h.sendError(client, 404, "会议不存在")
-			return
-		}
+	previous, joined := h.enterMeetingLive(message.Channel, uniqID, userName, client.ID, sourceRoom, meta)
+	if !joined {
+		h.sendError(client, 404, "会议不存在")
+		return
 	}
 	room := h.sfuManager.JoinRoom(message.Channel)
 	// 发布者中途新增 track（屏幕共享等）→ 通知所有已订阅者重协商
 	room.SetOnTrackPublished(h.onMeetingTrackPublished)
-	// 幂等：已存在则不重复建 PC
-	if owner, joined := h.meetings.clientForUniqID(message.Channel, uniqID); joined && owner != client.ID {
+	// 幂等：已存在则不重复建 PC（previous 非空 = 同一 uniqID 被新连接顶替，需摘旧会话）
+	if len(previous) > 0 {
 		h.releaseMeetingPresentation(message.Channel, uniqID)
 		_ = room.RemoveParticipant(uniqID, "meeting-rebind")
 	}
@@ -1035,7 +1034,6 @@ func (h *WebSocketHandler) handleMeetingJoin(client *model.Client, message *mode
 		_ = room.RemoveParticipant(uniqID, "meeting-stale-closed")
 	}
 	if existing, ok := room.GetParticipant(uniqID); ok && !existing.IsClosed() {
-		_, previous := h.meetings.join(message.Channel, uniqID, userName, client.ID)
 		h.sendMeetingMembershipSnapshot(client.ID, message.Channel)
 		if len(previous) > 0 {
 			h.broadcastMeetingMembership(message.Channel, "leave", uniqID, client.ID)
@@ -1047,6 +1045,8 @@ func (h *WebSocketHandler) handleMeetingJoin(client *model.Client, message *mode
 	}
 	p, err := room.AddParticipant(uniqID)
 	if err != nil {
+		// 未真正入会：回滚 enterMeetingLive 的成员登记，不得留下幽灵在册成员。
+		h.meetings.leave(message.Channel, uniqID, client.ID)
 		h.sendError(client, 500, "meeting:join 失败: "+err.Error())
 		// R2：失败出口也必须排下一次 —— 若此失败把会议留在无人状态，退回 PhaseGrace。
 		h.enterMeetingGrace(message.Channel, meetingEndReasonGraceArmed, logrus.Fields{
@@ -1055,7 +1055,6 @@ func (h *WebSocketHandler) handleMeetingJoin(client *model.Client, message *mode
 		return
 	}
 	// 接入该参与者发布 PC 的本地候选，定向回发给客户端
-	_, previous := h.meetings.join(message.Channel, uniqID, userName, client.ID)
 	h.sendMeetingMembershipSnapshot(client.ID, message.Channel)
 	if len(previous) > 0 {
 		h.broadcastMeetingMembership(message.Channel, "leave", uniqID, client.ID)

@@ -13,6 +13,9 @@ package handler
 import (
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"strings"
 	"sync"
@@ -184,6 +187,13 @@ func TestBreakoutChildCascadeTeardownReachesEndedExactlyOnceWithoutPanic(t *test
 // TestMeetingMetaLiteralOnlyExistsInsideTheSharedConstructor 不变量：
 // meetingMeta 复合字面量全包恰好一处（newMeetingMeta 内）—— 生产与测试只能走同一
 // 构造入口，否则「生产漏字段 / 测试接缝补齐」的 P0 分叉会重演。
+//
+// 扩针（Reviewer 登记项）：旧文本针只抓「类型名紧贴花括号」的字面量，以下四种形态
+// 全部未被捕获：var m meetingMeta（逐字段赋值，变量名任意）、new(meetingMeta)、
+// 内嵌/字段零值、meetingMeta {（类型名与花括号间有空格）。文本针对它们无解
+// （变量名/排版可任意变），故新增语法级（go/ast）穷举层：只要「物化了一个 meetingMeta
+// 值」就命中，指针类型不算（var p *meetingMeta 只是 nil 指针）。两层合起来仍只允许
+// newMeetingMeta 内那一处。
 func TestMeetingMetaLiteralOnlyExistsInsideTheSharedConstructor(t *testing.T) {
 	entries, err := os.ReadDir(".")
 	if err != nil {
@@ -213,4 +223,131 @@ func TestMeetingMetaLiteralOnlyExistsInsideTheSharedConstructor(t *testing.T) {
 	if total != 1 {
 		t.Fatalf("%s 字面量共 %d 处，应恰好 1 处（newMeetingMeta 内）", needle, total)
 	}
+	// 第二层：语法级穷举其余物化形态（含字面量本身的排版变体）。
+	sites := meetingMetaConstructionSites(t)
+	if len(sites) != 1 {
+		t.Fatalf("meetingMeta 物化点共 %d 处，应恰好 1 处（newMeetingMeta 内）: %v", len(sites), sites)
+	}
+	if site := sites[0]; site.file != "meeting_registry.go" || site.fn != "newMeetingMeta" {
+		t.Fatalf("meetingMeta 物化点落在 %s，必须只在 meeting_registry.go 的 newMeetingMeta 内", site)
+	}
+}
+
+// meetingMetaSite 一处 meetingMeta 物化点（字面量 / 零值 / 内嵌）的定位信息。
+type meetingMetaSite struct {
+	file string
+	line int
+	fn   string
+	what string
+}
+
+func (s meetingMetaSite) String() string {
+	return fmt.Sprintf("%s:%d %s() %s", s.file, s.line, s.fn, s.what)
+}
+
+// meetingMetaMaterialized 判断类型表达式是否物化一个 meetingMeta 值。
+// 只沿类型表达式链递归（Ident / *T / []T / map[K]V / chan T）；指针类型不物化对象本身。
+func meetingMetaMaterialized(expr ast.Expr) bool {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		return e.Name == "meeting"+"Meta"
+	case *ast.StarExpr:
+		return false
+	case *ast.ArrayType:
+		return meetingMetaMaterialized(e.Elt)
+	case *ast.MapType:
+		return meetingMetaMaterialized(e.Key) || meetingMetaMaterialized(e.Value)
+	case *ast.ChanType:
+		return meetingMetaMaterialized(e.Value)
+	}
+	return false
+}
+
+// meetingMetaNodeKind 把 AST 节点映射为物化形态标签（空串 = 不是物化点）。
+func meetingMetaNodeKind(n ast.Node) string {
+	switch v := n.(type) {
+	case *ast.CompositeLit:
+		if meetingMetaMaterialized(v.Type) {
+			return "复合字面量"
+		}
+	case *ast.ValueSpec:
+		if meetingMetaMaterialized(v.Type) {
+			return "零值声明"
+		}
+	case *ast.TypeSpec:
+		if meetingMetaMaterialized(v.Type) {
+			return "自定义类型"
+		}
+	case *ast.Field:
+		if meetingMetaMaterialized(v.Type) {
+			return "字段/内嵌零值"
+		}
+	case *ast.CallExpr:
+		return meetingMetaCallKind(v)
+	}
+	return ""
+}
+
+// meetingMetaCallKind new(meetingMeta) 分配与 meetingMeta(x) 类型转换两类旁路。
+func meetingMetaCallKind(call *ast.CallExpr) string {
+	id, ok := call.Fun.(*ast.Ident)
+	if !ok || len(call.Args) != 1 {
+		return ""
+	}
+	isBuiltinNew := id.Name == "new"
+	isConversion := id.Name == "meeting"+"Meta"
+	if (!isBuiltinNew && !isConversion) || !meetingMetaMaterialized(call.Args[0]) {
+		return ""
+	}
+	if isConversion {
+		return "类型转换"
+	}
+	return "new 分配"
+}
+
+// meetingMetaSitesInFile 扫描单个源文件（注释/字符串不参与，排版差异免疫）。
+func meetingMetaSitesInFile(t *testing.T, name string) []meetingMetaSite {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, name, nil, 0)
+	if err != nil {
+		t.Fatalf("解析 %s 失败: %v", name, err)
+	}
+	sites := []meetingMetaSite{}
+	for _, decl := range file.Decls {
+		fn, node := "<package>", ast.Node(decl)
+		if fd, ok := decl.(*ast.FuncDecl); ok {
+			fn, node = fd.Name.Name, fd
+		}
+		ast.Inspect(node, func(n ast.Node) bool {
+			if what := meetingMetaNodeKind(n); what != "" {
+				sites = append(sites, meetingMetaSite{
+					file: name, line: fset.Position(n.Pos()).Line, fn: fn, what: what,
+				})
+			}
+			return true
+		})
+	}
+	return sites
+}
+
+// meetingMetaConstructionSites 语法级穷举 meetingMeta 物化点：复合字面量
+// （类型名紧贴花括号 / & 前缀 / 类型名与花括号间留空格）、new 分配、零值声明
+// （var m meetingMeta，任意名字）、字段/内嵌零值（struct{ meetingMeta }）、类型转换与
+// 自定义类型（type x meetingMeta）。注释与字符串不参与（解析时丢弃），排版差异免疫。
+func meetingMetaConstructionSites(t *testing.T) []meetingMetaSite {
+	t.Helper()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sites := []meetingMetaSite{}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") {
+			continue
+		}
+		sites = append(sites, meetingMetaSitesInFile(t, name)...)
+	}
+	return sites
 }
