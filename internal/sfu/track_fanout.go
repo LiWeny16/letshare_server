@@ -70,6 +70,7 @@ func (f *trackFanout) close() {
 }
 
 func (f *trackFanout) run() {
+	defer f.close()
 	for {
 		select {
 		case <-f.stop:
