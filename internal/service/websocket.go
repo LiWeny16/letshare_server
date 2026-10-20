@@ -48,7 +48,7 @@ func NewWebSocketService(maxRoomUsers int) *WebSocketService {
 	return ws
 }
 
-// SetOnClientDisconnect 注册客户端断开连接的回调钩子
+// SetOnClientDisconnect 在接收客户端前注册断开回调；保留给在途清理使用。
 func (ws *WebSocketService) SetOnClientDisconnect(handler func(clientID string)) {
 	ws.onClientDisconnect = handler
 }
@@ -141,7 +141,6 @@ func (ws *WebSocketService) cleanupClientResources(client *model.Client, notifyD
 	// 清理客户端内部引用
 	client.Rooms = nil
 	client.Events = nil
-	client.Connection = nil
 	client.Metadata = nil
 
 	// 通知文件传输等下游服务：该客户端已断开
@@ -162,7 +161,13 @@ func (ws *WebSocketService) GetClient(clientID string) (*model.Client, bool) {
 // ordinary room membership. Meeting traffic uses this as its domain boundary.
 func (ws *WebSocketService) SendToClientID(clientID string, message *model.WebSocketMessage) bool {
 	client, ok := ws.GetClient(clientID)
-	if !ok || client == nil || client.Connection == nil {
+	if !ok || client == nil {
+		return false
+	}
+	client.ConnMutex.Lock()
+	connected := client.Connection != nil
+	client.ConnMutex.Unlock()
+	if !connected {
 		return false
 	}
 	ws.sendToClient(client, message)
@@ -808,7 +813,6 @@ func (ws *WebSocketService) Shutdown() {
 		ws.roomsMutex.Lock()
 		ws.rooms = make(map[string]*model.Room)
 		ws.roomsMutex.Unlock()
-		ws.onClientDisconnect = nil
 
 		logrus.Info("WebSocket服务已关闭")
 	})
