@@ -66,6 +66,47 @@ const (
 )
 
 // WebSocketMessage 表示WebSocket消息（兼容Ably格式）
+const MessageTypeFileTransferV2Control = "file:v2:control"
+
+// FileTransferV2Manifest is the stable, content-addressed file description
+// exchanged by the v2 control protocol.
+type FileTransferV2Manifest struct {
+	TransferID   string `json:"transferId"`
+	Name         string `json:"name"`
+	Size         int64  `json:"size"`
+	Type         string `json:"type"`
+	LastModified int64  `json:"lastModified"`
+	BlockSize    int    `json:"blockSize"`
+	TotalBlocks  int    `json:"totalBlocks"`
+	FileHash     string `json:"fileHash"`
+	CreatedAt    int64  `json:"createdAt"`
+}
+
+// FileTransferV2Control is used in the v2 JSON envelope and as
+// WebSocketMessage.Data on the server relay.
+type FileTransferV2Control struct {
+	Version      int                         `json:"version"`
+	Kind         string                      `json:"kind"`
+	TransferID   string                      `json:"transferId,omitempty"`
+	From         string                      `json:"from,omitempty"`
+	To           string                      `json:"to,omitempty"`
+	Manifest     *FileTransferV2Manifest     `json:"manifest,omitempty"`
+	Ranges       *[][]int                    `json:"ranges,omitempty"`
+	CreditBytes  *int64                      `json:"creditBytes,omitempty"`
+	Reason       string                      `json:"reason,omitempty"`
+	SessionID    string                      `json:"sessionId,omitempty"`
+	Capabilities *FileTransferV2Capabilities `json:"capabilities,omitempty"`
+}
+
+type FileTransferV2Capabilities struct {
+	Version        int   `json:"version"`
+	MaxFileSize    int64 `json:"maxFileSize"`
+	MaxFrameBytes  int   `json:"maxFrameBytes"`
+	MaxCreditBytes int64 `json:"maxCreditBytes"`
+	Resume         bool  `json:"resume"`
+	Multipath      bool  `json:"multipath"`
+}
+
 type WebSocketMessage struct {
 	Type      string          `json:"type"`
 	Channel   string          `json:"channel,omitempty"`

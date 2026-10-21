@@ -599,6 +599,8 @@ func (h *WebSocketHandler) processMessage(client *model.Client, message *model.W
 		h.handleUnsubscribe(client, message)
 	case model.MessageTypePublish:
 		h.handlePublish(client, message)
+	case model.MessageTypeFileTransferV2Control:
+		h.processFileTransferV2Control(client, message)
 	// 文件传输相关消息
 	case model.MessageTypeFileTransferRequest:
 		h.handleFileTransferRequest(client, message)
@@ -3771,6 +3773,9 @@ func isMediaFrame(data []byte) bool {
 
 // processBinaryMessage 处理二进制消息(文件数据块 / 通话媒体帧)
 func (h *WebSocketHandler) processBinaryMessage(client *model.Client, data []byte) {
+	if h.processFileTransferV2Binary(client, data) {
+		return
+	}
 	// 媒体帧（通话公网兜底轨道）：24字节固定头 [callId 16B | seq 2B | track 1B | padding 5B] + 裸 payload。
 	// 盲转发：不解析 payload，按头内 callId 定向转发。
 	if isMediaFrame(data) {

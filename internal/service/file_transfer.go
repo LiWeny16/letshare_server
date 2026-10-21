@@ -27,6 +27,7 @@ type FileTransferService struct {
 	maxFileSize         int64 // 最大文件大小(PRO 统一上限 3GB)
 	chunkSize           int   // 默认分块大小
 	spoolDir            string
+	fileTransferV2      *FileTransferV2Service
 	virtualRoomResolver func(roomName, userID string) (*model.Client, bool)
 	cleanupStop         chan struct{}
 	cleanupDone         chan struct{}
@@ -73,11 +74,20 @@ func NewFileTransferService(wsService *WebSocketService, maxFileSize int64, chun
 		cleanupStop:  make(chan struct{}),
 		cleanupDone:  make(chan struct{}),
 	}
+	fts.fileTransferV2 = NewFileTransferV2Service(fts)
 
 	// 启动会话清理
 	go fts.startSessionCleanup()
 
 	return fts
+}
+
+func (fts *FileTransferService) V2() *FileTransferV2Service {
+	return fts.fileTransferV2
+}
+
+func (fts *FileTransferService) MaxFileSize() int64 {
+	return fts.maxFileSize
 }
 
 func defaultRelaySpoolDir() string {
@@ -828,6 +838,11 @@ func (fts *FileTransferService) startSessionCleanup() {
 		select {
 		case <-ticker.C:
 			fts.cleanupStaleSessions()
+			if fts.fileTransferV2 != nil {
+				if err := fts.fileTransferV2.CleanupExpired(time.Now()); err != nil {
+					logrus.WithError(err).Warn("file v2 task cleanup failed")
+				}
+			}
 		case <-fts.cleanupStop:
 			return
 		}
