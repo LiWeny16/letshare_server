@@ -106,6 +106,7 @@ type wsRPC struct {
 	membership     chan model.WebSocketMessage
 	sdp            chan model.WebSocketMessage
 	create         chan model.WebSocketMessage
+	info           chan model.WebSocketMessage
 	roomMembership chan model.WebSocketMessage
 	invite         chan model.WebSocketMessage
 	chat           chan model.WebSocketMessage
@@ -152,6 +153,11 @@ func (r *wsRPC) dispatch() {
 			r.sdp <- m
 		case model.MessageTypeMeetingCreate:
 			r.create <- m
+		case model.MessageTypeMeetingInfo:
+			select {
+			case r.info <- m:
+			default:
+			}
 		case model.MessageTypeMessage:
 			if m.Event == "membership:snapshot" {
 				r.roomMembership <- m
@@ -303,6 +309,7 @@ func newWSRPC(t *testing.T, srv *httptest.Server, userID string) *wsRPC {
 		membership:     make(chan model.WebSocketMessage, 64),
 		sdp:            make(chan model.WebSocketMessage, 64),
 		create:         make(chan model.WebSocketMessage, 8),
+		info:           make(chan model.WebSocketMessage, 32),
 		roomMembership: make(chan model.WebSocketMessage, 16),
 		invite:         make(chan model.WebSocketMessage, 32),
 		chat:           make(chan model.WebSocketMessage, 64),

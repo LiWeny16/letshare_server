@@ -239,6 +239,7 @@ type meetingMetaInit struct {
 	SourceRoom      string
 	Parent          string
 	BreakoutMembers map[string]bool
+	OpenBreakout    bool
 }
 
 // newMeetingMeta meetingMeta 的唯一构造入口（X2 防分叉）：生产与测试同一构造路径，
@@ -246,6 +247,7 @@ type meetingMetaInit struct {
 func newMeetingMeta(p meetingMetaInit) *meetingMeta {
 	return &meetingMeta{
 		BreakoutMembers: p.BreakoutMembers,
+		OpenBreakout:    p.OpenBreakout,
 		Host:            p.Host,
 		HostClientID:    p.HostClientID,
 		SourceRoom:      p.SourceRoom,

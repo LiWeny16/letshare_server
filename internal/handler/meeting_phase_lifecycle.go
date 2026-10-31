@@ -57,6 +57,7 @@ func (h *WebSocketHandler) enterMeetingLive(roomID, uniqID, userName, clientID, 
 	}
 	_, previous := h.meetings.join(roomID, uniqID, userName, clientID)
 	h.stopEmptyTimerLocked(meta)
+	h.finishBreakoutHostSwitchLocked(roomID, uniqID)
 	meta.mu.Lock()
 	// A browser reconnect creates a new websocket client session. Keep the
 	// host recipient bound to the current meeting connection; otherwise
@@ -95,7 +96,13 @@ func (h *WebSocketHandler) restoreMeetingHostSeat(roomID string, meta *meetingMe
 		return
 	}
 	host, _ := meetingHostSeats(meta)
+	if meta.breakoutHostSwitchID == host && time.Now().Before(meta.breakoutHostSwitchDeadline) {
+		return
+	}
 	if _, inRoster := h.meetings.clientForUniqID(roomID, host); inRoster {
+		return
+	}
+	if h.memberInBreakout(roomID, host) {
 		return
 	}
 	h.transferMeetingHost(roomID, host)
@@ -113,6 +120,9 @@ func (h *WebSocketHandler) enterMeetingGrace(roomID, reason string, ctx logrus.F
 	meta, _ := v.(*meetingMeta)
 	if meta == nil || len(h.meetings.members(roomID)) > 0 {
 		return false
+	}
+	if meta.OpenBreakout {
+		return false // child room survives while its parent meeting exists
 	}
 	phaseFrom := meta.life.Phase()
 	if !meta.life.ToGrace() {
@@ -158,7 +168,7 @@ func (h *WebSocketHandler) onMeetingEmptyTimerFired(roomID string, meta *meeting
 	if phase == meeting.PhaseReserved {
 		ttl = currentMeetingReservationTTL()
 	}
-	if members > 0 || roomCount > 0 || phase == meeting.PhaseLive {
+	if members > 0 || roomCount > 0 || phase == meeting.PhaseLive || h.hasActiveBreakoutMembers(roomID) {
 		// F10 现场修复：到点但房间非空 → 重排下一次，而非跳过后让宽限永久失效。
 		logMeetingEnd(meetingEndReasonGraceSkipped, meetingActionScheduleGrace, logrus.Fields{
 			"roomID":            roomID,
