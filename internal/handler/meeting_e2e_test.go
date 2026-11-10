@@ -31,11 +31,24 @@ type meetingTestServer struct {
 var meetingTestClientSeq atomic.Uint64
 
 func newMeetingTestServer(t *testing.T) *meetingTestServer {
+	return newMeetingTestServerWithSetup(t, nil)
+}
+
+func newMeetingTestServerWithCaptions(t *testing.T) *meetingTestServer {
+	return newMeetingTestServerWithSetup(t, func(h *WebSocketHandler) {
+		h.captionsEnabled = true
+	})
+}
+
+func newMeetingTestServerWithSetup(t *testing.T, setup func(*WebSocketHandler)) *meetingTestServer {
 	t.Helper()
 	wsService := service.NewWebSocketService(10)
 	authService := service.NewAuthService()
 	fts := service.NewFileTransferService(wsService, 3*1024*1024*1024, 65536)
 	h := NewWebSocketHandler(wsService, authService, fts, nil)
+	if setup != nil {
+		setup(h)
+	}
 	// 注入离线回环引擎，保证本进程内两客户端可无外网连通
 	h.SetSFU(sfu.MustNewManager(sfu.OfflineSettingEngine()))
 
@@ -98,6 +111,8 @@ func (ts *meetingTestServer) Close() {
 // wsRPC 模拟一个会议客户端：单 reader 将每条 WS 消息推入 in，
 // dispatcher 把 meeting:ice 应用到对应 PC、把 subscribed / meeting:sdp 送入相应通道。
 type wsRPC struct {
+	handler        *WebSocketHandler
+	userID         string
 	writeMu        sync.Mutex
 	pcMu           sync.RWMutex
 	conn           *websocket.Conn
@@ -107,6 +122,7 @@ type wsRPC struct {
 	sdp            chan model.WebSocketMessage
 	create         chan model.WebSocketMessage
 	info           chan model.WebSocketMessage
+	minutesWire    chan model.WebSocketMessage
 	roomMembership chan model.WebSocketMessage
 	invite         chan model.WebSocketMessage
 	chat           chan model.WebSocketMessage
@@ -155,6 +171,10 @@ func (r *wsRPC) dispatch() {
 			r.create <- m
 		case model.MessageTypeMeetingInfo:
 			select {
+			case r.minutesWire <- m:
+			default:
+			}
+			select {
 			case r.info <- m:
 			default:
 			}
@@ -189,6 +209,10 @@ func (r *wsRPC) dispatch() {
 		case model.MessageTypeMeetingBreakout:
 			r.breakout <- m
 		case model.MessageTypeMeetingMinutes:
+			select {
+			case r.minutesWire <- m:
+			default:
+			}
 			r.minutes <- m
 		case model.MessageTypeMeetingEnded:
 			r.ended <- m
@@ -303,6 +327,7 @@ func newWSRPC(t *testing.T, srv *httptest.Server, userID string) *wsRPC {
 	t.Helper()
 	conn := dialTestClient(t, srv, userID)
 	r := &wsRPC{
+		userID:         userID,
 		conn:           conn,
 		in:             make(chan model.WebSocketMessage, 128),
 		subs:           make(chan struct{}, 16),
@@ -310,6 +335,7 @@ func newWSRPC(t *testing.T, srv *httptest.Server, userID string) *wsRPC {
 		sdp:            make(chan model.WebSocketMessage, 64),
 		create:         make(chan model.WebSocketMessage, 8),
 		info:           make(chan model.WebSocketMessage, 32),
+		minutesWire:    make(chan model.WebSocketMessage, 256),
 		roomMembership: make(chan model.WebSocketMessage, 16),
 		invite:         make(chan model.WebSocketMessage, 32),
 		chat:           make(chan model.WebSocketMessage, 64),

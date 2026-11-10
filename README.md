@@ -34,7 +34,7 @@ server/
 
 ### 技术栈
 
-- **Go 1.21**: 最新 LTS 版本
+- **Go 1.24**: 纯 Go Opus 解码依赖要求 Go 1.24+
 - **Gin**: 高性能 Web 框架
 - **gorilla/websocket**: 成熟的 WebSocket 库
 - **JWT**: 轻量级认证
@@ -69,11 +69,11 @@ docker-compose up -d
 
 ### 2. 本地开发
 
-**安装 Go 1.21:**
+**安装 Go 1.24:**
 ```bash
-# 下载并安装 Go 1.21
-wget https://go.dev/dl/go1.21.6.linux-amd64.tar.gz
-sudo tar -C /usr/local -xzf go1.21.6.linux-amd64.tar.gz
+# 下载并安装 Go 1.24
+wget https://go.dev/dl/go1.24.0.linux-amd64.tar.gz
+sudo tar -C /usr/local -xzf go1.24.0.linux-amd64.tar.gz
 echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
 source ~/.bashrc
 ```
@@ -97,6 +97,28 @@ MODE=production go run cmd/server/main.go
 | `LETSHARE_SERVER_PORT` | 服务端口 | `8080` |
 | `LETSHARE_JWT_SECRET` | JWT 密钥 | `letshare-jwt-secret-key-2024` |
 | `LETSHARE_LOG_LEVEL` | 日志级别 | `info` |
+
+### 会议纪要 AI（Gemini + Somni 流式 ASR）
+
+会议纪要的文本模型**固定为 Gemini**（`gemini-3.5-flash-lite`，OpenAI 兼容网关），**不再支持 GLM**；语音识别使用配置的 Somni ASR 服务。Somni 的具体识别模型由该服务决定，本仓库无法确认其模型名称。密钥只放在服务器环境，绝不发给客户端。模板见 `env.example` / `env.meeting.example`（真实值写 `server/.env`，已被 git 忽略）。
+
+需要的环境变量：
+
+| 变量名 | 说明 | 默认值 |
+|--------|------|--------|
+| `MEETING_AI_BASE_URL` | Gemini OpenAI 兼容网关地址 | `https://api.fullive.xyz/v1` |
+| `MEETING_AI_MODEL` | 文本模型（仅允许 `gemini-3.5-flash-lite`） | `gemini-3.5-flash-lite` |
+| `MEETING_AI_API_KEY` | 网关 API key（必填，否则纪要 AI 不启用） | 无 |
+| `MEETING_AI_ENABLED` | `false` 强制关闭；缺省时配置了 key 即启用 | 自动 |
+| `MEETING_AI_BILLING_DISABLED` | 运营者声明 key 不会产生计费 | `true` |
+| `MEETING_ASR_STREAM_HTTP_BASE` | Somni ASR HTTP 基址（登录/配置） | 无 |
+| `MEETING_ASR_STREAM_WS_BASE` | Somni ASR WebSocket 基址 | 无 |
+| `MEETING_ASR_STREAM_EMAIL` / `MEETING_ASR_STREAM_PASSWORD` | Somni 账号凭据 | 无 |
+| `MEETING_ASR_STREAM_LOGIN_TYPE` / `MEETING_ASR_STREAM_DEVICE_PLATFORM` / `MEETING_ASR_STREAM_DEVICE_NAME` / `MEETING_ASR_STREAM_APP_VERSION` / `MEETING_ASR_STREAM_TIMEZONE` | Somni 登录与设备字段 | `password` / `android` / `letshare-server` / `1.0.0` / `Asia/Shanghai` |
+
+`SOMNI_LLM_*` / `SOMNI_ASR_*` 同名变量作为兼容 fallback 被接受。未配置 Somni ASR 凭据时，会议转写不可用。实时字幕及旧客户端的字幕识别入口暂时关闭；会议纪要的服务端混音识别不受影响。启动日志的「会议 AI/识别能力」一行会显示实际生效的 `meeting_ai_model` 与 `meeting_asr_stream`。
+
+AI minutes start only when both the fixed Gemini service and Somni ASR are ready. Any member can start the shared session; each member receives results by default and can independently stop or resume receiving them. The server mixes every current meeting audio publisher, including participants who join after the session starts; microphone settings continue to control publication. A single active receiving member coordinates the shared incremental summaries. Server-side energy VAD suppresses silence and keeps short pre-roll and hangover around speech. Older chunk and stream frame shapes remain in the protocol, but caption-only recognition is disabled and per-speaker recognition is suppressed while the server mixer owns a recording epoch.
 
 ### 配置文件
 

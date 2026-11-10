@@ -51,11 +51,34 @@ func (h *WebSocketHandler) enterMeetingLive(roomID, uniqID, userName, clientID, 
 	h.meetingLifecycleMu.Lock()
 	phaseFrom := meta.life.Phase()
 	current, registered := h.activeMeetingRooms.Load(roomID)
-	if !registered || current != meta || !meta.life.ToLive() {
+	clientConnected := h.wsService == nil
+	if h.wsService != nil {
+		_, clientConnected = h.wsService.GetClient(clientID)
+	}
+	if !registered || current != meta || !clientConnected || !meta.life.ToLive() {
 		h.meetingLifecycleMu.Unlock()
 		return nil, false
 	}
+	meta.meetingASRPublishMu.Lock()
+	asrStreams := h.lockMeetingASRStreamsForUser(roomID, uniqID)
+	meta.minutesDeliveryMu.Lock()
 	_, previous := h.meetings.join(roomID, uniqID, userName, clientID)
+	meta.mu.Lock()
+	if meta.minutesReplayPending == nil {
+		meta.minutesReplayPending = make(map[string]bool)
+	}
+	for _, old := range previous {
+		delete(meta.minutesReplayPending, old.ClientID)
+	}
+	meta.minutesReplayPending[clientID] = true
+	meta.mu.Unlock()
+	meta.minutesDeliveryMu.Unlock()
+	if len(previous) > 0 {
+		h.finishMeetingASRStreamTransition(asrStreams, nil)
+	} else {
+		h.finishMeetingASRStreamTransition(asrStreams, func(*meetingASRStreamState) bool { return true })
+	}
+	meta.meetingASRPublishMu.Unlock()
 	h.stopEmptyTimerLocked(meta)
 	h.finishBreakoutHostSwitchLocked(roomID, uniqID)
 	meta.mu.Lock()

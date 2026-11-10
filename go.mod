@@ -1,6 +1,6 @@
 module letshare-server
 
-go 1.21
+go 1.24.0
 
 require (
 	github.com/gin-contrib/cors v1.5.0
@@ -11,6 +11,7 @@ require (
 	github.com/joho/godotenv v1.5.1
 	github.com/pion/ice/v4 v4.0.2
 	github.com/pion/interceptor v0.1.37
+	github.com/pion/opus v0.1.0
 	github.com/pion/rtp v1.8.9
 	github.com/pion/turn/v2 v2.1.6
 	github.com/pion/webrtc/v4 v4.0.0

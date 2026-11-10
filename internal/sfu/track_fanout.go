@@ -14,19 +14,23 @@ import (
 // lose keyframes. The fanout reads once and writes each packet to every
 // subscriber's local delivery track.
 type trackFanout struct {
-	remote  *webrtc.TrackRemote
-	mu      sync.RWMutex
-	outputs map[string]*webrtc.TrackLocalStaticRTP
-	stop    chan struct{}
-	once    sync.Once
-	closed  atomic.Bool
+	remote      *webrtc.TrackRemote
+	room        *Room
+	publisherID string
+	mu          sync.RWMutex
+	outputs     map[string]*webrtc.TrackLocalStaticRTP
+	stop        chan struct{}
+	once        sync.Once
+	closed      atomic.Bool
 }
 
-func newTrackFanout(remote *webrtc.TrackRemote) *trackFanout {
+func newTrackFanout(remote *webrtc.TrackRemote, room *Room, publisherID string) *trackFanout {
 	fanout := &trackFanout{
-		remote:  remote,
-		outputs: make(map[string]*webrtc.TrackLocalStaticRTP),
-		stop:    make(chan struct{}),
+		remote:      remote,
+		room:        room,
+		publisherID: publisherID,
+		outputs:     make(map[string]*webrtc.TrackLocalStaticRTP),
+		stop:        make(chan struct{}),
 	}
 	go fanout.run()
 	return fanout
@@ -85,6 +89,12 @@ func (f *trackFanout) run() {
 				log.WithError(err).WithField("trackID", f.remote.ID()).Debug("发布轨道读取结束")
 			}
 			return
+		}
+		// The fanout owns the only ReadRTP loop for this track. Server-side
+		// consumers (meeting-minutes mixing) tap that loop instead of calling
+		// ReadRTP again, which would steal packets from subscribers.
+		if f.remote.Kind() == webrtc.RTPCodecTypeAudio {
+			f.room.deliverAudio(f.publisherID, f.remote, packet)
 		}
 		f.mu.RLock()
 		outputs := make([]*webrtc.TrackLocalStaticRTP, 0, len(f.outputs))

@@ -18,7 +18,6 @@ type Config struct {
 	WebSocket    WebSocket    `mapstructure:"websocket"`
 	FileTransfer FileTransfer `mapstructure:"file_transfer"`
 	Runtime      Runtime      `mapstructure:"runtime"`
-	GLM          GLM          `mapstructure:"glm"`
 	JWT          JWT          `mapstructure:"jwt"`
 	TURN         TURN         `mapstructure:"turn"`
 }
@@ -87,14 +86,6 @@ type Runtime struct {
 	GOMAXPROCS int `mapstructure:"gomaxprocs"` // 最大CPU核心数,0表示使用所有核心
 }
 
-type GLM struct {
-	APIKey      string `mapstructure:"api_key"`
-	ModelOpus   string `mapstructure:"model_opus"`
-	ModelSonnet string `mapstructure:"model_sonnet"`
-	ModelVision string `mapstructure:"model_vision"`
-	BaseURL     string `mapstructure:"base_url"`
-}
-
 func Load() *Config {
 	_ = godotenv.Load()
 
@@ -149,11 +140,6 @@ func setDefaults() {
 	viper.SetDefault("turn.relay_port_max", 49200)  // 中继端口段上界
 	viper.SetDefault("turn.realm", "letshare.fun")
 	viper.SetDefault("runtime.gomaxprocs", 0)                  // 使用所有核心
-	viper.SetDefault("glm.base_url", "https://open.bigmodel.cn/api/paas/v4")
-	viper.SetDefault("glm.model_opus", os.Getenv("GLM_MODEL_OPUS"))
-	viper.SetDefault("glm.model_sonnet", os.Getenv("GLM_MODEL_SONNET"))
-	viper.SetDefault("glm.model_vision", os.Getenv("GLM_MODEL_VISION"))
-	viper.SetDefault("glm.api_key", os.Getenv("GLM_API_KEY"))
 	viper.SetDefault("tls.enabled", false)
 	viper.SetDefault("tls.cert_file", "/etc/letsencrypt/live/ecs.letshare.fun/fullchain.pem")
 	viper.SetDefault("tls.key_file", "/etc/letsencrypt/live/ecs.letshare.fun/privkey.pem")

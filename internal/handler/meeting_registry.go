@@ -246,15 +246,17 @@ type meetingMetaInit struct {
 // 「生产漏字段、测试接缝补齐」类 bug 由 TestMeetingMetaLiteralOnlyExistsInsideTheSharedConstructor 锁死。
 func newMeetingMeta(p meetingMetaInit) *meetingMeta {
 	return &meetingMeta{
-		BreakoutMembers: p.BreakoutMembers,
-		OpenBreakout:    p.OpenBreakout,
-		Host:            p.Host,
-		HostClientID:    p.HostClientID,
-		SourceRoom:      p.SourceRoom,
-		Title:           p.Title,
-		Parent:          p.Parent,
-		life:            meeting.NewMachine(),
-		minutes:         meetingMinutesState{RequireConsent: true},
+		BreakoutMembers:      p.BreakoutMembers,
+		OpenBreakout:         p.OpenBreakout,
+		Host:                 p.Host,
+		HostClientID:         p.HostClientID,
+		SourceRoom:           p.SourceRoom,
+		Title:                p.Title,
+		Parent:               p.Parent,
+		life:                 meeting.NewMachine(),
+		minutes:              meetingMinutesState{RequireConsent: true},
+		minutesReplayPending: make(map[string]bool),
+		minutesSubscriptions: make(map[string]bool),
 	}
 }
 

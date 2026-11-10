@@ -121,6 +121,50 @@ func main() {
 
 	// 创建处理器
 	wsHandler := handler.NewWebSocketHandler(wsService, authService, fileTransferService, jwtService)
+	envFirst := func(keys ...string) string {
+		for _, key := range keys {
+			if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+				return value
+			}
+		}
+		return ""
+	}
+	// Meeting minutes use the fixed server-side Gemini text model on an
+	// OpenAI-compatible gateway. Credentials never reach clients.
+	// MEETING_AI_ENABLED=false still hard-disables the feature; when unset,
+	// a configured key enables it.
+	meetingAIBaseURL := envFirst("MEETING_AI_BASE_URL", "SOMNI_LLM_BASE_URL")
+	meetingAIKey := envFirst("MEETING_AI_API_KEY", "SOMNI_LLM_API_KEY")
+	meetingAIModelName := envFirst("MEETING_AI_MODEL", "SOMNI_LLM_MODEL")
+	meetingAIEnv := strings.TrimSpace(os.Getenv("MEETING_AI_ENABLED"))
+	meetingAIEnabled := strings.EqualFold(meetingAIEnv, "true") ||
+		(meetingAIEnv == "" && strings.TrimSpace(meetingAIKey) != "")
+	meetingBillingEnv := strings.TrimSpace(os.Getenv("MEETING_AI_BILLING_DISABLED"))
+	meetingAIBillingDisabled := meetingBillingEnv == "" || strings.EqualFold(meetingBillingEnv, "true")
+	meetingAIService := handler.NewMeetingAIService(
+		meetingAIKey, meetingAIBaseURL,
+		meetingAIEnabled,
+		meetingAIBillingDisabled,
+		nil,
+	)
+	if meetingAIModelName != "" && !meetingAIService.SetModel(meetingAIModelName) {
+		logrus.WithField("model", meetingAIModelName).Warn("不支持的会议 AI 模型，回退到默认模型")
+	}
+	wsHandler.SetMeetingAIService(meetingAIService)
+	// Somni streaming ASR is the only server-side recognizer. The legacy
+	// chunked WebSocket action is retained, but it also uses this service.
+	wsHandler.SetMeetingASRStreamService(handler.NewMeetingASRStreamService(handler.MeetingASRStreamConfig{
+		HTTPBase:       envFirst("MEETING_ASR_STREAM_HTTP_BASE", "SOMNI_ASR_HTTP_BASE"),
+		WSBase:         envFirst("MEETING_ASR_STREAM_WS_BASE", "SOMNI_ASR_WS_BASE"),
+		Email:          envFirst("MEETING_ASR_STREAM_EMAIL", "SOMNI_ASR_EMAIL"),
+		Password:       envFirst("MEETING_ASR_STREAM_PASSWORD", "SOMNI_ASR_PASSWORD"),
+		LoginType:      envFirst("MEETING_ASR_STREAM_LOGIN_TYPE", "SOMNI_ASR_LOGIN_TYPE"),
+		DevicePlatform: envFirst("MEETING_ASR_STREAM_DEVICE_PLATFORM", "SOMNI_ASR_DEVICE_PLATFORM"),
+		DeviceName:     envFirst("MEETING_ASR_STREAM_DEVICE_NAME", "SOMNI_ASR_DEVICE_NAME"),
+		AppVersion:     envFirst("MEETING_ASR_STREAM_APP_VERSION", "SOMNI_ASR_APP_VERSION"),
+		Timezone:       envFirst("MEETING_ASR_STREAM_TIMEZONE", "SOMNI_ASR_TIMEZONE"),
+	}))
+	wsHandler.LogMeetingAICapabilities()
 	// The SFU is a server-side WebRTC endpoint.  Its ICE host candidates must
 	// be the ECS public address; otherwise browsers only receive Docker/private
 	// 172.x candidates and the signaling layer succeeds while media never does.
@@ -128,7 +172,6 @@ func main() {
 		wsHandler.SetSFU(sfu.MustNewManager(sfu.PublicSettingEngine(cfg.TURN.PublicIP)))
 	}
 	healthHandler := handler.NewHealthHandler(wsService)
-	glmHandler := handler.NewGLMHandler(cfg.GLM)
 
 	// 嵌入式 TURN/STUN 中继（与 HTTP/WS 同进程；凭据签发端点共享同一 secret）
 	var turnRelay *turnserver.Server
@@ -159,7 +202,6 @@ func main() {
 	r.GET("/api/turn-credentials", turnHandler.Credentials)
 	r.GET("/ws", wsHandler.HandleWebSocket)
 	r.GET("/", wsHandler.HandleWebSocket)
-	r.Any("/api/glm/*path", glmHandler.Proxy)
 	// 启动服务器
 	logrus.WithField("port", cfg.Server.Port).Info("启动WebSocket服务器")
 	logrus.WithField("pro_invite_code_set", cfg.FileTransfer.ProInviteCode != "").Info("PRO 邀请码已配置")

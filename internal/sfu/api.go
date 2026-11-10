@@ -45,11 +45,21 @@ func NewAPI(se *webrtc.SettingEngine) (*API, error) {
 func PublicSettingEngine(publicIP string) *webrtc.SettingEngine {
 	se := &webrtc.SettingEngine{}
 	publicIP = strings.TrimSpace(publicIP)
-	if net.ParseIP(publicIP) == nil {
+	ip := net.ParseIP(publicIP)
+	if ip == nil {
+		return se
+	}
+	se.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
+	if ip.IsLoopback() {
+		// A loopback websocket URL is local signaling configuration, not a
+		// public address. Rewriting every host candidate to 127.0.0.1 makes
+		// Pion bind a socket to a real interface while advertising loopback,
+		// so ICE can stay in checking forever. Keep real interface candidates
+		// and include loopback for clients on the same machine.
+		se.SetIncludeLoopbackCandidate(true)
 		return se
 	}
 	se.SetNAT1To1IPs([]string{publicIP}, webrtc.ICECandidateTypeHost)
-	se.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
 	return se
 }
 

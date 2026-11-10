@@ -274,7 +274,7 @@ func (ws *WebSocketService) FindClientByUniqID(uniqID, roomName string) *model.C
 func (ws *WebSocketService) SubscribeToRoom(clientID, roomName, event string) error {
 	// 验证房间名
 	if valid, errMsg := ws.roomService.ValidateRoomName(roomName); !valid {
-		return fmt.Errorf(errMsg)
+		return fmt.Errorf("%s", errMsg)
 	}
 
 	client, exists := ws.GetClient(clientID)

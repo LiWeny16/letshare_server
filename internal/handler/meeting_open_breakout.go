@@ -138,9 +138,11 @@ func (h *WebSocketHandler) syncOpenBreakoutHosts(parentID, hostID, clientID stri
 	h.activeMeetingRooms.Range(func(_, value any) bool {
 		child, ok := value.(*meetingMeta)
 		if ok && child != nil && child.OpenBreakout && child.Parent == parentID {
+			child.meetingASRPublishMu.Lock()
 			child.hostMu.Lock()
 			child.Host, child.HostClientID = hostID, clientID
 			child.hostMu.Unlock()
+			child.meetingASRPublishMu.Unlock()
 		}
 		return true
 	})

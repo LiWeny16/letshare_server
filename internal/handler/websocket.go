@@ -2,6 +2,8 @@ package handler
 
 import (
 	"bytes"
+	crand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +15,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -107,13 +110,30 @@ func (r *ErrorRateLimiter) Allow(clientID string) bool {
 }
 
 type WebSocketHandler struct {
-	wsService           *service.WebSocketService
-	authService         *service.AuthService
-	fileTransferService *service.FileTransferService
-	jwtService          *service.JWTService
-	errorRateLimiter    *ErrorRateLimiter
-	sfuManager          *sfu.Manager
-	meetings            *meetingRegistry
+	wsService            *service.WebSocketService
+	authService          *service.AuthService
+	fileTransferService  *service.FileTransferService
+	jwtService           *service.JWTService
+	errorRateLimiter     *ErrorRateLimiter
+	sfuManager           *sfu.Manager
+	meetings             *meetingRegistry
+	meetingAIService     *MeetingAIService
+	meetingAIRateMu      sync.Mutex
+	meetingAIRates       map[string]meetingAIRateWindow
+	meetingASRRateMu     sync.Mutex
+	meetingASRRates      map[string]meetingAIRateWindow
+	meetingASRChunkSemMu sync.Mutex
+	meetingASRChunkSem   chan struct{}
+	// captionsEnabled is intentionally false in production while caption UI
+	// entry points are disabled. Same-package handler tests can opt in before
+	// starting their test server to keep the retained implementation covered.
+	captionsEnabled bool
+	// meetingASRErrorAt throttles "recognizer unavailable" replies so a client
+	// that keeps streaming audio cannot flood the socket with the same frame.
+	meetingASRErrorAt    map[string]time.Time
+	meetingASRStream     *MeetingASRStreamService
+	meetingASRStreams    sync.Map // roomID+clientID -> *meetingASRStreamState
+	meetingAudioSessions sync.Map // roomID -> *meetingAudioMinutesSession
 	// activeMeetingRooms 保存当前合法的（已登记）会议号 → *meetingMeta。
 	// 会议号与 SFU 房间名（message.Channel）是同一个值；加入前需在此存在才放行。
 	activeMeetingRooms sync.Map
@@ -144,7 +164,15 @@ type meetingMeta struct {
 	Title        string // 会议标题（可选，≤64 字）
 	Parent       string // breakout 房间指向主会议号；主会议为空
 	mu           sync.Mutex
-	BreakoutName string // self-service room name; protected by mu, independent of meeting title
+	// meetingASRPublishMu orders ASR delivery against caption consent,
+	// membership, and recording transitions.
+	meetingASRPublishMu sync.Mutex
+	// minutesDeliveryMu serializes personal receive-preference changes against
+	// every shared transcript/summary/replay delivery.
+	minutesDeliveryMu sync.Mutex
+	// minutesSummaryMu permits only one room-level summary completion at a time.
+	minutesSummaryMu sync.Mutex
+	BreakoutName     string // self-service room name; protected by mu, independent of meeting title
 	// Protected by meetingLifecycleMu; prevents host reassignment while moving rooms.
 	breakoutHostSwitchID       string
 	breakoutHostSwitchDeadline time.Time
@@ -155,13 +183,33 @@ type meetingMeta struct {
 	emptyGen   uint64 // 递增代次：已被替换/停掉的陈旧回调据此作废，不得拆除新计时器保护的会议
 	// life 相位状态机（reserved/live/grace/ended），唯一写者 internal/meeting（A1/A2），
 	// 唯一构造入口 newMeetingMeta（防「生产漏字段 / 测试接缝补齐」分叉）。
-	life              *meeting.Machine
-	presentation      meetingPresentationState
-	excalidraw        meetingExcalidrawState
-	minutes           meetingMinutesState
-	minutesPending    []meetingMinutesSegment
-	minutesFlushTimer *time.Timer
-	chatHistory       []meetingChatEntry
+	life                                    *meeting.Machine
+	presentation                            meetingPresentationState
+	excalidraw                              meetingExcalidrawState
+	minutes                                 meetingMinutesState
+	minutesPending                          []meetingMinutesSegment
+	minutesFlushTimer                       *time.Timer
+	minutesSegments                         []meetingMinutesSegment
+	minutesSegmentsBytes                    int
+	minutesReplayPending                    map[string]bool
+	minutesSubscriptions                    map[string]bool
+	minutesSummaryRequestedRecordingID      string
+	minutesSummaryRequestedCoordinatorEpoch uint64
+	minutesSummaryRequestedThroughSeq       uint64
+	minutesSummaryRequestedAt               time.Time
+	minutesSummaryCachedOutput              string
+	minutesSummaryCacheValid                bool
+	minutesASRErrorAt                       time.Time
+	minutesASRErrorEpoch                    string
+	// captionViewers 个人字幕的请求方 websocket 会话集合（clientID → true）。
+	// 纯内存态：永不序列化、永不落盘、永不写入日志；对外只广播聚合后的
+	// captionActive 布尔，绝不泄露请求方身份。成员显式离场 / 被移出 / 断线 /
+	// 重连顶替时移除条目，避免被遗弃的字幕请求让其他成员的麦克风无限期开启。
+	captionViewers map[string]bool
+	chatHistory    []meetingChatEntry
+	// aiTranscript is a bounded in-memory ring used only for private
+	// meeting-assistant questions. It is never persisted or broadcast.
+	aiTranscript []meetingMinutesSegment
 }
 
 type meetingChatEntry struct {
@@ -214,11 +262,31 @@ type meetingExcalidrawState struct {
 	OperationOrder []string
 }
 
-// meetingMinutesState intentionally contains no provider API key. Keys stay in
-// the host browser and are never placed on the meeting WebSocket.
+// meetingMinutesState intentionally contains no provider API key. Credentials
+// stay on the server and are never placed on the meeting WebSocket.
 type meetingMinutesState struct {
-	Configured      bool            `json:"configured"`
-	Running         bool            `json:"running"`
+	Configured bool `json:"configured"`
+	Running    bool `json:"running"`
+	// ServerMix reports that this deployment can mix every current publisher
+	// and run server-side ASR. AI reports that fixed Gemini is configured.
+	ServerMix         bool `json:"serverMix"`
+	AI                bool `json:"ai"`
+	CapabilitiesKnown bool `json:"capabilitiesKnown"`
+	// RecordingID 是纪要录制的 wire-contract 录制代次（epoch）标识：仅在房主
+	// 真正 start 一段新录制时由服务端用 crypto/rand 生成的不可预测值覆盖并随
+	// started 广播；停止后保留以便挂起批次按旧代次投递，下一次 start 永不复用。
+	// 前端只持久化携带当前 recordingId 的转写帧，从而与延迟到达的旧批次天然
+	// 隔离。该值永不写入日志或磁盘。
+	RecordingID             string `json:"recordingId"`
+	LatestSegmentSeq        uint64 `json:"latestSegmentSeq"`
+	SummaryThroughSeq       uint64 `json:"summaryThroughSeq"`
+	HistoryStartSeq         uint64 `json:"historyStartSeq"`
+	SummaryCoordinatorID    string `json:"summaryCoordinatorId"`
+	SummaryCoordinatorEpoch uint64 `json:"summaryCoordinatorEpoch"`
+	SummaryLanguage         string `json:"summaryLanguage"`
+	// CaptionActive 个人字幕的房间级聚合开关：任意成员请求即 true，由
+	// caption-subscribe 与成员清理路径维护，随公开 minutes 状态广播给全员。
+	CaptionActive   bool            `json:"captionActive"`
 	RequireConsent  bool            `json:"requireConsent"`
 	AsrSource       string          `json:"asrSource,omitempty"`
 	AsrModel        string          `json:"asrModel,omitempty"`
@@ -233,20 +301,53 @@ type meetingMinutesState struct {
 // can emit many short finals, but the host summary pipeline does not need a
 // WebSocket frame for every one of them.
 type meetingMinutesSegment struct {
-	SegmentID   string `json:"segmentId"`
+	SegmentID string `json:"segmentId"`
+	Seq       uint64 `json:"seq,omitempty"`
+	// RecordingID 只回传发送方自带且与到达时正在运行的录制代次完全匹配的值；
+	// 其余一律清空（omitempty 下线），服务端绝不代为推断或补写录制代次。
+	RecordingID string `json:"recordingId,omitempty"`
 	Text        string `json:"text"`
 	StartMs     int64  `json:"startMs"`
 	EndMs       int64  `json:"endMs"`
 	Final       bool   `json:"final"`
 	From        string `json:"from,omitempty"`
 	SpeakerName string `json:"speakerName,omitempty"`
+	Language    string `json:"language,omitempty"`
 }
 
 const (
-	meetingMinutesFlushDelay    = 1200 * time.Millisecond
-	meetingMinutesMaxBatch      = 12
-	meetingMinutesMaxBatchBytes = 24 * 1024
+	meetingMinutesFlushDelay         = 1200 * time.Millisecond
+	meetingMinutesMaxBatch           = 12
+	meetingMinutesMaxBatchBytes      = 24 * 1024
+	meetingMinutesHistoryMaxSegments = 120
+	meetingMinutesHistoryMaxBytes    = 256 * 1024
 )
+
+// meetingMinutesRecordingIDMaxLen caps wire-supplied recording IDs. IDs the
+// server generates are 32 lowercase hex characters; longer client values are
+// invalid and collapse to empty so they can never match a running recording.
+const meetingMinutesRecordingIDMaxLen = 128
+
+// newMeetingRecordingID returns an unpredictable per-start recording epoch ID
+// from crypto/rand. The v4 UUID fallback stays collision-resistant if the
+// system entropy source ever fails.
+func newMeetingRecordingID() string {
+	buf := make([]byte, 16)
+	if _, err := crand.Read(buf); err == nil {
+		return hex.EncodeToString(buf)
+	}
+	return uuid.NewString()
+}
+
+// sanitizeMeetingRecordingID trims and size-bounds a wire-supplied recording
+// ID without ever retaining or logging its content.
+func sanitizeMeetingRecordingID(raw string) string {
+	id := strings.TrimSpace(raw)
+	if len(id) > meetingMinutesRecordingIDMaxLen {
+		return ""
+	}
+	return id
+}
 
 // Excalidraw embeds image data as data URLs. Keep the snapshot bounded, but
 // allow ordinary screenshots and small reference images to be shared. The
@@ -1037,6 +1138,13 @@ func (h *WebSocketHandler) handleMeetingJoin(client *model.Client, message *mode
 	if len(previous) > 0 {
 		h.releaseMeetingPresentation(message.Channel, uniqID)
 		_ = room.RemoveParticipant(uniqID, "meeting-rebind")
+		// A rebind means the previous websocket session is gone: its caption
+		// viewer flag must not survive the connection swap (reconnect cleanup).
+		for _, old := range previous {
+			if captionState, changed := h.removeMeetingCaptionViewer(message.Channel, old.ClientID); changed {
+				h.broadcastMeetingCaptions(message.Channel, captionState)
+			}
+		}
 	}
 	// 已关闭的参与者（PC failed/closed）必须显式摘除后才能重建：它的 fanout 已停摆，
 	// 若复用，重连方会拿到一个「已关闭」的 participant，发布 offer 被拒、订阅绑到死轨，
@@ -1050,7 +1158,7 @@ func (h *WebSocketHandler) handleMeetingJoin(client *model.Client, message *mode
 			h.broadcastMeetingMembership(message.Channel, "leave", uniqID, client.ID)
 			h.broadcastMeetingMembership(message.Channel, "join", uniqID, client.ID)
 		}
-		h.sendMeetingInfo(message.Channel, uniqID, meta)
+		h.sendMeetingJoinSnapshot(message.Channel, uniqID, client.ID, meta)
 		h.sendMeetingChatHistory(client, message.Channel)
 		h.broadcastBreakoutRooms(message.Channel)
 		return
@@ -1059,6 +1167,11 @@ func (h *WebSocketHandler) handleMeetingJoin(client *model.Client, message *mode
 	if err != nil {
 		// 未真正入会：回滚 enterMeetingLive 的成员登记，不得留下幽灵在册成员。
 		h.meetings.leave(message.Channel, uniqID, client.ID)
+		meta.minutesDeliveryMu.Lock()
+		meta.mu.Lock()
+		delete(meta.minutesReplayPending, client.ID)
+		meta.mu.Unlock()
+		meta.minutesDeliveryMu.Unlock()
 		h.sendError(client, 500, "meeting:join 失败: "+err.Error())
 		// R2：失败出口也必须排下一次 —— 若此失败把会议留在无人状态，退回 PhaseGrace。
 		h.enterMeetingGrace(message.Channel, meetingEndReasonGraceArmed, logrus.Fields{
@@ -1076,7 +1189,7 @@ func (h *WebSocketHandler) handleMeetingJoin(client *model.Client, message *mode
 		h.forwardMeetingICE(message.Channel, uniqID, c, "")
 	})
 	// 定向告知会议信息（房主/标题）：前端用于房主徽章、控制按钮和无媒体入会状态。
-	h.sendMeetingInfo(message.Channel, uniqID, meta)
+	h.sendMeetingJoinSnapshot(message.Channel, uniqID, client.ID, meta)
 	h.sendMeetingChatHistory(client, message.Channel)
 	h.broadcastBreakoutRooms(message.Channel)
 }
@@ -1257,6 +1370,7 @@ func (h *WebSocketHandler) setMeetingHost(roomID, hostID, trigger string) bool {
 	if !loaded || !ok || meta == nil {
 		return false
 	}
+	meta.meetingASRPublishMu.Lock()
 	var next meetingMembership
 	found := false
 	for _, member := range h.meetings.members(roomID) {
@@ -1270,17 +1384,20 @@ func (h *WebSocketHandler) setMeetingHost(roomID, hostID, trigger string) bool {
 		next, found = h.openBreakoutMember(roomID, hostID)
 	}
 	if !found {
+		meta.meetingASRPublishMu.Unlock()
 		return false
 	}
 	meta.hostMu.Lock()
 	if meta.Host == next.UniqID && meta.HostClientID == next.ClientID {
 		meta.hostMu.Unlock()
+		meta.meetingASRPublishMu.Unlock()
 		return true
 	}
 	prevHost, prevHostClient := meta.Host, meta.HostClientID
 	meta.Host = next.UniqID
 	meta.HostClientID = next.ClientID
 	meta.hostMu.Unlock()
+	meta.meetingASRPublishMu.Unlock()
 	if meta.Parent == "" {
 		h.syncOpenBreakoutHosts(roomID, next.UniqID, next.ClientID)
 	}
@@ -1339,7 +1456,13 @@ func (h *WebSocketHandler) transferMeetingHost(roomID, leavingUniqID string) {
 // (emptyTimer re-armed), never an immediate teardown —— 会议号必须存活，
 // 重入必须成功（C-17/C-20）。room 为 nil（SFU 房间已不在）时同样必须留痕并走完判定。
 func (h *WebSocketHandler) finishMeetingMemberLeave(roomID string, member meetingMembership, clientID string, room *sfu.Room, explicitLeave bool, switching bool) {
+	h.reconcileMeetingMinutesCoordinator(roomID)
 	h.releaseMeetingPresentation(roomID, member.UniqID)
+	if value, ok := h.meetingAudioSessions.Load(roomID); ok {
+		if session, ok := value.(*meetingAudioMinutesSession); ok && session != nil {
+			session.removePublisher(member.UniqID)
+		}
+	}
 	if room != nil {
 		_ = room.RemoveParticipant(member.UniqID, "meeting-member-leave")
 	}
@@ -1391,12 +1514,23 @@ func (h *WebSocketHandler) sendMeetingInfo(roomID, userID string, meta *meetingM
 	if meta == nil {
 		return
 	}
+	meta.minutesDeliveryMu.Lock()
+	defer meta.minutesDeliveryMu.Unlock()
+	if !meetingMinutesRoomCurrent(h, roomID, meta) {
+		return
+	}
 	meta.mu.Lock()
 	presentation := meta.presentation
 	excalidrawScene := append(json.RawMessage(nil), meta.excalidraw.Scene...)
 	excalidrawRevision := meta.excalidraw.Revision
-	minutes := meta.minutes
-	minutes.Consented = nil
+	minutes := meetingMinutesWireState(meta.minutes)
+	minutesEnabled := minutesSubscriptionEnabledLocked(meta, userID)
+	if !minutesEnabled {
+		minutes.Summary = ""
+	}
+	minutes.ServerMix = h.meetingASRStream != nil && h.meetingASRStream.Enabled()
+	minutes.AI = h.meetingAIService != nil && h.meetingAIService.Enabled()
+	minutes.CapabilitiesKnown = true
 	title := meta.Title
 	meta.mu.Unlock()
 	if meta.OpenBreakout {
@@ -1411,13 +1545,120 @@ func (h *WebSocketHandler) sendMeetingInfo(roomID, userID string, meta *meetingM
 	meta.hostMu.Unlock()
 	h.sendMeetingToUser(roomID, userID, model.MessageTypeMeetingInfo, map[string]interface{}{
 		"roomId": roomID, "host": host, "title": title, "minutes": minutes,
-		"joined": true, "presentation": presentation,
+		"minutesSubscription": map[string]bool{"enabled": minutesEnabled},
+		"joined":              true, "presentation": presentation,
 	})
 	if len(excalidrawScene) > 0 {
 		h.sendMeetingToUser(roomID, userID, model.MessageTypeMeetingExcalidraw, map[string]interface{}{
 			"action": "snapshot", "revision": excalidrawRevision, "delta": false, "scene": json.RawMessage(excalidrawScene),
 		})
 	}
+}
+
+// sendMeetingJoinSnapshot serializes the meeting info + transcript replay with
+// server-mixed ASR publication. The join path has already registered the
+// member, but replay-pending suppresses live segments until this snapshot is
+// sent so the client never applies transcript data before its epoch state.
+func (h *WebSocketHandler) sendMeetingJoinSnapshot(roomID, userID, clientID string, meta *meetingMeta) {
+	if meta == nil {
+		return
+	}
+	meta.meetingASRPublishMu.Lock()
+	defer meta.meetingASRPublishMu.Unlock()
+	current, active := h.activeMeetingRoom(roomID)
+	if !active || current != meta || !h.meetings.owns(roomID, userID, clientID) {
+		return
+	}
+	members := h.meetings.members(roomID)
+	meta.mu.Lock()
+	coordinatorChanged := electMeetingMinutesCoordinatorLocked(meta, members, userID)
+	minutesState := meetingMinutesWireState(meta.minutes)
+	meta.mu.Unlock()
+	h.sendMeetingInfo(roomID, userID, meta)
+	h.sendMeetingMinutesReplay(roomID, clientID, meta, 0, false)
+	meta.minutesDeliveryMu.Lock()
+	meta.mu.Lock()
+	delete(meta.minutesReplayPending, clientID)
+	meta.mu.Unlock()
+	meta.minutesDeliveryMu.Unlock()
+	if coordinatorChanged {
+		h.broadcastMeetingMinutesState(roomID, "coordinator", minutesState)
+	}
+}
+
+func (h *WebSocketHandler) sendMeetingMinutesReplay(roomID, clientID string, meta *meetingMeta, afterSeq uint64, includeState bool) {
+	if meta == nil {
+		return
+	}
+	uniqID := ""
+	for _, member := range h.meetings.members(roomID) {
+		if member.ClientID == clientID {
+			uniqID = member.UniqID
+			break
+		}
+	}
+	if uniqID == "" {
+		return
+	}
+	meta.minutesDeliveryMu.Lock()
+	defer meta.minutesDeliveryMu.Unlock()
+	if !meetingMinutesRoomCurrent(h, roomID, meta) || !h.meetings.owns(roomID, uniqID, clientID) {
+		return
+	}
+	meta.mu.Lock()
+	if !minutesSubscriptionEnabledLocked(meta, uniqID) {
+		meta.mu.Unlock()
+		return
+	}
+	recordingID := meta.minutes.RecordingID
+	latestSeq := meta.minutes.LatestSegmentSeq
+	state := meetingMinutesWireState(meta.minutes)
+	segments := make([]meetingMinutesSegment, 0, len(meta.minutesSegments))
+	if recordingID != "" {
+		for _, segment := range meta.minutesSegments {
+			if segment.RecordingID == recordingID && segment.Seq > afterSeq && segment.Seq > 0 {
+				segments = append(segments, segment)
+			}
+		}
+	}
+	meta.mu.Unlock()
+	if recordingID == "" {
+		return
+	}
+	if includeState {
+		h.sendMeetingToClient(clientID, roomID, model.MessageTypeMeetingMinutes, map[string]interface{}{
+			"kind": "replay-state", "recordingId": recordingID, "minutes": state,
+			"minutesSubscription": map[string]bool{"enabled": true},
+		})
+	}
+	if len(segments) == 0 {
+		h.sendMeetingToClient(clientID, roomID, model.MessageTypeMeetingMinutes, map[string]interface{}{
+			"kind": "segments", "recordingId": recordingID, "replay": true,
+			"afterSeq": afterSeq, "throughSeq": latestSeq, "latestSegmentSeq": latestSeq,
+			"segments": []meetingMinutesSegment{},
+		})
+		return
+	}
+
+	batch := make([]meetingMinutesSegment, 0, meetingMinutesMaxBatch)
+	sendBatch := func() {
+		if len(batch) == 0 {
+			return
+		}
+		h.sendMeetingToClient(clientID, roomID, model.MessageTypeMeetingMinutes, map[string]interface{}{
+			"kind": "segments", "recordingId": recordingID, "replay": true,
+			"fromSeq": batch[0].Seq, "throughSeq": batch[len(batch)-1].Seq, "latestSegmentSeq": latestSeq,
+			"segments": batch,
+		})
+	}
+	for _, segment := range segments {
+		if len(batch) > 0 && (len(batch) >= meetingMinutesMaxBatch || meetingMinutesBatchBytes(append(batch, segment)) > meetingMinutesMaxBatchBytes) {
+			sendBatch()
+			batch = make([]meetingMinutesSegment, 0, meetingMinutesMaxBatch)
+		}
+		batch = append(batch, segment)
+	}
+	sendBatch()
 }
 
 func (h *WebSocketHandler) handleMeetingLeave(client *model.Client, message *model.WebSocketMessage) {
@@ -1441,6 +1682,7 @@ func (h *WebSocketHandler) handleMeetingLeave(client *model.Client, message *mod
 	if lockedSwitch {
 		switching = h.isAuthorizedBreakoutSwitch(roomName, data.SwitchTo, client.UniqID)
 	}
+	asrMeta, hasASRMeeting, asrStates := h.beginMeetingASRMemberTransition(roomName, client.ID)
 	member, left := h.meetings.leave(roomName, client.UniqID, client.ID)
 	if switching && left {
 		h.beginBreakoutHostSwitchLocked(roomName, client.UniqID)
@@ -1448,6 +1690,7 @@ func (h *WebSocketHandler) handleMeetingLeave(client *model.Client, message *mod
 	if lockedSwitch {
 		h.meetingLifecycleMu.Unlock()
 	}
+	h.finishMeetingASRMemberTransition(roomName, client.ID, asrMeta, hasASRMeeting, left, asrStates)
 	if !left {
 		return
 	}
@@ -1494,22 +1737,30 @@ func (h *WebSocketHandler) endMeetingLocked(roomID, reason string, ctx logrus.Fi
 	parentRoomID := meta.Parent
 	membersRemaining := len(h.meetings.members(roomID))
 	h.stopEmptyTimerLocked(meta)
+	meta.meetingASRPublishMu.Lock()
+	asrStreams := h.lockMeetingASRStreamsForRoom(roomID)
+	meta.minutesDeliveryMu.Lock()
 	meta.mu.Lock()
 	if meta.minutesFlushTimer != nil {
 		meta.minutesFlushTimer.Stop()
 		meta.minutesFlushTimer = nil
 	}
 	meta.minutesPending = nil
+	meta.captionViewers = nil
 	meta.mu.Unlock()
+	h.activeMeetingRooms.Delete(roomID) // 释放会议号
+	h.finishMeetingASRStreamTransition(asrStreams, nil)
+	meta.meetingASRPublishMu.Unlock()
 	clientReason := meetingClientReasonForEnd(reason)
 	if clientReason != "" {
 		h.broadcastMeetingMembers(roomID, nil, model.MessageTypeMeetingEnded, map[string]interface{}{
 			"roomId": roomID, "reason": clientReason,
 		}, "")
 	}
-	h.activeMeetingRooms.Delete(roomID) // 释放会议号
+	h.stopMeetingAudioMinutes(roomID)
 	h.sfuManager.RemoveRoomWithReason(roomID, reason)
 	h.meetings.clear(roomID)
+	meta.minutesDeliveryMu.Unlock()
 	// 观测：「会议没了」的权威记录 —— 每次 End 恰好一条 action=teardown。
 	logMeetingTeardown(reason, roomID, parentRoomID, clientReason != "", loaded, membersRemaining, ctx)
 	// 级联：拆除以本房间为父的 breakout 房间（递归深度恒为 1，Parent 指向主会议号）。
@@ -1544,6 +1795,13 @@ func (h *WebSocketHandler) isMeetingHost(roomID string, client *model.Client, me
 	return hostClientID == client.ID
 }
 
+// isCurrentMeetingHost rejects a stale room pointer after teardown/reuse and
+// rechecks both host ownership and membership at a serialized transition.
+func (h *WebSocketHandler) isCurrentMeetingHost(roomID string, client *model.Client, meta *meetingMeta) bool {
+	current, active := h.activeMeetingRoom(roomID)
+	return active && current == meta && h.meetings.owns(roomID, client.UniqID, client.ID) && h.isMeetingHost(roomID, client, meta)
+}
+
 // cleanupMeetingState 客户端断线后的会议侧清理：
 //  1. 从所有 SFU 房间移除其参与者；房间变空则进入 PhaseGrace（重入即停表），不立即回收——
 //     正常流程"创建→路由跳转(WS 弹跳)→join"依赖这一点。
@@ -1560,11 +1818,49 @@ func (h *WebSocketHandler) cleanupMeetingState(client *model.Client) {
 // removed by the generic inactivity sweeper rather than HandleWebSocket's
 // read loop.
 func (h *WebSocketHandler) cleanupMeetingClientID(clientID string) {
-	removed := h.meetings.leaveClient(clientID)
-	for _, member := range removed {
+	// Serialize disconnect with join/rebind, then remove the exact client owner
+	// while each room's ASR publication guard is held. Pending Somni Open calls
+	// recheck ownership before they can install a stream.
+	type leavingMember struct {
+		member meetingMembership
+		meta   *meetingMeta
+		has    bool
+		states []*meetingASRStreamState
+	}
+	var candidates []meetingMembership
+	h.meetingLifecycleMu.Lock()
+	h.activeMeetingRooms.Range(func(key, _ any) bool {
+		roomID, ok := key.(string)
+		if !ok {
+			return true
+		}
+		for _, member := range h.meetings.members(roomID) {
+			if member.ClientID == clientID {
+				candidates = append(candidates, member)
+			}
+		}
+		return true
+	})
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].RoomID < candidates[j].RoomID })
+	leaving := make([]leavingMember, 0, len(candidates))
+	for _, candidate := range candidates {
+		meta, hasMeeting, states := h.beginMeetingASRMemberTransition(candidate.RoomID, clientID)
+		member, left := h.meetings.leave(candidate.RoomID, candidate.UniqID, clientID)
+		if left {
+			leaving = append(leaving, leavingMember{member: member, meta: meta, has: hasMeeting, states: states})
+		} else {
+			leaving = append(leaving, leavingMember{meta: meta, has: hasMeeting, states: states})
+		}
+	}
+	h.meetingLifecycleMu.Unlock()
+	for _, item := range leaving {
+		h.finishMeetingASRMemberTransition(item.member.RoomID, clientID, item.meta, item.has, item.member.RoomID != "", item.states)
+		if item.member.RoomID == "" {
+			continue
+		}
 		// V0.1 无痕点②：SFU 房间已不在时成员级离场也必须留痕并走完生命周期判定。
-		room, _ := h.sfuManager.GetRoom(member.RoomID)
-		h.finishMeetingMemberLeave(member.RoomID, member, clientID, room, false, false)
+		room, _ := h.sfuManager.GetRoom(item.member.RoomID)
+		h.finishMeetingMemberLeave(item.member.RoomID, item.member, clientID, room, false, false)
 	}
 	// 登记但从未进入的会议（房主断线）：进入 PhaseGrace，宽限后回收。
 	h.activeMeetingRooms.Range(func(key, value any) bool {
@@ -1956,7 +2252,12 @@ func (h *WebSocketHandler) handleMeetingKick(client *model.Client, message *mode
 	h.sendMeetingToUser(roomID, m.To, model.MessageTypeMeetingKicked, map[string]interface{}{
 		"roomId": roomID,
 	})
-	h.meetings.leave(roomID, m.To, targetClientID)
+	asrMeta, hasASRMeeting, asrStates := h.beginMeetingASRMemberTransition(roomID, targetClientID)
+	_, left := h.meetings.leave(roomID, m.To, targetClientID)
+	h.finishMeetingASRMemberTransition(roomID, targetClientID, asrMeta, hasASRMeeting, left, asrStates)
+	if !left {
+		return
+	}
 	h.revokeOpenBreakoutAccess(roomID, m.To)
 	// 从 SFU 房间移除（断其上下行媒体）
 	if room, ok := h.sfuManager.GetRoom(roomID); ok {
@@ -2137,8 +2438,9 @@ func (h *WebSocketHandler) handleMeetingChat(client *model.Client, message *mode
 		return
 	}
 	var m struct {
-		Text string `json:"text"`
-		To   string `json:"to"`
+		Text      string `json:"text"`
+		To        string `json:"to"`
+		RequestID string `json:"requestId"`
 	}
 	if err := json.Unmarshal(message.Data, &m); err != nil {
 		h.sendError(client, 400, "meeting:chat 数据格式错误")
@@ -2150,6 +2452,10 @@ func (h *WebSocketHandler) handleMeetingChat(client *model.Client, message *mode
 	}
 	if len(text) > meetingChatMaxLen {
 		text = text[:meetingChatMaxLen]
+	}
+	if m.To == meetingAssistantID {
+		h.handleMeetingAssistantChat(client, roomID, text, m.RequestID)
+		return
 	}
 
 	// 定向私聊：目标必须仍是本会议成员（roomID == meetingID，杜绝跨会议/跨房间）
@@ -2231,37 +2537,85 @@ func (h *WebSocketHandler) handleMeetingDraw(client *model.Client, message *mode
 }
 
 type meetingMinutesMsg struct {
-	Action          string                  `json:"action"`
-	RequireConsent  bool                    `json:"requireConsent"`
-	AsrSource       string                  `json:"asrSource"`
-	AsrModel        string                  `json:"asrModel"`
-	SummaryProvider string                  `json:"summaryProvider"`
-	SummaryModel    string                  `json:"summaryModel"`
-	Accepted        bool                    `json:"accepted"`
-	SegmentID       string                  `json:"segmentId"`
-	Text            string                  `json:"text"`
-	StartMs         int64                   `json:"startMs"`
-	EndMs           int64                   `json:"endMs"`
-	Final           bool                    `json:"final"`
-	Summary         string                  `json:"summary"`
-	Segments        []meetingMinutesSegment `json:"segments"`
+	Action           string                  `json:"action"`
+	Enabled          bool                    `json:"enabled"`
+	RequireConsent   bool                    `json:"requireConsent"`
+	AsrSource        string                  `json:"asrSource"`
+	AsrModel         string                  `json:"asrModel"`
+	SummaryProvider  string                  `json:"summaryProvider"`
+	SummaryModel     string                  `json:"summaryModel"`
+	Accepted         bool                    `json:"accepted"`
+	RecordingID      string                  `json:"recordingId,omitempty"`
+	CoordinatorEpoch uint64                  `json:"coordinatorEpoch,omitempty"`
+	ThroughSeq       *uint64                 `json:"throughSeq,omitempty"`
+	AfterSeq         *uint64                 `json:"afterSeq,omitempty"`
+	SummaryLanguage  string                  `json:"summaryLanguage,omitempty"`
+	SegmentID        string                  `json:"segmentId"`
+	Text             string                  `json:"text"`
+	StartMs          int64                   `json:"startMs"`
+	EndMs            int64                   `json:"endMs"`
+	Final            bool                    `json:"final"`
+	Summary          string                  `json:"summary"`
+	Language         string                  `json:"language"`
+	Segments         []meetingMinutesSegment `json:"segments"`
 }
 
 func meetingMinutesBatchBytes(segments []meetingMinutesSegment) int {
 	total := 0
 	for _, segment := range segments {
-		total += len(segment.Text) + len(segment.SegmentID) + 48
+		total += len(segment.Text) + len(segment.SegmentID) + len(segment.RecordingID) + 48
 	}
 	return total
 }
 
-// queueMeetingMinutesSegments sends transcript batches to the current host
-// only. Members still receive the final structured summary, but raw transcript
-// text is not fanned out to every participant.
+func meetingMinutesHistoryEntryBytes(segment meetingMinutesSegment) int {
+	return len(segment.Text) + len(segment.SegmentID) + len(segment.RecordingID) + len(segment.From) + len(segment.SpeakerName) + len(segment.Language) + 96
+}
+
+func resetMeetingMinutesEpochLocked(meta *meetingMeta) {
+	meta.minutes.LatestSegmentSeq = 0
+	meta.minutes.SummaryThroughSeq = 0
+	meta.minutes.HistoryStartSeq = 0
+	meta.minutes.Summary = ""
+	meta.minutesSegments = nil
+	meta.minutesSegmentsBytes = 0
+	meta.minutesSummaryRequestedRecordingID = ""
+	meta.minutesSummaryRequestedCoordinatorEpoch = 0
+	meta.minutesSummaryRequestedThroughSeq = 0
+	meta.minutesSummaryRequestedAt = time.Time{}
+	meta.minutesSummaryCachedOutput = ""
+	meta.minutesSummaryCacheValid = false
+}
+
+func appendMeetingMinutesHistoryLocked(meta *meetingMeta, segment meetingMinutesSegment) {
+	meta.minutesSegments = append(meta.minutesSegments, segment)
+	meta.minutesSegmentsBytes += meetingMinutesHistoryEntryBytes(segment)
+	for len(meta.minutesSegments) > meetingMinutesHistoryMaxSegments || meta.minutesSegmentsBytes > meetingMinutesHistoryMaxBytes {
+		oldest := meta.minutesSegments[0]
+		meta.minutesSegmentsBytes -= meetingMinutesHistoryEntryBytes(oldest)
+		meta.minutesSegments[0] = meetingMinutesSegment{}
+		meta.minutesSegments = meta.minutesSegments[1:]
+	}
+	if len(meta.minutesSegments) > 0 {
+		meta.minutes.HistoryStartSeq = meta.minutesSegments[0].Seq
+	} else if meta.minutes.LatestSegmentSeq > 0 {
+		meta.minutes.HistoryStartSeq = meta.minutes.LatestSegmentSeq + 1
+	} else {
+		meta.minutes.HistoryStartSeq = 0
+	}
+}
+
+// queueMeetingMinutesSegments batches final transcript segments in memory and
+// flushes them room-wide: every authorized current meeting member receives the
+// batch, including the sender (its client dedupes the own echo by segmentId).
+// Caption-only senders are checked for consent; the minutes notice never gates
+// the server mixer or recipients.
+// Nothing is persisted and nothing is replayed to later joiners.
 func (h *WebSocketHandler) queueMeetingMinutesSegments(roomID string, meta *meetingMeta, segments []meetingMinutesSegment) {
 	if meta == nil || len(segments) == 0 {
 		return
 	}
+	h.appendMeetingAITranscript(roomID, segments)
 	meta.mu.Lock()
 	meta.minutesPending = append(meta.minutesPending, segments...)
 	flushNow := len(meta.minutesPending) >= meetingMinutesMaxBatch || meetingMinutesBatchBytes(meta.minutesPending) >= meetingMinutesMaxBatchBytes
@@ -2293,19 +2647,113 @@ func (h *WebSocketHandler) flushMeetingMinutesSegments(roomID string, expected *
 	}
 	segments := append([]meetingMinutesSegment(nil), meta.minutesPending...)
 	meta.minutesPending = nil
+	pendingClients := make(map[string]bool, len(meta.minutesReplayPending))
+	for clientID, pending := range meta.minutesReplayPending {
+		pendingClients[clientID] = pending
+	}
 	meta.mu.Unlock()
-	meta.hostMu.Lock()
-	hostClientID := meta.HostClientID
-	meta.hostMu.Unlock()
 
-	h.sendMeetingToClient(hostClientID, roomID, model.MessageTypeMeetingMinutes, map[string]interface{}{
-		"kind": "segments", "segments": segments,
-	})
+	payload := map[string]interface{}{"kind": "segments", "segments": segments}
+	h.sendMeetingMinutesToEnabledMembersExcept(roomID, meta, payload, pendingClients)
 }
 
-// handleMeetingMinutes owns the non-media AI collaboration plane. Provider
-// credentials are intentionally not accepted here: they remain in the host
-// browser and are used only for the BYOK request.
+// meetingMinutesWireState strips the in-memory-only maps before a state
+// snapshot is placed on the wire. Both maps are also tagged json:"-"; nil'ing
+// them here is defense in depth against accidentally serializing consent or
+// segment-dedupe state.
+func meetingMinutesWireState(state meetingMinutesState) meetingMinutesState {
+	state.Consented = nil
+	state.SeenSegments = nil
+	return state
+}
+
+// normalizeMeetingLanguage keeps only the explicitly supported per-speaker
+// caption languages (zh-CN / en-US). Unknown or empty values are relayed as
+// empty so a mixed Chinese/English room never locks viewers to one wrong
+// source language.
+func normalizeMeetingLanguage(language string) string {
+	switch language {
+	case "zh-CN", "en-US":
+		return language
+	default:
+		return ""
+	}
+}
+
+// clearMeetingMinutesConsentIfIdle drops stored consent once neither captions
+// nor minutes remain active, so a later session always requires a fresh
+// opt-in. Consent survives while either service stays active.
+func clearMeetingMinutesConsentIfIdle(meta *meetingMeta) {
+	if meta == nil {
+		return
+	}
+	if !meta.minutes.Running && !meta.minutes.CaptionActive {
+		meta.minutes.Consented = make(map[string]bool)
+	}
+}
+
+// updateMeetingCaptionViewer records one websocket session's personal-caption
+// viewer flag and recomputes the room-active flag from the viewer set. The
+// returned snapshot is the public minutes state only: viewer identities stay
+// in memory and are never broadcast, persisted or logged.
+func (h *WebSocketHandler) updateMeetingCaptionViewer(roomID, clientID string, enabled bool) meetingMinutesState {
+	v, ok := h.activeMeetingRooms.Load(roomID)
+	meta, _ := v.(*meetingMeta)
+	if !ok || meta == nil {
+		return meetingMinutesState{}
+	}
+	meta.mu.Lock()
+	if meta.captionViewers == nil {
+		meta.captionViewers = make(map[string]bool)
+	}
+	if enabled {
+		meta.captionViewers[clientID] = true
+	} else {
+		delete(meta.captionViewers, clientID)
+	}
+	meta.minutes.CaptionActive = len(meta.captionViewers) > 0
+	clearMeetingMinutesConsentIfIdle(meta)
+	state := meetingMinutesWireState(meta.minutes)
+	meta.mu.Unlock()
+	return state
+}
+
+// removeMeetingCaptionViewer drops one websocket session from the caption
+// viewer set (explicit leave, kick, disconnect cleanup, reconnect rebind,
+// room teardown). It reports whether the public captionActive flag changed so
+// the caller can broadcast the refreshed state; abandoned captions therefore
+// cannot keep member microphones running indefinitely.
+func (h *WebSocketHandler) removeMeetingCaptionViewer(roomID, clientID string) (meetingMinutesState, bool) {
+	v, ok := h.activeMeetingRooms.Load(roomID)
+	meta, _ := v.(*meetingMeta)
+	if !ok || meta == nil {
+		return meetingMinutesState{}, false
+	}
+	meta.mu.Lock()
+	if !meta.captionViewers[clientID] {
+		meta.mu.Unlock()
+		return meetingMinutesState{}, false
+	}
+	delete(meta.captionViewers, clientID)
+	active := len(meta.captionViewers) > 0
+	changed := meta.minutes.CaptionActive != active
+	meta.minutes.CaptionActive = active
+	clearMeetingMinutesConsentIfIdle(meta)
+	state := meetingMinutesWireState(meta.minutes)
+	meta.mu.Unlock()
+	return state, changed
+}
+
+// broadcastMeetingCaptions pushes the public captions state (kind "captions")
+// to every current meeting member. The payload carries only the aggregated
+// captionActive flag — never viewer identities.
+func (h *WebSocketHandler) broadcastMeetingCaptions(roomID string, state meetingMinutesState) {
+	h.broadcastMeetingMinutesState(roomID, "captions", state)
+}
+
+// handleMeetingMinutes owns the non-media AI collaboration plane. Legacy
+// provider fields remain in the wire shape for compatibility, but meeting AI
+// requests always use the server's fixed Gemini service.
 func (h *WebSocketHandler) handleMeetingMinutes(client *model.Client, message *model.WebSocketMessage) {
 	roomID := message.Channel
 	if roomID == "" {
@@ -2340,84 +2788,250 @@ func (h *WebSocketHandler) handleMeetingMinutes(client *model.Client, message *m
 	meta.mu.Unlock()
 
 	switch m.Action {
+	case "ai":
+		h.handleMeetingAIRequest(client, roomID, message)
+		return
 	case "configure":
-		if !h.isMeetingHost(roomID, client, meta) {
-			h.sendError(client, 403, "仅主持人可以配置会议纪要")
+		if !validMeetingASRSource(m.AsrSource) {
+			h.sendError(client, 400, "不支持的 ASR 来源（请确认后端已更新到支持服务端混音识别的版本）")
 			return
 		}
-		if m.AsrSource != "browser-speech" && m.AsrSource != "mimo-asr" && m.AsrSource != "wasm" && m.AsrSource != "iflytek" {
-			h.sendError(client, 400, "不支持的 ASR 来源")
-			return
-		}
-		if m.SummaryProvider != "mimo" && m.SummaryProvider != "openai" && m.SummaryProvider != "deepseek" && m.SummaryProvider != "anthropic" && m.SummaryProvider != "custom" {
-			h.sendError(client, 400, "不支持的摘要供应商")
-			return
-		}
-		if len(m.AsrModel) > 64 || len(m.SummaryModel) > 128 {
+		if len(m.AsrModel) > 64 || len(m.SummaryModel) > 128 || len(m.SummaryProvider) > 64 {
 			h.sendError(client, 400, "模型名称过长")
 			return
 		}
-		meta.mu.Lock()
-		meta.minutes = meetingMinutesState{
-			Configured: true, Running: false, RequireConsent: m.RequireConsent,
-			AsrSource: m.AsrSource, AsrModel: strings.TrimSpace(m.AsrModel),
-			SummaryProvider: m.SummaryProvider, SummaryModel: strings.TrimSpace(m.SummaryModel),
-			Consented: make(map[string]bool), SeenSegments: make(map[string]bool),
-		}
-		state = meta.minutes
-		state.Consented = nil
-		meta.mu.Unlock()
-		h.broadcastMeetingMembers(roomID, room, model.MessageTypeMeetingMinutes, map[string]interface{}{"kind": "configured", "minutes": state}, "")
-	case "start":
-		if !h.isMeetingHost(roomID, client, meta) {
-			h.sendError(client, 403, "仅主持人可以启动会议纪要")
+		meta.meetingASRPublishMu.Lock()
+		currentMeta, active := h.activeMeetingRoom(roomID)
+		if !active || currentMeta != meta || !h.meetings.owns(roomID, client.UniqID, client.ID) {
+			meta.meetingASRPublishMu.Unlock()
+			h.sendError(client, 403, "meeting:minutes configure sender is no longer a current member")
 			return
 		}
+		meta.mu.Lock()
+		if !meta.minutes.Running {
+			meta.minutes.Configured = true
+			meta.minutes.RequireConsent = m.RequireConsent
+			meta.minutes.AsrSource = "server-stream"
+			meta.minutes.AsrModel = "server-asr"
+			meta.minutes.SummaryProvider = "gemini"
+			meta.minutes.SummaryModel = meetingAIModel
+			meta.minutes.ServerMix = h.meetingASRStream != nil && h.meetingASRStream.Enabled()
+			meta.minutes.AI = h.meetingAIService != nil && h.meetingAIService.Enabled()
+			meta.minutes.CapabilitiesKnown = true
+			if meta.minutes.SummaryLanguage == "" {
+				meta.minutes.SummaryLanguage = "zh-CN"
+			}
+		}
+		state = meetingMinutesWireState(meta.minutes)
+		meta.mu.Unlock()
+		h.broadcastMeetingMinutesState(roomID, "configured", state)
+		meta.meetingASRPublishMu.Unlock()
+	case "start":
+		if h.meetingAIService == nil || !h.meetingAIService.Enabled() || !h.meetingAudioMinutesMixerConfigured() {
+			h.sendError(client, 503, "Gemini and Somni server services must be configured before starting AI minutes")
+			return
+		}
+		meta.meetingASRPublishMu.Lock()
+		currentMeta, active := h.activeMeetingRoom(roomID)
+		if !active || currentMeta != meta || !h.meetings.owns(roomID, client.UniqID, client.ID) {
+			meta.meetingASRPublishMu.Unlock()
+			h.sendError(client, 403, "meeting:minutes start sender is no longer a current member")
+			return
+		}
+		meta.minutesDeliveryMu.Lock()
+		meta.mu.Lock()
+		if meta.minutes.Running {
+			setMinutesSubscriptionLocked(meta, client.UniqID, true)
+			meta.mu.Unlock()
+			members := h.meetings.members(roomID)
+			meta.mu.Lock()
+			coordinatorChanged := electMeetingMinutesCoordinatorLocked(meta, members, client.UniqID)
+			state = meetingMinutesWireState(meta.minutes)
+			meta.mu.Unlock()
+			meta.minutesDeliveryMu.Unlock()
+			h.sendMeetingMinutesSubscriptionAck(client.ID, roomID, client.UniqID)
+			h.sendMeetingMinutesReplay(roomID, client.ID, meta, 0, true)
+			if coordinatorChanged {
+				h.broadcastMeetingMinutesState(roomID, "coordinator", state)
+			}
+			meta.meetingASRPublishMu.Unlock()
+			return
+		}
+		meta.mu.Unlock()
+		asrStreams := h.lockMeetingASRStreamsForRoom(roomID)
+		oldAudioSession := h.detachMeetingAudioMinutes(roomID)
 		meta.mu.Lock()
 		if !meta.minutes.Configured {
-			meta.mu.Unlock()
-			h.sendError(client, 409, "请先配置会议纪要来源")
-			return
+			meta.minutes.Configured = true
+			meta.minutes.RequireConsent = m.RequireConsent
+			meta.minutes.AsrSource = "server-stream"
+			meta.minutes.AsrModel = "server-asr"
+			meta.minutes.SummaryProvider = "gemini"
+			meta.minutes.SummaryModel = meetingAIModel
+			meta.minutes.ServerMix = h.meetingASRStream != nil && h.meetingASRStream.Enabled()
+			meta.minutes.AI = h.meetingAIService != nil && h.meetingAIService.Enabled()
+			meta.minutes.CapabilitiesKnown = true
 		}
+		setMinutesSubscriptionLocked(meta, client.UniqID, true)
 		meta.minutes.Running = true
-		state = meta.minutes
-		state.Consented = nil
+		meta.minutes.RecordingID = newMeetingRecordingID()
+		if m.SummaryLanguage == "zh-CN" || m.SummaryLanguage == "en-US" {
+			meta.minutes.SummaryLanguage = m.SummaryLanguage
+		} else if meta.minutes.SummaryLanguage == "" {
+			meta.minutes.SummaryLanguage = "zh-CN"
+		}
+		resetMeetingMinutesEpochLocked(meta)
+		consented := make(map[string]bool)
+		if meta.minutes.CaptionActive {
+			for uniqID, accepted := range meta.minutes.Consented {
+				if accepted {
+					consented[uniqID] = true
+				}
+			}
+		}
+		meta.minutes.Consented = consented
+		recordingID := meta.minutes.RecordingID
 		meta.mu.Unlock()
-		h.broadcastMeetingMembers(roomID, room, model.MessageTypeMeetingMinutes, map[string]interface{}{"kind": "started", "minutes": state}, "")
-	case "stop":
-		if !h.isMeetingHost(roomID, client, meta) {
-			h.sendError(client, 403, "仅主持人可以停止会议纪要")
+		members := h.meetings.members(roomID)
+		meta.mu.Lock()
+		coordinatorChanged := electMeetingMinutesCoordinatorLocked(meta, members, client.UniqID)
+		state = meetingMinutesWireState(meta.minutes)
+		meta.mu.Unlock()
+		meta.minutesDeliveryMu.Unlock()
+		h.finishMeetingASRStreamTransition(asrStreams, nil)
+		meta.meetingASRPublishMu.Unlock()
+		if oldAudioSession != nil {
+			go oldAudioSession.Abort()
+		}
+		// Install the room tap before acknowledging a successful start. A
+		// parallel stop or restart may supersede this epoch while installation
+		// runs, so publish only if it is still current under the same gate.
+		var session *meetingAudioMinutesSession
+		if meetingUsesServerMix(state.AsrSource) {
+			session = h.startMeetingAudioMinutes(roomID, room, meta)
+		}
+		if session == nil {
+			meta.meetingASRPublishMu.Lock()
+			meta.mu.Lock()
+			stillCurrent := meta.minutes.Running && meta.minutes.RecordingID == recordingID
+			if stillCurrent {
+				meta.minutes.Running = false
+				state = meetingMinutesWireState(meta.minutes)
+			}
+			meta.mu.Unlock()
+			meta.meetingASRPublishMu.Unlock()
+			if stillCurrent {
+				h.sendError(client, 503, "Somni server mixer could not start")
+			}
 			return
 		}
-		h.flushMeetingMinutesSegments(roomID, meta)
+		meta.meetingASRPublishMu.Lock()
+		members = h.meetings.members(roomID)
+		currentMeta, active = h.activeMeetingRoom(roomID)
 		meta.mu.Lock()
-		meta.minutes.Running = false
-		state = meta.minutes
-		state.Consented = nil
-		meta.mu.Unlock()
-		h.broadcastMeetingMembers(roomID, room, model.MessageTypeMeetingMinutes, map[string]interface{}{"kind": "stopped", "minutes": state}, "")
+		stillCurrent := meta.minutes.Running && meta.minutes.RecordingID == recordingID
+		if stillCurrent && active && currentMeta == meta {
+			coordinatorChanged = electMeetingMinutesCoordinatorLocked(meta, members, client.UniqID) || coordinatorChanged
+			state = meetingMinutesWireState(meta.minutes)
+			subscriptionEnabled := minutesSubscriptionEnabledLocked(meta, client.UniqID)
+			meta.mu.Unlock()
+			if coordinatorChanged {
+				h.broadcastMeetingMinutesState(roomID, "coordinator", state)
+			}
+			h.sendMeetingMinutesSubscriptionAck(client.ID, roomID, client.UniqID)
+			h.broadcastMeetingMinutesState(roomID, "started", state)
+			if subscriptionEnabled {
+				h.sendMeetingMinutesReplay(roomID, client.ID, meta, 0, true)
+			}
+		} else {
+			meta.mu.Unlock()
+		}
+		meta.meetingASRPublishMu.Unlock()
+	case "stop":
+		h.handleMeetingMinutesSubscription(client, roomID, meta, false, m.RecordingID, nil)
+	case "receive":
+		h.handleMeetingMinutesSubscription(client, roomID, meta, m.Enabled, m.RecordingID, m.AfterSeq)
 	case "consent":
+		meta.meetingASRPublishMu.Lock()
+		asrStreams := h.lockMeetingASRStreamsForUser(roomID, client.UniqID)
 		meta.mu.Lock()
-		meta.minutes.Consented[client.UniqID] = m.Accepted
+		if !meta.minutes.Running {
+			meta.minutes.Consented[client.UniqID] = m.Accepted
+		}
 		meta.mu.Unlock()
+		h.finishMeetingASRStreamsForCurrentState(roomID, asrStreams)
+		meta.meetingASRPublishMu.Unlock()
 		h.broadcastMeetingMembers(roomID, room, model.MessageTypeMeetingMinutes, map[string]interface{}{"kind": "consent", "uniqId": client.UniqID, "accepted": m.Accepted}, "")
+	case "caption-subscribe":
+		if m.Enabled && !h.captionsEnabled {
+			h.sendError(client, 409, "Live captions are temporarily unavailable")
+			return
+		}
+		// Any current meeting member may enable personal captions without
+		// starting minutes. The caller's viewer flag stays private; members
+		// only ever see the aggregated captionActive state (opt-in notice).
+		meta.meetingASRPublishMu.Lock()
+		var asrStreams []*meetingASRStreamState
+		if !m.Enabled {
+			asrStreams = h.lockMeetingASRStreamsForRoom(roomID)
+		}
+		captionState := h.updateMeetingCaptionViewer(roomID, client.ID, m.Enabled)
+		if !m.Enabled {
+			h.finishMeetingASRStreamsForCurrentState(roomID, asrStreams)
+		}
+		meta.meetingASRPublishMu.Unlock()
+		h.broadcastMeetingCaptions(roomID, captionState)
+		// The subscriber gets the operator's real recognizer availability for
+		// this deployment. Without it a client keeps a default server engine
+		// that silently produces nothing.
+		if m.Enabled {
+			h.sendMeetingASRCapabilities(client, roomID)
+		}
+	case "asr-chunk":
+		h.handleMeetingASRChunk(client, roomID, message)
+	case "asr-stream":
+		h.handleMeetingASRStream(client, roomID, message)
 	case "segment", "segments":
+		// Serialize the final eligibility check and enqueue with start/stop. A
+		// caption fragment that passed its first validation cannot cross into a
+		// newly started server-mixed recording as a duplicate speaker segment.
+		meta.meetingASRPublishMu.Lock()
+		defer meta.meetingASRPublishMu.Unlock()
+		currentMeta, active := h.activeMeetingRoom(roomID)
+		if !active || currentMeta != meta || !h.meetings.owns(roomID, client.UniqID, client.ID) {
+			h.sendError(client, 403, "meeting:minutes sender is no longer a current member")
+			return
+		}
 		meta.mu.Lock()
 		running := meta.minutes.Running
-		requireConsent := meta.minutes.RequireConsent
+		captionActive := meta.minutes.CaptionActive
 		consented := meta.minutes.Consented[client.UniqID]
+		activeRecordingID := meta.minutes.RecordingID
 		meta.mu.Unlock()
-		if !running {
+		// The transient segment stream stays active while either service needs
+		// transcription: host-controlled minutes or any member's captions.
+		if !running && !captionActive {
 			h.sendError(client, 409, "会议纪要尚未启动")
 			return
 		}
-		if requireConsent && !consented {
-			h.sendError(client, 403, "璇峰厛鍚屾剰浼氳绾褰曢煶杞啓")
+		if !running && !h.captionsEnabled {
+			h.sendError(client, 409, "字幕功能暂时关闭")
+			return
+		}
+		if running && h.meetingAudioMinutesMixerConfigured() {
+			h.sendError(client, 409, "Server mixed minutes already include publisher audio")
+			return
+		}
+		// Legacy client transcription may still contribute to captions-only
+		// sessions, where each speaker must consent. AI minutes use the server
+		// mixer and include every publisher independently of this consent state.
+		if !running && captionActive && !consented {
+			h.sendError(client, 403, "请先同意字幕转写")
 			return
 		}
 		incoming := m.Segments
 		if m.Action == "segment" {
-			incoming = []meetingMinutesSegment{{SegmentID: m.SegmentID, Text: m.Text, StartMs: m.StartMs, EndMs: m.EndMs, Final: m.Final}}
+			incoming = []meetingMinutesSegment{{SegmentID: m.SegmentID, RecordingID: m.RecordingID, Text: m.Text, StartMs: m.StartMs, EndMs: m.EndMs, Final: m.Final, Language: m.Language}}
 		}
 		if len(incoming) == 0 || len(incoming) > meetingMinutesMaxBatch {
 			h.sendError(client, 400, "转写批次为空或过大")
@@ -2443,9 +3057,21 @@ func (h *WebSocketHandler) handleMeetingMinutes(client *model.Client, message *m
 			if segmentID == "" {
 				segmentID = fmt.Sprintf("%s:%d", client.UniqID, time.Now().UnixNano())
 			}
+			// Recording-epoch contract: the sender-supplied recordingId is
+			// relayed only when it exactly matches the recording running at
+			// arrival time; anything else (empty, stale, oversized) is stripped.
+			// Caption-only relay stays available for stripped segments, and the
+			// server never infers or stamps an ID the client did not supply.
+			// Tagging at arrival means batches queued before a later start can
+			// never inherit the new recording's ID.
+			segmentRecording := ""
+			if supplied := sanitizeMeetingRecordingID(item.RecordingID); running && activeRecordingID != "" && supplied == activeRecordingID {
+				segmentRecording = supplied
+			}
 			canonical = append(canonical, meetingMinutesSegment{
-				SegmentID: segmentID, From: client.UniqID, SpeakerName: speakerName,
+				SegmentID: segmentID, RecordingID: segmentRecording, From: client.UniqID, SpeakerName: speakerName,
 				Text: text, StartMs: item.StartMs, EndMs: item.EndMs, Final: item.Final,
+				Language: normalizeMeetingLanguage(item.Language),
 			})
 		}
 		if len(canonical) == 0 {
@@ -2470,26 +3096,97 @@ func (h *WebSocketHandler) handleMeetingMinutes(client *model.Client, message *m
 			return
 		}
 		h.queueMeetingMinutesSegments(roomID, meta, unique)
-	case "summary":
-		if !h.isMeetingHost(roomID, client, meta) {
-			h.sendError(client, 403, "仅主持人可以提交会议摘要")
+	case "replay":
+		meta.meetingASRPublishMu.Lock()
+		defer meta.meetingASRPublishMu.Unlock()
+		currentMeta, active := h.activeMeetingRoom(roomID)
+		if !active || currentMeta != meta || !h.meetings.owns(roomID, client.UniqID, client.ID) {
+			h.sendError(client, 403, "meeting:minutes replay sender is no longer a current member")
 			return
 		}
-		h.flushMeetingMinutesSegments(roomID, meta)
-		if len(m.Summary) > 128*1024 {
+		recordingID := sanitizeMeetingRecordingID(m.RecordingID)
+		meta.mu.Lock()
+		activeRecordingID := meta.minutes.RecordingID
+		latestSeq := meta.minutes.LatestSegmentSeq
+		receivingEnabled := minutesSubscriptionEnabledLocked(meta, client.UniqID)
+		meta.mu.Unlock()
+		if !receivingEnabled {
+			h.sendError(client, 403, "meeting:minutes replay subscription is disabled")
+			return
+		}
+		if recordingID == "" || recordingID != activeRecordingID {
+			h.sendError(client, 409, "meeting:minutes replay recording epoch is stale")
+			return
+		}
+		afterSeq := uint64(0)
+		if m.AfterSeq != nil {
+			afterSeq = *m.AfterSeq
+		}
+		if afterSeq > latestSeq {
+			h.sendError(client, 409, "meeting:minutes replay cursor is ahead of the current epoch")
+			return
+		}
+		h.sendMeetingMinutesReplay(roomID, client.ID, meta, afterSeq, true)
+	case "summary":
+		if len(m.Summary) > 128*1024 || strings.TrimSpace(m.Summary) == "" {
 			h.sendError(client, 400, "会议摘要过长")
 			return
 		}
+		meta.meetingASRPublishMu.Lock()
+		defer meta.meetingASRPublishMu.Unlock()
+		currentMeta, active := h.activeMeetingRoom(roomID)
+		if !active || currentMeta != meta || !h.meetings.owns(roomID, client.UniqID, client.ID) {
+			h.sendError(client, 403, "meeting:minutes summary sender is no longer a current member")
+			return
+		}
+		if m.ThroughSeq == nil || m.CoordinatorEpoch == 0 {
+			h.sendError(client, 400, "meeting:minutes summary requires recordingId, coordinatorEpoch and throughSeq")
+			return
+		}
+		recordingID := sanitizeMeetingRecordingID(m.RecordingID)
+		throughSeq := *m.ThroughSeq
 		meta.mu.Lock()
+		if recordingID == "" || recordingID != meta.minutes.RecordingID ||
+			m.CoordinatorEpoch != meta.minutes.SummaryCoordinatorEpoch ||
+			meta.minutes.SummaryCoordinatorID != client.UniqID ||
+			!minutesSubscriptionEnabledLocked(meta, client.UniqID) {
+			meta.mu.Unlock()
+			h.sendError(client, 409, "meeting:minutes summary coordinator or recording epoch is stale")
+			return
+		}
+		if throughSeq == 0 || throughSeq <= meta.minutes.SummaryThroughSeq || throughSeq > meta.minutes.LatestSegmentSeq {
+			meta.mu.Unlock()
+			h.sendError(client, 409, "meeting:minutes summary cursor is stale or outside the current recording epoch")
+			return
+		}
+		meta.minutes.SummaryThroughSeq = throughSeq
+		meta.minutesSummaryRequestedRecordingID = recordingID
+		meta.minutesSummaryRequestedCoordinatorEpoch = m.CoordinatorEpoch
+		meta.minutesSummaryRequestedThroughSeq = throughSeq
+		meta.minutesSummaryRequestedAt = time.Now()
 		meta.minutes.Summary = strings.TrimSpace(m.Summary)
-		meta.minutes.Running = false
-		state = meta.minutes
-		state.Consented = nil
+		state = meetingMinutesWireState(meta.minutes)
 		meta.mu.Unlock()
-		h.broadcastMeetingMembers(roomID, room, model.MessageTypeMeetingMinutes, map[string]interface{}{"kind": "summary", "summary": state.Summary, "minutes": state}, "")
+		h.broadcastMeetingMinutesState(roomID, "summary", state)
 	default:
 		h.sendError(client, 400, "meeting:minutes 未知 action")
 	}
+}
+
+// validMeetingASRSource accepts known legacy values and the fixed server
+// source so older clients can configure minutes. The stored state is always
+// canonicalized to the Somni server stream.
+func validMeetingASRSource(source string) bool {
+	switch source {
+	case "", "server-mix", "server-asr", "server-stream", "browser-speech", "mimo-asr", "wasm", "iflytek":
+		return true
+	default:
+		return false
+	}
+}
+
+func meetingUsesServerMix(source string) bool {
+	return source == "server-mix" || source == "server-asr" || source == "server-stream"
 }
 
 // broadcastMeetingMembers 只向已登记 SFU 参与者投递会议协作事件。

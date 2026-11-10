@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 	log "github.com/sirupsen/logrus"
 )
@@ -23,6 +24,12 @@ type Room struct {
 	// 主线可借此触发“已订阅该发布者的订阅端发起重协商”。
 	trackPublishedMu sync.RWMutex
 	onTrackPublished func(roomID, publisherID string, track *webrtc.TrackRemote)
+
+	// audioTap observes decoded-track RTP packets without reading the track
+	// itself. Only one meeting-level consumer (server-side minutes mixing) is
+	// supported; the tap is installed while a recording is running.
+	audioTapMu sync.RWMutex
+	audioTap   func(participantID string, track *webrtc.TrackRemote, packet *rtp.Packet)
 }
 
 // SetOnTrackPublished installs the room-level publish callback safely.
@@ -30,6 +37,23 @@ func (r *Room) SetOnTrackPublished(cb func(roomID, publisherID string, track *we
 	r.trackPublishedMu.Lock()
 	r.onTrackPublished = cb
 	r.trackPublishedMu.Unlock()
+}
+
+// SetAudioTap installs (or clears, with nil) the room's audio RTP observer.
+// The callback runs on the publisher's fanout goroutine and must not block.
+func (r *Room) SetAudioTap(cb func(participantID string, track *webrtc.TrackRemote, packet *rtp.Packet)) {
+	r.audioTapMu.Lock()
+	r.audioTap = cb
+	r.audioTapMu.Unlock()
+}
+
+func (r *Room) deliverAudio(participantID string, track *webrtc.TrackRemote, packet *rtp.Packet) {
+	r.audioTapMu.RLock()
+	cb := r.audioTap
+	r.audioTapMu.RUnlock()
+	if cb != nil {
+		cb(participantID, track, packet)
+	}
 }
 
 // AddParticipant 在房间内新增一名参与者，并为其建立订阅/发布用的
@@ -176,6 +200,7 @@ func (r *Room) closeWithReason(reason string) error {
 	if !r.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	r.SetAudioTap(nil)
 	r.mu.RLock()
 	parts := make([]*Participant, 0, len(r.participants))
 	for _, p := range r.participants {

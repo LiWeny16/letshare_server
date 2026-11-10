@@ -222,7 +222,7 @@ func (p *Participant) registerPublishedTrack(track *webrtc.TrackRemote) {
 	if p.fanouts == nil {
 		p.fanouts = make(map[string]*trackFanout)
 	}
-	p.fanouts[track.ID()] = newTrackFanout(track)
+	p.fanouts[track.ID()] = newTrackFanout(track, p.room, p.ID)
 	p.mu.Unlock()
 	log.WithFields(log.Fields{
 		"sfu":           "participant",

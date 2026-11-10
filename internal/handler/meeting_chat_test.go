@@ -11,8 +11,14 @@ import (
 
 // meetingChatFlow 建立「A/B 已入会（SFU 参与者）、C 仅订阅会议房间未 join」的前置。
 func meetingChatFlow(t *testing.T) (ts *meetingTestServer, a, b, c *wsRPC, meetingID string) {
+	// Legacy caption tests opt in before the HTTP test server starts. The
+	// production constructor itself keeps caption entry points disabled.
+	return meetingChatFlowWithSetup(t, func(h *WebSocketHandler) { h.captionsEnabled = true })
+}
+
+func meetingChatFlowWithSetup(t *testing.T, setup func(*WebSocketHandler)) (ts *meetingTestServer, a, b, c *wsRPC, meetingID string) {
 	t.Helper()
-	ts = newMeetingTestServer(t)
+	ts = newMeetingTestServerWithSetup(t, setup)
 	t.Cleanup(ts.Close)
 
 	const userA = "alice:chat-1"
@@ -22,6 +28,7 @@ func meetingChatFlow(t *testing.T) (ts *meetingTestServer, a, b, c *wsRPC, meeti
 	a = newWSRPC(t, ts.srv, userA)
 	b = newWSRPC(t, ts.srv, userB)
 	c = newWSRPC(t, ts.srv, userC)
+	a.handler, b.handler, c.handler = ts.handler, ts.handler, ts.handler
 
 	// A 创建会议
 	if err := a.sendJSON(model.WebSocketMessage{Type: "meeting:create", Data: []byte(`{}`)}); err != nil {
