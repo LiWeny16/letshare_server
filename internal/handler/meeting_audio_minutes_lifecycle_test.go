@@ -201,8 +201,24 @@ func TestMeetingAudioMinutesMeetingEndCleansUpCapture(t *testing.T) {
 	if _, err := waitMinutesKind(host, "subscription", 3*time.Second); err != nil {
 		t.Fatal("personal stop was not acknowledged")
 	}
-	if _, ok := ts.handler.meetingAudioSessions.Load(roomID); !ok || session.closed.Load() {
-		t.Fatal("personal stop shut down the room mixer")
+	// The host is now the only current member and has explicitly paused, so
+	// the no-receivers fallback ends the session and tears down the mixer.
+	stopped, err := waitMinutesKind(host, "stopped", 3*time.Second)
+	if err != nil {
+		t.Fatalf("sole paused member did not trigger the no-receivers stop: %v", err)
+	}
+	if minutesMapFromFrame(t, stopped)["running"] != false {
+		t.Fatalf("no-receivers stop frame still reports running: %s", string(stopped.Data))
+	}
+	if _, ok := ts.handler.meetingAudioSessions.Load(roomID); ok {
+		t.Fatal("no-receivers stop left the room mixer registered")
+	}
+	closedDeadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(closedDeadline) && !session.closed.Load() {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !session.closed.Load() {
+		t.Fatal("no-receivers stop did not abort the mixer session")
 	}
 	ts.handler.End(roomID, meetingEndReasonHostEnded)
 	if _, ok := ts.handler.meetingAudioSessions.Load(roomID); ok {

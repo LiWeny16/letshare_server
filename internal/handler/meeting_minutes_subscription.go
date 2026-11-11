@@ -248,6 +248,60 @@ func (h *WebSocketHandler) handleMeetingMinutesSubscription(client *model.Client
 	if coordinatorChanged {
 		h.broadcastMeetingMinutesState(roomID, "coordinator", state)
 	}
+	if !enabled {
+		h.stopMeetingMinutesWithNoReceiversLocked(roomID)
+	}
+}
+
+// stopMeetingMinutesWithNoReceiversLocked ends an active shared-minutes
+// session once every current member has explicitly paused reception. An unset
+// preference counts as enabled, so a new member or a member who never opened
+// the notes panel keeps the session alive. Caller holds meta.meetingASRPublishMu.
+// Lock order: meetingASRPublishMu -> minutesDeliveryMu -> meta.mu.
+func (h *WebSocketHandler) stopMeetingMinutesWithNoReceiversLocked(roomID string) bool {
+	meta, active := h.activeMeetingRoom(roomID)
+	if !active {
+		return false
+	}
+	members := h.meetings.members(roomID)
+	if len(members) == 0 {
+		return false
+	}
+	meta.mu.Lock()
+	if !meta.minutes.Running {
+		meta.mu.Unlock()
+		return false
+	}
+	for _, member := range members {
+		if minutesSubscriptionEnabledLocked(meta, member.UniqID) {
+			meta.mu.Unlock()
+			return false
+		}
+	}
+	meta.minutes.Running = false
+	meta.minutes.SummaryCoordinatorID = ""
+	meta.minutes.SummaryCoordinatorEpoch++
+	meta.minutesSummaryRequestedRecordingID = ""
+	meta.minutesSummaryRequestedCoordinatorEpoch = 0
+	meta.minutesSummaryRequestedThroughSeq = 0
+	meta.minutesSummaryRequestedAt = time.Time{}
+	meta.minutesSummaryCachedOutput = ""
+	meta.minutesSummaryCacheValid = false
+	if meta.minutesFlushTimer != nil {
+		meta.minutesFlushTimer.Stop()
+		meta.minutesFlushTimer = nil
+	}
+	meta.minutesPending = nil
+	clearMeetingMinutesConsentIfIdle(meta)
+	state := meetingMinutesWireState(meta.minutes)
+	meta.mu.Unlock()
+
+	session := h.detachMeetingAudioMinutes(roomID)
+	h.broadcastMeetingMinutesState(roomID, "stopped", state)
+	if session != nil {
+		go session.Abort()
+	}
+	return true
 }
 
 func (h *WebSocketHandler) reconcileMeetingMinutesCoordinator(roomID string) {
@@ -269,4 +323,5 @@ func (h *WebSocketHandler) reconcileMeetingMinutesCoordinator(roomID string) {
 	if changed {
 		h.broadcastMeetingMinutesState(roomID, "coordinator", state)
 	}
+	h.stopMeetingMinutesWithNoReceiversLocked(roomID)
 }

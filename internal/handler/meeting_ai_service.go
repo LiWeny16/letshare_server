@@ -574,7 +574,8 @@ func meetingAISystemPrompt(task, languageName string) string {
 	b.WriteString("You have no tools and cannot browse, call functions, or take any action. ")
 	switch task {
 	case MeetingAITaskSummary:
-		b.WriteString("Task: summarize the meeting data. Return only valid JSON with keys meetingTitle (string), overview (string), timeline (array of objects {id,startMs,speakerName,summary,transcript,kind}), decisions (array {text,timeMs}), actionItems (array {task,owner,deadline,timeMs}), and openQuestions (array {question,timeMs}). Use empty arrays if unknown. Do not invent decisions, owners, dates, names, or quotes. Preserve prior conclusions when supplied.")
+		b.WriteString("Task: summarize the meeting data. Return only valid JSON with keys meetingTitle (string), overview (string), timeline (array of objects {id,startMs,speakerName,summary,transcript,kind}), decisions (array {text,timeMs}), actionItems (array {task,owner,deadline,timeMs}), and openQuestions (array {question,timeMs}). Use empty arrays if unknown. Do not invent decisions, owners, dates, names, or quotes. Preserve prior conclusions when supplied. ")
+		b.WriteString("For every timeline entry, summary must be one short sentence in the reply language that recaps what the speaker said, proposed, asked, confirmed, or decided (for example \"Alice proposed moving the launch to Friday\") and must never copy the transcript verbatim; set kind to speech, decision, action, or question, and keep transcript as the original excerpt.")
 	case MeetingAITaskTranslate:
 		b.WriteString("Task: translate the excerpt below into " + languageName +
 			". Preserve meaning and speaker intent; output only the translation.")
