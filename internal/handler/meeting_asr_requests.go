@@ -220,8 +220,11 @@ func (h *WebSocketHandler) handleMeetingASRChunk(client *model.Client, roomID st
 		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		defer cancel()
 		text, err := h.meetingASRStream.Transcribe(ctx, pcm)
-		if err != nil || strings.TrimSpace(text) == "" {
+		if err != nil {
 			logrus.WithFields(logrus.Fields{"room": roomID, "user": client.UniqID}).WithError(err).Warn("会议 ASR 上游失败")
+			return
+		}
+		if !meaningfulMeetingASRText(text) {
 			return
 		}
 		h.broadcastMeetingASRChunkIfCurrent(roomID, meta, client, text, language, recordingID)
@@ -268,6 +271,9 @@ func (h *WebSocketHandler) broadcastMeetingASRChunkIfCurrent(roomID string, requ
 }
 
 func (h *WebSocketHandler) broadcastMeetingASRSegment(roomID string, client *model.Client, text, language, recordingID string) {
+	if !meaningfulMeetingASRText(text) {
+		return
+	}
 	speakerName := client.UserName
 	if speakerName == "" {
 		speakerName = client.UniqID

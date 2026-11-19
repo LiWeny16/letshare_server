@@ -616,7 +616,7 @@ func (s *meetingAudioMinutesSession) transcribeLoop() {
 			continue
 		}
 		text = strings.TrimSpace(text)
-		if text == "" {
+		if !meaningfulMeetingASRText(text) {
 			continue
 		}
 		log.WithFields(log.Fields{"roomID": s.roomID, "chars": len([]rune(text))}).Info("会议纪要 ASR 批次已转写")
@@ -665,7 +665,7 @@ func (h *WebSocketHandler) broadcastMeetingAudioASRError(roomID string, sessionM
 }
 
 func (h *WebSocketHandler) broadcastMeetingAudioSegment(roomID string, sessionMeta *meetingMeta, text string, startMs, endMs int64, recordingID, speakerID, speakerName string) {
-	if strings.TrimSpace(text) == "" || recordingID == "" {
+	if !meaningfulMeetingASRText(text) || recordingID == "" {
 		return
 	}
 	meta, ok := h.activeMeetingRoom(roomID)

@@ -231,7 +231,8 @@ func TestMeetingMinutes_ACMINREPLAY003_LateJoinGetsBoundedHistoryAfterInfo(t *te
 		}
 	}
 
-	sendMinutes(t, host, roomID, map[string]interface{}{
+	coordinator := currentMinutesCoordinatorRPC(t, host.handler, roomID, host, member)
+	sendMinutes(t, coordinator, roomID, map[string]interface{}{
 		"action": "summary", "summary": "first shared summary", "recordingId": recordingID,
 		"coordinatorEpoch": currentMinutesCoordinatorEpoch(t, host.handler, roomID), "throughSeq": 1,
 	})

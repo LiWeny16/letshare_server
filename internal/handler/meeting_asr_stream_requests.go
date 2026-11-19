@@ -444,7 +444,7 @@ func (h *WebSocketHandler) handleMeetingASRStreamEvent(roomID string, state *mee
 		meta.meetingASRPublishMu.Unlock()
 		return
 	}
-	if event.Kind != "result" || event.Text == "" {
+	if event.Kind != "result" || !meaningfulMeetingASRText(event.Text) {
 		meta.meetingASRPublishMu.Unlock()
 		return
 	}
