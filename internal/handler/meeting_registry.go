@@ -201,14 +201,19 @@ func (r *meetingRegistry) members(roomID string) []meetingMembership {
 }
 
 func (r *meetingRegistry) clientForUniqID(roomID, uniqID string) (string, bool) {
+	member, ok := r.member(roomID, uniqID)
+	return member.ClientID, ok
+}
+
+func (r *meetingRegistry) member(roomID, uniqID string) (meetingMembership, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	room := r.rooms[roomID]
 	if room == nil {
-		return "", false
+		return meetingMembership{}, false
 	}
 	member, ok := room.byUniqID[uniqID]
-	return member.ClientID, ok
+	return member, ok
 }
 
 // meetingHostSeats 一次性快照读取房主席位（Host / HostClientID）。

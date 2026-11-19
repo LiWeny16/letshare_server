@@ -916,6 +916,7 @@ type meetingJoinMsg struct {
 type meetingICEMsg struct {
 	Candidate json.RawMessage `json:"candidate"`
 	To        string          `json:"to"`
+	RestartID string          `json:"restartId,omitempty"`
 }
 
 // isDirectCallSFURoom keeps ordinary call media rooms separate from user
@@ -1186,7 +1187,7 @@ func (h *WebSocketHandler) handleMeetingJoin(client *model.Client, message *mode
 	}
 	h.broadcastMeetingMembership(message.Channel, "join", uniqID, client.ID)
 	p.OnICECandidate(func(c *webrtc.ICECandidate) {
-		h.forwardMeetingICE(message.Channel, uniqID, c, "")
+		h.forwardMeetingICE(message.Channel, uniqID, c, "", "")
 	})
 	// 定向告知会议信息（房主/标题）：前端用于房主徽章、控制按钮和无媒体入会状态。
 	h.sendMeetingJoinSnapshot(message.Channel, uniqID, client.ID, meta)
@@ -1952,21 +1953,20 @@ func (h *WebSocketHandler) handleMeetingSDP(client *model.Client, message *model
 			// 幂等重试：若首个 offer 可能在网络中丢失，只重发仍在等待 answer
 			// 的同一个 offer；稳定连接不重复协商。
 			if offer, pending := sub.OfferForRetry(); pending {
-				h.sendMeetingSubscriberOfferWithRestartID(message.Channel, client.UniqID, m.To, offer, m.RestartID)
+				h.sendMeetingSubscriberOffer(message.Channel, client.UniqID, m.To, sub, offer)
 			}
 			return
 		}
-		// 接入该订阅 PC 的本地候选，定向回发给订阅者（默认引擎非离线需真实 ICE）
-		sub.OnICECandidate(func(c *webrtc.ICECandidate) {
-			h.forwardMeetingICE(message.Channel, client.UniqID, c, m.To)
-		})
-		h.sendMeetingSubscriberOfferWithRestartID(message.Channel, client.UniqID, m.To, sub.Offer(), m.RestartID)
+		h.signalNewMeetingSubscriber(message.Channel, client.UniqID, m.To, sub)
 
 	case m.Type == "answer" && m.To != "":
 		// 订阅者回 answer（订阅 PC）：按发布者 m.To 找到对应 Subscriber
 		sub, ok := part.GetSubscriber(m.To)
 		if !ok {
 			h.sendChannelError(client, message.Channel, 400, fmt.Sprintf("meeting:sdp 未找到订阅 %s 的连接", m.To))
+			return
+		}
+		if m.RestartID != "" && m.RestartID != sub.RestartID() {
 			return
 		}
 		if err := sub.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: m.SDP}); err != nil {
@@ -1979,7 +1979,7 @@ func (h *WebSocketHandler) handleMeetingSDP(client *model.Client, message *model
 			h.sendChannelError(client, message.Channel, 500, "meeting:sdp 后续 offer 生成失败: "+err.Error())
 			return
 		} else if ok {
-			h.sendMeetingSubscriberOffer(message.Channel, client.UniqID, m.To, next)
+			h.sendMeetingSubscriberOffer(message.Channel, client.UniqID, m.To, sub, next)
 		}
 
 	case m.Type == "answer" && m.To == "":
@@ -2046,6 +2046,9 @@ func (h *WebSocketHandler) handleMeetingICE(client *model.Client, message *model
 		h.sendChannelError(client, message.Channel, 400, fmt.Sprintf("meeting:ice 未找到订阅 %s 的连接", m.To))
 		return
 	}
+	if m.RestartID != "" && m.RestartID != sub.RestartID() {
+		return
+	}
 	if err := sub.AddICECandidate(init); err != nil {
 		h.sendChannelError(client, message.Channel, 500, "meeting:ice 添加失败: "+err.Error())
 		return
@@ -2068,21 +2071,8 @@ func (h *WebSocketHandler) onMeetingTrackPublished(roomID, publisherID string, t
 		if p.ID == publisherID {
 			continue
 		}
-		if sub, ok := p.GetSubscriber(publisherID); ok && !sub.IsClosed() {
-			offer, err := sub.AddPublishedTrack(track)
-			if err != nil {
-				logrus.WithError(err).WithFields(logrus.Fields{
-					"room": roomID, "publisher": publisherID, "subscriber": p.ID,
-				}).Warn("会议 track 扇出重协商失败")
-				continue
-			}
-			if offer.SDP == "" {
-				continue // 幂等跳过
-			}
-			h.sendMeetingSubscriberOffer(roomID, p.ID, publisherID, offer)
-			continue
-		}
-		// 无有效订阅（旧订阅已关闭/不存在）：为迟发布自动建订阅并推送 offer
+		// SubscribeTo waits for any concurrent creation to finish. Its initial
+		// offer may have snapshotted the publisher's tracks before this one arrived.
 		sub, created, err := p.SubscribeTo(publisherID)
 		if err != nil {
 			logrus.WithError(err).WithFields(logrus.Fields{
@@ -2090,21 +2080,26 @@ func (h *WebSocketHandler) onMeetingTrackPublished(roomID, publisherID string, t
 			}).Debug("迟发布自动补订阅未成功")
 			continue
 		}
-		if !created {
-			continue // 并发路径已有人建订阅并推送
+		if created {
+			h.signalNewMeetingSubscriber(roomID, p.ID, publisherID, sub)
+			continue
 		}
-		sub.OnICECandidate(func(c *webrtc.ICECandidate) {
-			h.forwardMeetingICE(roomID, p.ID, c, publisherID)
-		})
-		h.sendMeetingSubscriberOffer(roomID, p.ID, publisherID, sub.Offer())
+		offer, err := sub.AddPublishedTrack(track)
+		if err != nil {
+			logrus.WithError(err).WithFields(logrus.Fields{
+				"room": roomID, "publisher": publisherID, "subscriber": p.ID,
+			}).Warn("会议 track 扇出重协商失败")
+			continue
+		}
+		h.sendMeetingSubscriberOffer(roomID, p.ID, publisherID, sub, offer)
 	}
 }
 
 // reconcileMeetingSubscriptionsEventually closes the timing gap between a
 // participant join/publish request and Pion's asynchronous OnTrack callback.
 // It is deliberately bounded: this is recovery for the join race, not a
-// permanent polling loop. Once a subscriber exists, only a pending offer is
-// resent; no duplicate peer connection is created.
+// permanent polling loop. Existing subscriptions are reconciled by OnTrack
+// and pending offers are replayed in response to a client retry.
 func (h *WebSocketHandler) reconcileMeetingSubscriptionsEventually(roomID, publisherID string) {
 	for attempt := 0; attempt < 10; attempt++ {
 		if attempt > 0 {
@@ -2135,26 +2130,23 @@ func (h *WebSocketHandler) reconcileMeetingSubscriptions(roomID, publisherID str
 			continue
 		}
 		if created {
-			sub.OnICECandidate(func(c *webrtc.ICECandidate) {
-				h.forwardMeetingICE(roomID, subscriber.ID, c, publisherID)
-			})
-			h.sendMeetingSubscriberOffer(roomID, subscriber.ID, publisherID, sub.Offer())
-			continue
+			h.signalNewMeetingSubscriber(roomID, subscriber.ID, publisherID, sub)
 		}
-		// 不在后台 reconcile 循环里反复重发同一 offer。客户端的订阅请求
-		// 本身就是幂等重试入口，后台重复推送会让浏览器连续回两个 answer，
-		// 服务端订阅 PC 随后收到 stable -> SetRemote(answer) 并进入坏状态。
-		// 只有创建订阅或 track 新增时才发送新的 offer。
 	}
 }
 
-// sendMeetingSubscriberOffer 统一发送订阅方向 offer，避免不同入口遗漏 to/channel。
-func (h *WebSocketHandler) sendMeetingSubscriberOffer(roomID, subscriberID, publisherID string, offer webrtc.SessionDescription) {
-	h.sendMeetingSubscriberOfferWithRestartID(roomID, subscriberID, publisherID, offer, "")
+func (h *WebSocketHandler) signalNewMeetingSubscriber(roomID, subscriberID, publisherID string, sub *sfu.Subscriber) {
+	sub.OnICECandidate(func(c *webrtc.ICECandidate) {
+		if !sub.IsClosed() {
+			h.forwardMeetingICE(roomID, subscriberID, c, publisherID, sub.RestartID())
+		}
+	})
+	h.sendMeetingSubscriberOffer(roomID, subscriberID, publisherID, sub, sub.Offer())
 }
 
-func (h *WebSocketHandler) sendMeetingSubscriberOfferWithRestartID(roomID, subscriberID, publisherID string, offer webrtc.SessionDescription, restartID string) {
-	if offer.SDP == "" {
+// sendMeetingSubscriberOffer keeps the restart identity on every offer for this connection.
+func (h *WebSocketHandler) sendMeetingSubscriberOffer(roomID, subscriberID, publisherID string, sub *sfu.Subscriber, offer webrtc.SessionDescription) {
+	if offer.SDP == "" || sub.IsClosed() {
 		return
 	}
 	logrus.WithFields(logrus.Fields{
@@ -2163,7 +2155,7 @@ func (h *WebSocketHandler) sendMeetingSubscriberOfferWithRestartID(roomID, subsc
 	data := map[string]interface{}{
 		"type": "offer", "sdp": offer.SDP, "to": publisherID,
 	}
-	if restartID != "" {
+	if restartID := sub.RestartID(); restartID != "" {
 		data["restartId"] = restartID
 	}
 	h.sendMeetingToUser(roomID, subscriberID, model.MessageTypeMeetingSDP, data)
@@ -2171,13 +2163,16 @@ func (h *WebSocketHandler) sendMeetingSubscriberOfferWithRestartID(roomID, subsc
 
 // forwardMeetingICE 把服务器侧某条 PC 的本地候选定向回发给客户端。
 // pubID 为发布者时表示订阅 PC 的候选；为空表示发布 PC 的候选。
-func (h *WebSocketHandler) forwardMeetingICE(roomName, toUserID string, c *webrtc.ICECandidate, pubID string) {
+func (h *WebSocketHandler) forwardMeetingICE(roomName, toUserID string, c *webrtc.ICECandidate, pubID, restartID string) {
 	if c == nil {
 		// ice 收集完成哨兵：nil 候选，跳过（客户端可自行判断收尾）
 		return
 	}
 	init := c.ToJSON()
 	payload := map[string]interface{}{"candidate": init, "to": pubID}
+	if restartID != "" {
+		payload["restartId"] = restartID
+	}
 	h.sendMeetingToUser(roomName, toUserID, model.MessageTypeMeetingICE, payload)
 }
 

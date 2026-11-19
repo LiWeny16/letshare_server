@@ -118,7 +118,7 @@ MODE=production go run cmd/server/main.go
 
 `SOMNI_LLM_*` / `SOMNI_ASR_*` 同名变量作为兼容 fallback 被接受。未配置 Somni ASR 凭据时，会议转写不可用。实时字幕及旧客户端的字幕识别入口暂时关闭；会议纪要的服务端混音识别不受影响。启动日志的「会议 AI/识别能力」一行会显示实际生效的 `meeting_ai_model` 与 `meeting_asr_stream`。
 
-AI minutes start only when both the fixed Gemini service and Somni ASR are ready. Any member can start the shared session; each member receives results by default and can independently stop or resume receiving them. The server mixes every current meeting audio publisher, including participants who join after the session starts; microphone settings continue to control publication. A single active receiving member coordinates the shared incremental summaries. Server-side energy VAD suppresses silence and keeps short pre-roll and hangover around speech. Older chunk and stream frame shapes remain in the protocol, but caption-only recognition is disabled and per-speaker recognition is suppressed while the server mixer owns a recording epoch.
+AI minutes start when Gemini and Somni ASR are ready. Any member can start the shared session and independently stop or resume receiving results. The server transcribes every current publisher, including late joiners, and labels each segment with the publisher's meeting identity. Energy VAD trims silence per publisher and preserves short speech-boundary padding. A single active receiving member coordinates the shared summaries. Caption-only recognition is currently disabled. The server handles recognition during a shared recording epoch.
 
 ### 配置文件
 

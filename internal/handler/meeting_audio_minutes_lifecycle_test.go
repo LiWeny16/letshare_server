@@ -182,13 +182,14 @@ func TestMeetingAudioMinutesMeetingEndCleansUpCapture(t *testing.T) {
 	}
 
 	memberClient := meetingASRTestClient(t, ts, roomID, "bob:chat-2")
+	speaker := testMeetingAudioSpeaker(memberClient.UniqID, &meetingAudioDecoder{lastSeen: time.Now()})
 	session.mu.Lock()
-	session.decoders["member-track"] = &meetingAudioDecoder{participantID: memberClient.UniqID}
+	session.speakers[speaker.id] = speaker
 	session.mu.Unlock()
 	leaveMeeting(t, member, roomID)
 	waitMembersRegistered(t, ts, roomID, 1)
 	session.mu.Lock()
-	_, decoderRetained := session.decoders["member-track"]
+	decoderRetained := len(speaker.tracks) > 0
 	session.mu.Unlock()
 	if decoderRetained {
 		t.Fatal("member leave retained that publisher's decoder ring")

@@ -47,6 +47,7 @@ type Subscriber struct {
 	offerGeneration      uint64
 	negotiatedGeneration uint64
 	awaitingAnswer       bool
+	lastAnswerSDP        string // guarded by offerMu
 
 	stop chan struct{}
 	once sync.Once
@@ -65,6 +66,9 @@ func (s *Subscriber) Offer() webrtc.SessionDescription {
 	defer s.mu.RUnlock()
 	return s.offer
 }
+
+// RestartID identifies the client-requested replacement that created this connection.
+func (s *Subscriber) RestartID() string { return s.restartID }
 
 // OfferForRetry 返回仍在等待客户端 answer 的当前 offer。
 // 仅用于客户端丢帧/重试恢复：稳定连接不重复发 offer。
@@ -115,10 +119,15 @@ func (s *Subscriber) SetRemoteDescription(sd webrtc.SessionDescription) error {
 	if s.off.Load() {
 		return errors.New("sfu: 订阅连接已关闭")
 	}
+	// A delayed offer replay can elicit the same answer after a new offer is pending.
+	if sd.Type == webrtc.SDPTypeAnswer && s.lastAnswerSDP != "" && sd.SDP == s.lastAnswerSDP {
+		return nil
+	}
 	if err := s.pc.SetRemoteDescription(sd); err != nil {
 		return err
 	}
 	if sd.Type == webrtc.SDPTypeAnswer {
+		s.lastAnswerSDP = sd.SDP
 		s.mu.Lock()
 		s.awaitingAnswer = false
 		s.mu.Unlock()

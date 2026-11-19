@@ -122,17 +122,13 @@ func TestMeetingAISomniLiveOptIn(t *testing.T) {
 			session := &meetingAudioMinutesSession{
 				meta:        meta,
 				recordingID: "live-synthetic-vad",
-				vad:         newMeetingAudioVAD(),
-				buffer:      make([]byte, 0, meetingAudioBatchBytes),
-				decoders:    make(map[string]*meetingAudioDecoder),
-				energy:      make(map[string]int64),
+				speakers:    make(map[string]*meetingAudioSpeaker),
 				queue:       queue,
 			}
 			decoder := &meetingAudioDecoder{
-				participantID: "synthetic-speaker",
-				ring:          make([]int16, meetingAudioRingSample),
+				ring: make([]int16, meetingAudioRingSample),
 			}
-			session.decoders["synthetic-track"] = decoder
+			session.speakers["synthetic-speaker"] = testMeetingAudioSpeaker("synthetic-speaker", decoder)
 			base := time.Now().UTC().Truncate(meetingAudioVADFrameDuration)
 			samples := make([]int16, meetingAudioFrameSample)
 			for frameOffset := 0; frameOffset < len(mixedInput); frameOffset += meetingAudioFrameBytes {
@@ -144,7 +140,7 @@ func TestMeetingAISomniLiveOptIn(t *testing.T) {
 				now := base.Add(time.Duration(frameOffset/meetingAudioFrameBytes+1) * meetingAudioVADFrameDuration)
 				decoder.lastSeen = now
 				decoder.push(samples)
-				session.mixTick(now)
+				session.captureTick(now)
 			}
 			session.finalFlush()
 

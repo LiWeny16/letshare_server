@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +26,7 @@ const (
 	meetingAudioBatchBytes          = meetingAudioBatchSample * 2
 	meetingAudioGapPad              = 300 * time.Millisecond
 	meetingAudioBatchDuration       = 10 * time.Second
+	meetingAudioQueueCapacity       = 16
 	meetingAudioFinalQueueReserve   = 2
 	meetingAudioRingSample          = meetingAudioSampleRate // 1s jitter buffer per track
 	meetingAudioDecoderIdle         = 30 * time.Second
@@ -43,13 +45,22 @@ type meetingAudioBatch struct {
 }
 
 type meetingAudioDecoder struct {
-	participantID string
-	decoder       opus.Decoder
-	samples       []int16
-	ring          []int16
-	head          int
-	size          int
-	lastSeen      time.Time
+	decoder  opus.Decoder
+	samples  []int16
+	ring     []int16
+	head     int
+	size     int
+	lastSeen time.Time
+}
+
+type meetingAudioSpeaker struct {
+	id          string
+	name        string
+	tracks      map[*webrtc.TrackRemote]*meetingAudioDecoder
+	vad         *meetingAudioVAD
+	buffer      []byte
+	bufferStart time.Time
+	bufferEnd   time.Time
 }
 
 type meetingAudioPipelineDiagnostics struct {
@@ -59,24 +70,22 @@ type meetingAudioPipelineDiagnostics struct {
 	decodeErrors      uint64
 	decodedPackets    uint64
 	decodedSamples    uint64
-	mixedFrames       uint64
+	speakerFrames     uint64
 	voiceFrames       uint64
 	vadSegments       uint64
 	asrBatches        uint64
 	asrQueueDrops     uint64
 }
 
-func newMeetingAudioDecoder(participantID string) (*meetingAudioDecoder, error) {
+func newMeetingAudioDecoder() (*meetingAudioDecoder, error) {
 	decoder, err := opus.NewDecoderWithOutput(meetingAudioSampleRate, 1)
 	if err != nil {
 		return nil, err
 	}
 	return &meetingAudioDecoder{
-		participantID: participantID,
-		decoder:       decoder,
-		samples:       make([]int16, 5760),
-		ring:          make([]int16, meetingAudioRingSample),
-		lastSeen:      time.Now(),
+		decoder: decoder,
+		samples: make([]int16, 5760),
+		ring:    make([]int16, meetingAudioRingSample),
 	}, nil
 }
 
@@ -84,7 +93,7 @@ func (d *meetingAudioDecoder) push(samples []int16) {
 	for _, sample := range samples {
 		if d.size == len(d.ring) {
 			// Keep the newest second of audio; a stalled publisher must not
-			// grow the buffer or make the mix drift permanently behind.
+			// grow the buffer or make capture drift permanently behind.
 			d.head = (d.head + 1) % len(d.ring)
 			d.size--
 		}
@@ -115,9 +124,8 @@ func (d *meetingAudioDecoder) clear() {
 	d.size = 0
 }
 
-// meetingAudioMinutesSession owns the room's server-side mix. It decodes each
-// published Opus RTP track at 16kHz mono, sums 20ms frames, trims silence with
-// VAD, and sends bounded PCM batches to the non-streaming ASR service.
+// meetingAudioMinutesSession decodes each publisher's Opus RTP at 16kHz mono.
+// VAD and ASR batches stay per publisher so each result has one known speaker.
 type meetingAudioMinutesSession struct {
 	roomID      string
 	room        *sfu.Room
@@ -135,17 +143,11 @@ type meetingAudioMinutesSession struct {
 	closed         atomic.Bool
 
 	mu          sync.Mutex
-	decoders    map[string]*meetingAudioDecoder
-	buffer      []byte
-	bufferStart time.Time
-	bufferEnd   time.Time
-	vad         *meetingAudioVAD
-	energy      map[string]int64
+	speakers    map[string]*meetingAudioSpeaker
 	diagnostics meetingAudioPipelineDiagnostics
 
-	queue       chan meetingAudioBatch
-	speakerName func(participantID string) string
-	onText      func(text string, startMs, endMs int64, recordingID, speakerID, speakerName string)
+	queue  chan meetingAudioBatch
+	onText func(text string, startMs, endMs int64, recordingID, speakerID, speakerName string)
 }
 
 func (h *WebSocketHandler) startMeetingAudioMinutes(roomID string, room *sfu.Room, meta *meetingMeta) *meetingAudioMinutesSession {
@@ -177,14 +179,8 @@ func (h *WebSocketHandler) startMeetingAudioMinutes(roomID string, room *sfu.Roo
 		asrCancel:      asrCancel,
 		done:           make(chan struct{}),
 		transcribeDone: make(chan struct{}),
-		decoders:       make(map[string]*meetingAudioDecoder),
-		buffer:         make([]byte, 0, meetingAudioBatchBytes),
-		vad:            newMeetingAudioVAD(),
-		energy:         make(map[string]int64),
-		queue:          make(chan meetingAudioBatch, 4),
-		speakerName: func(participantID string) string {
-			return h.meetingMemberDisplayName(roomID, participantID)
-		},
+		speakers:       make(map[string]*meetingAudioSpeaker),
+		queue:          make(chan meetingAudioBatch, meetingAudioQueueCapacity),
 		onText: func(text string, startMs, endMs int64, recordingID, speakerID, speakerName string) {
 			h.broadcastMeetingAudioSegment(roomID, meta, text, startMs, endMs, recordingID, speakerID, speakerName)
 		},
@@ -218,13 +214,13 @@ func (h *WebSocketHandler) startMeetingAudioMinutes(roomID string, room *sfu.Roo
 	h.finishMeetingASRStreamTransition(oldStreams, nil)
 	h.meetingAudioSessions.Store(roomID, session)
 	room.SetAudioTap(session.handlePacket)
-	go session.mixLoop()
+	go session.captureLoop()
 	go session.transcribeLoop()
 	meta.meetingASRPublishMu.Unlock()
 	if replaced != nil {
 		go replaced.Abort()
 	}
-	log.WithField("roomID", roomID).Info("会议混音纪要已启动")
+	log.WithField("roomID", roomID).Info("会议按发言人转写已启动")
 	return session
 }
 
@@ -246,12 +242,12 @@ func (h *WebSocketHandler) stopMeetingAudioMinutesMode(roomID string, drain bool
 	} else {
 		session.Abort()
 	}
-	log.WithField("roomID", roomID).Info("会议混音纪要已停止")
+	log.WithField("roomID", roomID).Info("会议按发言人转写已停止")
 }
 
 // detachMeetingAudioMinutes revokes the room tap and removes its session.
 // Callers that coordinate a recording transition can do this under the room
-// publication lock, then stop the mixer after releasing that lock.
+// publication lock, then stop capture after releasing that lock.
 func (h *WebSocketHandler) detachMeetingAudioMinutes(roomID string) *meetingAudioMinutesSession {
 	value, ok := h.meetingAudioSessions.LoadAndDelete(roomID)
 	if !ok {
@@ -309,7 +305,7 @@ func (s *meetingAudioMinutesSession) minutesActive() bool {
 // handlePacket is called from the publisher's single RTP fanout loop. It must
 // stay quick: decode into the track's 1s ring and return.
 func (s *meetingAudioMinutesSession) handlePacket(participantID string, track *webrtc.TrackRemote, packet *rtp.Packet) {
-	if s.closed.Load() || !s.minutesActive() || !s.publisherIsMember(participantID) || packet == nil || len(packet.Payload) == 0 {
+	if s.closed.Load() || !s.minutesActive() || participantID == "" || packet == nil || len(packet.Payload) == 0 {
 		return
 	}
 	if track == nil || track.Kind() != webrtc.RTPCodecTypeAudio {
@@ -320,19 +316,39 @@ func (s *meetingAudioMinutesSession) handlePacket(participantID string, track *w
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed.Load() || !s.minutesActive() || !s.publisherIsMember(participantID) {
+	if s.closed.Load() || !s.minutesActive() {
 		return
 	}
-	state := s.decoders[track.ID()]
+	var name string
+	if s.handler != nil {
+		member, ok := s.handler.meetings.member(s.roomID, participantID)
+		if !ok {
+			return
+		}
+		name = member.UserName
+	}
+	speaker := s.speakers[participantID]
+	if speaker == nil {
+		speaker = &meetingAudioSpeaker{
+			id:     participantID,
+			tracks: make(map[*webrtc.TrackRemote]*meetingAudioDecoder),
+			vad:    newMeetingAudioVAD(),
+		}
+		s.speakers[participantID] = speaker
+	}
+	if name != "" {
+		speaker.name = name
+	}
+	state := speaker.tracks[track]
 	if state == nil {
-		decoded, err := newMeetingAudioDecoder(participantID)
+		decoded, err := newMeetingAudioDecoder()
 		if err != nil {
 			s.diagnostics.decoderInitErrors++
 			return
 		}
 		state = decoded
-		s.decoders[track.ID()] = state
-		log.WithField("roomID", s.roomID).Info("会议混音开始解码音频")
+		speaker.tracks[track] = state
+		log.WithField("roomID", s.roomID).Info("会议纪要开始解码音频")
 	}
 	s.diagnostics.rtpPackets++
 	count, err := state.decoder.DecodeToInt16(packet.Payload, state.samples)
@@ -346,56 +362,41 @@ func (s *meetingAudioMinutesSession) handlePacket(participantID string, track *w
 	state.lastSeen = time.Now()
 }
 
-func (s *meetingAudioMinutesSession) publisherIsMember(participantID string) bool {
-	if s.handler == nil {
-		return true
-	}
-	clientID, ok := s.handler.meetings.clientForUniqID(s.roomID, participantID)
-	return ok && s.handler.meetings.owns(s.roomID, participantID, clientID)
-}
-
 func (s *meetingAudioMinutesSession) removePublisher(participantID string) {
 	if s == nil || participantID == "" {
 		return
 	}
 	s.mu.Lock()
-	for trackID, decoder := range s.decoders {
-		if decoder.participantID == participantID {
-			delete(s.decoders, trackID)
-		}
+	if speaker := s.speakers[participantID]; speaker != nil {
+		// The capture loop seals any pending speech with this publisher's last known name.
+		clear(speaker.tracks)
 	}
 	s.mu.Unlock()
 }
 
-func (s *meetingAudioMinutesSession) mixLoop() {
+func (s *meetingAudioMinutesSession) captureLoop() {
 	defer func() {
 		s.finalFlush()
 		close(s.done)
 	}()
-	ticker := time.NewTicker(20 * time.Millisecond)
+	ticker := time.NewTicker(meetingAudioVADFrameDuration)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
 		case now := <-ticker.C:
-			s.mixTick(now)
+			s.captureTick(now)
 		}
 	}
 }
 
-func (s *meetingAudioMinutesSession) mixTick(now time.Time) {
-	if !s.minutesActive() {
-		return
-	}
+func (p *meetingAudioSpeaker) nextFrame(now time.Time) [meetingAudioFrameBytes]byte {
 	var frame [meetingAudioFrameSample]int16
 	var acc [meetingAudioFrameSample]int32
-	var report *meetingAudioPipelineDiagnostics
-
-	s.mu.Lock()
-	for trackID, state := range s.decoders {
+	for track, state := range p.tracks {
 		if now.Sub(state.lastSeen) > meetingAudioDecoderIdle {
-			delete(s.decoders, trackID)
+			delete(p.tracks, track)
 			continue
 		}
 		if now.Sub(state.lastSeen) > meetingAudioStaleGap {
@@ -407,42 +408,43 @@ func (s *meetingAudioMinutesSession) mixTick(now time.Time) {
 		if !state.popFrame(frame[:]) {
 			continue
 		}
-		var frameEnergy int64
-		for _, sample := range frame {
-			frameEnergy += int64(absInt16(sample))
-		}
-		if frameEnergy > 0 {
-			s.energy[state.participantID] += frameEnergy
-		}
 		for index, sample := range frame {
 			acc[index] += int32(sample)
 		}
 	}
-	for index, sample := range acc {
-		if sample > 32767 {
-			frame[index] = 32767
-		} else if sample < -32768 {
-			frame[index] = -32768
-		} else {
-			frame[index] = int16(sample)
-		}
-	}
-	s.diagnostics.mixedFrames++
 	var encoded [meetingAudioFrameBytes]byte
-	for index, sample := range frame {
-		binary.LittleEndian.PutUint16(encoded[index*2:], uint16(sample))
+	for index, sample := range acc {
+		binary.LittleEndian.PutUint16(encoded[index*2:], uint16(int16(max(-32768, min(32767, sample)))))
 	}
-	if meetingAudioVADHasVoice(encoded[:]) {
-		s.diagnostics.voiceFrames++
+	return encoded
+}
+
+func (s *meetingAudioMinutesSession) captureTick(now time.Time) {
+	if !s.minutesActive() {
+		return
 	}
-	segments := s.vad.PushFrame(encoded[:], now.Add(-meetingAudioVADFrameDuration))
-	s.diagnostics.vadSegments += uint64(len(segments))
+	var report *meetingAudioPipelineDiagnostics
 	var batches []meetingAudioBatch
-	for _, segment := range segments {
-		batches = append(batches, s.appendSpeechSegmentLocked(segment)...)
-	}
-	if len(s.buffer) > 0 && now.Sub(s.bufferStart) >= meetingAudioBatchDuration {
-		batches = append(batches, s.takeBatchLocked()...)
+	s.mu.Lock()
+	for id, speaker := range s.speakers {
+		frame := speaker.nextFrame(now)
+		if len(speaker.tracks) == 0 {
+			batches = append(batches, speaker.flush()...)
+			delete(s.speakers, id)
+			continue
+		}
+		s.diagnostics.speakerFrames++
+		if meetingAudioVADHasVoice(frame[:]) {
+			s.diagnostics.voiceFrames++
+		}
+		segments := speaker.vad.PushFrame(frame[:], now.Add(-meetingAudioVADFrameDuration))
+		s.diagnostics.vadSegments += uint64(len(segments))
+		for _, segment := range segments {
+			batches = append(batches, speaker.appendSpeechSegment(segment)...)
+		}
+		if len(speaker.buffer) > 0 && now.Sub(speaker.bufferStart) >= meetingAudioBatchDuration {
+			batches = append(batches, speaker.takeBatch()...)
+		}
 	}
 	if s.diagnostics.startedAt.IsZero() {
 		s.diagnostics.startedAt = now
@@ -459,18 +461,16 @@ func (s *meetingAudioMinutesSession) mixTick(now time.Time) {
 			"roomID":      s.roomID,
 			"rtp_packets": report.rtpPackets, "decoder_init_errors": report.decoderInitErrors,
 			"decode_errors": report.decodeErrors, "decoded_packets": report.decodedPackets,
-			"decoded_samples": report.decodedSamples, "mixed_frames": report.mixedFrames,
+			"decoded_samples": report.decodedSamples, "speaker_frames": report.speakerFrames,
 			"voice_frames": report.voiceFrames, "vad_segments": report.vadSegments,
 			"asr_batches": report.asrBatches, "asr_queue_drops": report.asrQueueDrops,
 			"asr_queue_depth": len(s.queue),
 		}).Info("meeting audio pipeline diagnostic")
 	}
-	for _, batch := range batches {
-		s.enqueue(batch)
-	}
+	s.enqueueBatches(batches, false)
 }
 
-func (s *meetingAudioMinutesSession) appendSpeechSegmentLocked(segment meetingAudioSpeechSegment) []meetingAudioBatch {
+func (s *meetingAudioSpeaker) appendSpeechSegment(segment meetingAudioSpeechSegment) []meetingAudioBatch {
 	if len(segment.PCM) == 0 || segment.Start.IsZero() || !segment.End.After(segment.Start) {
 		return nil
 	}
@@ -479,8 +479,8 @@ func (s *meetingAudioMinutesSession) appendSpeechSegmentLocked(segment meetingAu
 	if !s.bufferStart.IsZero() {
 		gap := start.Sub(s.bufferEnd)
 		if segment.End.Sub(s.bufferStart) > meetingAudioBatchDuration {
-			batches := s.takeBatchLocked()
-			return append(batches, s.appendSpeechSegmentLocked(segment)...)
+			batches := s.takeBatch()
+			return append(batches, s.appendSpeechSegment(segment)...)
 		}
 		if gap < 0 {
 			overlapFrames := int((-gap + meetingAudioVADFrameDuration - 1) / meetingAudioVADFrameDuration)
@@ -499,14 +499,14 @@ func (s *meetingAudioMinutesSession) appendSpeechSegmentLocked(segment meetingAu
 			}
 			padBytes := int(pad/meetingAudioVADFrameDuration) * meetingAudioFrameBytes
 			if len(s.buffer)+padBytes+len(pcm) > meetingAudioBatchBytes && len(s.buffer) > 0 {
-				batches := s.takeBatchLocked()
-				return append(batches, s.appendSpeechSegmentLocked(segment)...)
+				batches := s.takeBatch()
+				return append(batches, s.appendSpeechSegment(segment)...)
 			}
 			s.buffer = append(s.buffer, make([]byte, padBytes)...)
 		}
 		if len(s.buffer)+len(pcm) > meetingAudioBatchBytes && len(s.buffer) > 0 {
-			batches := s.takeBatchLocked()
-			return append(batches, s.appendSpeechSegmentLocked(segment)...)
+			batches := s.takeBatch()
+			return append(batches, s.appendSpeechSegment(segment)...)
 		}
 	} else {
 		s.bufferStart = start
@@ -517,78 +517,74 @@ func (s *meetingAudioMinutesSession) appendSpeechSegmentLocked(segment meetingAu
 	s.buffer = append(s.buffer, pcm...)
 	s.bufferEnd = segment.End
 	if segment.End.Sub(s.bufferStart) >= meetingAudioBatchDuration || len(s.buffer) >= meetingAudioBatchBytes {
-		return s.takeBatchLocked()
+		return s.takeBatch()
 	}
 	return nil
 }
 
-func (s *meetingAudioMinutesSession) takeBatchLocked() []meetingAudioBatch {
+func (s *meetingAudioSpeaker) takeBatch() []meetingAudioBatch {
 	if len(s.buffer) == 0 {
 		return nil
 	}
-	speakerID, speakerName := "meeting-audio", "Meeting audio"
-	var maxEnergy int64
-	for participantID, energy := range s.energy {
-		if energy > maxEnergy {
-			maxEnergy = energy
-			speakerID = participantID
-		}
-	}
-	if speakerID != "meeting-audio" && s.speakerName != nil {
-		if name := strings.TrimSpace(s.speakerName(speakerID)); name != "" {
-			speakerName = name
-		}
-	}
-	s.energy = make(map[string]int64)
-	pcm := append([]byte(nil), s.buffer...)
-	s.buffer = s.buffer[:0]
 	batch := meetingAudioBatch{
-		pcm:         pcm,
+		pcm:         s.buffer,
 		startMs:     s.bufferStart.UnixMilli(),
 		endMs:       s.bufferEnd.UnixMilli(),
-		recordingID: s.recordingID,
-		speakerID:   speakerID,
-		speakerName: speakerName,
+		speakerID:   s.id,
+		speakerName: s.name,
 	}
+	s.buffer = nil
 	s.bufferStart = time.Time{}
 	s.bufferEnd = time.Time{}
 	return []meetingAudioBatch{batch}
 }
+
+func (s *meetingAudioSpeaker) flush() []meetingAudioBatch {
+	var batches []meetingAudioBatch
+	for _, segment := range s.vad.Flush() {
+		batches = append(batches, s.appendSpeechSegment(segment)...)
+	}
+	return append(batches, s.takeBatch()...)
+}
+
 func (s *meetingAudioMinutesSession) finalFlush() {
 	s.mu.Lock()
 	var batches []meetingAudioBatch
-	if s.vad != nil {
-		for _, segment := range s.vad.Flush() {
-			batches = append(batches, s.appendSpeechSegmentLocked(segment)...)
-		}
+	for _, speaker := range s.speakers {
+		batches = append(batches, speaker.flush()...)
 	}
-	batches = append(batches, s.takeBatchLocked()...)
+	clear(s.speakers)
 	s.mu.Unlock()
+	s.enqueueBatches(batches, true)
+}
+
+func (s *meetingAudioMinutesSession) enqueueBatches(batches []meetingAudioBatch, final bool) {
+	if len(batches) > 1 {
+		sort.Slice(batches, func(i, j int) bool {
+			if batches[i].startMs == batches[j].startMs {
+				return batches[i].speakerID < batches[j].speakerID
+			}
+			return batches[i].startMs < batches[j].startMs
+		})
+	}
 	for _, batch := range batches {
-		s.enqueueFinal(batch)
+		s.enqueue(batch, final)
 	}
 }
 
-func (s *meetingAudioMinutesSession) enqueue(batch meetingAudioBatch) {
-	if batch.recordingID == "" || len(batch.pcm) == 0 {
+func (s *meetingAudioMinutesSession) enqueue(batch meetingAudioBatch, final bool) {
+	if s.recordingID == "" || len(batch.pcm) == 0 {
 		return
 	}
-	if len(s.queue) >= cap(s.queue)-meetingAudioFinalQueueReserve {
-		// Keep two queue slots available for the final VAD segment and any
-		// coalesced batch that must be sealed when capture stops.
+	if !final && len(s.queue) >= cap(s.queue)-meetingAudioFinalQueueReserve {
+		// Keep room in the queue for speech that is sealed when capture stops.
 		s.mu.Lock()
 		s.diagnostics.asrQueueDrops++
 		s.mu.Unlock()
 		log.WithField("roomID", s.roomID).Warn("meeting audio ASR queue is near capacity; dropping a non-final batch")
 		return
 	}
-	s.enqueueFinal(batch)
-}
-
-func (s *meetingAudioMinutesSession) enqueueFinal(batch meetingAudioBatch) {
-	if batch.recordingID == "" || len(batch.pcm) == 0 {
-		return
-	}
+	batch.recordingID = s.recordingID
 	select {
 	case s.queue <- batch:
 		s.mu.Lock()
@@ -599,7 +595,7 @@ func (s *meetingAudioMinutesSession) enqueueFinal(batch meetingAudioBatch) {
 		s.mu.Lock()
 		s.diagnostics.asrQueueDrops++
 		s.mu.Unlock()
-		log.WithField("roomID", s.roomID).Warn("会议混音 ASR 队列已满，丢弃一个批次")
+		log.WithField("roomID", s.roomID).Warn("会议纪要 ASR 队列已满，丢弃一个批次")
 	}
 }
 
@@ -615,7 +611,7 @@ func (s *meetingAudioMinutesSession) transcribeLoop() {
 		text, err := s.asr.Transcribe(ctx, batch.pcm)
 		cancel()
 		if err != nil {
-			log.WithFields(log.Fields{"roomID": s.roomID, "bytes": len(batch.pcm), "error_type": fmt.Sprintf("%T", err)}).Warn("会议混音 ASR 批次识别失败")
+			log.WithFields(log.Fields{"roomID": s.roomID, "bytes": len(batch.pcm), "error_type": fmt.Sprintf("%T", err)}).Warn("会议纪要 ASR 批次识别失败")
 			s.handler.broadcastMeetingAudioASRError(s.roomID, s.meta, batch.recordingID)
 			continue
 		}
@@ -623,7 +619,7 @@ func (s *meetingAudioMinutesSession) transcribeLoop() {
 		if text == "" {
 			continue
 		}
-		log.WithFields(log.Fields{"roomID": s.roomID, "chars": len([]rune(text))}).Info("会议混音 ASR 批次已转写")
+		log.WithFields(log.Fields{"roomID": s.roomID, "chars": len([]rune(text))}).Info("会议纪要 ASR 批次已转写")
 		if s.onText != nil {
 			s.onText(text, batch.startMs, batch.endMs, batch.recordingID, batch.speakerID, batch.speakerName)
 		}
@@ -722,27 +718,4 @@ func (h *WebSocketHandler) broadcastMeetingAudioSegment(roomID string, sessionMe
 	h.appendMeetingAITranscript(roomID, []meetingMinutesSegment{segment})
 	payload := map[string]interface{}{"kind": "segments", "recordingId": recordingID, "segments": []meetingMinutesSegment{segment}}
 	h.sendMeetingMinutesToEnabledMembersExcept(roomID, meta, payload, pendingClients)
-}
-
-func (h *WebSocketHandler) meetingMemberDisplayName(roomID, uniqID string) string {
-	for _, member := range h.meetings.members(roomID) {
-		if member.UniqID != uniqID {
-			continue
-		}
-		name := strings.TrimSpace(member.UserName)
-		if index := strings.IndexByte(name, ':'); index > 0 {
-			name = name[:index]
-		}
-		if name != "" {
-			return name
-		}
-	}
-	return "会议音频"
-}
-
-func absInt16(value int16) int {
-	if value < 0 {
-		return -int(value)
-	}
-	return int(value)
 }

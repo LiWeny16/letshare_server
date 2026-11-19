@@ -179,7 +179,8 @@ func TestMeetingAudioPipelineOpusRTPToASR(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	asrCtx, asrCancel := context.WithCancel(context.Background())
 	defer asrCancel()
-	result := make(chan string, 2)
+	type transcriptResult struct{ text, recordingID, speakerID string }
+	result := make(chan transcriptResult, 2)
 	session := &meetingAudioMinutesSession{
 		roomID: "opus-pipeline-test", room: room, meta: meta, recordingID: "synthetic-recording",
 		asr: NewMeetingASRStreamService(MeetingASRStreamConfig{
@@ -188,12 +189,13 @@ func TestMeetingAudioPipelineOpusRTPToASR(t *testing.T) {
 		}),
 		ctx: ctx, cancel: cancel, asrCtx: asrCtx, asrCancel: asrCancel,
 		done: make(chan struct{}), transcribeDone: make(chan struct{}),
-		decoders: make(map[string]*meetingAudioDecoder), vad: newMeetingAudioVAD(),
-		energy: make(map[string]int64), queue: make(chan meetingAudioBatch, 4),
-		onText: func(text string, _, _ int64, _, _, _ string) { result <- text },
+		speakers: make(map[string]*meetingAudioSpeaker), queue: make(chan meetingAudioBatch, 4),
+		onText: func(text string, _, _ int64, recordingID, speakerID, _ string) {
+			result <- transcriptResult{text, recordingID, speakerID}
+		},
 	}
 	room.SetAudioTap(session.handlePacket)
-	go session.mixLoop()
+	go session.captureLoop()
 	go session.transcribeLoop()
 	t.Cleanup(session.Abort)
 	var seq uint16
@@ -226,9 +228,12 @@ func TestMeetingAudioPipelineOpusRTPToASR(t *testing.T) {
 		t.Fatal("decoded speech never reached ASR while the meeting was active")
 	}
 	select {
-	case text := <-result:
-		if strings.TrimSpace(text) == "" || (!live && text != "synthetic speech") {
+	case segment := <-result:
+		if strings.TrimSpace(segment.text) == "" || (!live && segment.text != "synthetic speech") {
 			t.Fatal("ASR result was not delivered to the meeting")
+		}
+		if segment.recordingID != session.recordingID || segment.speakerID != participant.ID {
+			t.Fatalf("ASR result lost its recording or publisher identity: recording=%q publisher=%q", segment.recordingID, segment.speakerID)
 		}
 	case <-upstreamFailure:
 		t.Fatal("real Somni ASR failed or returned an empty result for decoded synthetic speech")

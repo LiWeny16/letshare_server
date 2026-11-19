@@ -32,8 +32,8 @@ type meetingAudioVADFrame struct {
 	pcm   [meetingAudioFrameBytes]byte
 }
 
-// meetingAudioVAD performs a small, energy-based voice activity pass over the
-// server-side mixed 20ms PCM frames. It retains at most 200ms of pre-roll and
+// meetingAudioVAD performs a small, energy-based voice activity pass over one
+// publisher's 20ms PCM frames. It retains at most 200ms of pre-roll and
 // one segment of at most 10s. The threshold is deliberately permissive: this
 // helper is a speech/no-speech heuristic, not a speech recognizer.
 type meetingAudioVAD struct {
@@ -56,15 +56,14 @@ type meetingAudioVAD struct {
 }
 
 // newMeetingAudioVAD constructs the production VAD with the fixed padding and
-// 10s segment ceiling used by the meeting audio mixer.
+// 10s segment ceiling used by meeting transcription.
 func newMeetingAudioVAD() *meetingAudioVAD {
 	return &meetingAudioVAD{
 		maxSegmentFrames: meetingAudioVADMaxFrames,
-		segmentPCM:       make([]byte, 0, meetingAudioVADMaxFrames*meetingAudioFrameBytes),
 	}
 }
 
-// PushFrame accepts one mixed 20ms mono PCM16LE frame. capturedAt is the
+// PushFrame accepts one 20ms mono PCM16LE frame. capturedAt is the
 // capture time of the first sample in pcm16le. Returned segments own their PCM
 // buffers. Frames of the wrong size are ignored without changing VAD state.
 // Speech can start with a single voiced frame; there is no minimum speech

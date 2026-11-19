@@ -12,7 +12,12 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/pion/webrtc/v4"
 )
+
+func testMeetingAudioSpeaker(id string, decoder *meetingAudioDecoder) *meetingAudioSpeaker {
+	return &meetingAudioSpeaker{id: id, name: id + " name", vad: newMeetingAudioVAD(), tracks: map[*webrtc.TrackRemote]*meetingAudioDecoder{nil: decoder}}
+}
 
 func TestMeetingAudioRingKeepsNewestSamples(t *testing.T) {
 	decoder := &meetingAudioDecoder{ring: make([]int16, 4)}
@@ -29,43 +34,59 @@ func TestMeetingAudioRingKeepsNewestSamples(t *testing.T) {
 	}
 }
 
-func TestMeetingAudioMinutesMixIncludesLatePublisherWithoutConsent(t *testing.T) {
+func TestMeetingAudioMinutesKeepsOverlappingLatePublisherAudioSeparate(t *testing.T) {
 	meta := newMeetingMeta(meetingMetaInit{})
 	meta.minutes.Running = true
 	meta.minutes.RecordingID = "recording-1"
 	base := time.Date(2026, 11, 10, 8, 0, 0, 0, time.UTC)
 	session := &meetingAudioMinutesSession{
-		meta: meta, recordingID: "recording-1", vad: newMeetingAudioVAD(),
-		queue: make(chan meetingAudioBatch, 4), decoders: make(map[string]*meetingAudioDecoder),
-		energy: make(map[string]int64),
+		meta: meta, recordingID: "recording-1", queue: make(chan meetingAudioBatch, 4),
+		speakers: make(map[string]*meetingAudioSpeaker),
 	}
 
 	firstPublisher := &meetingAudioDecoder{
-		participantID: "first", ring: make([]int16, meetingAudioRingSample), lastSeen: base,
+		ring: make([]int16, meetingAudioRingSample), lastSeen: base,
 	}
 	firstPublisher.push(repeatedSamples(1000, 2*meetingAudioFrameSample))
-	session.decoders["first-track"] = firstPublisher
-	session.mixTick(base.Add(meetingAudioVADFrameDuration))
+	session.speakers["first"] = testMeetingAudioSpeaker("first", firstPublisher)
+	session.captureTick(base.Add(meetingAudioVADFrameDuration))
 
 	// This publisher joins after minutes start and has no legacy consent entry.
 	latePublisher := &meetingAudioDecoder{
-		participantID: "late", ring: make([]int16, meetingAudioRingSample), lastSeen: base.Add(meetingAudioVADFrameDuration),
+		ring: make([]int16, meetingAudioRingSample), lastSeen: base.Add(meetingAudioVADFrameDuration),
 	}
 	latePublisher.push(repeatedSamples(2000, meetingAudioFrameSample))
-	session.decoders["late-track"] = latePublisher
-	session.mixTick(base.Add(2 * meetingAudioVADFrameDuration))
+	session.speakers["late"] = testMeetingAudioSpeaker("late", latePublisher)
+	session.captureTick(base.Add(2 * meetingAudioVADFrameDuration))
 	session.finalFlush()
 
-	batch := <-session.queue
-	if batch.recordingID != "recording-1" {
-		t.Fatalf("recording ID = %q", batch.recordingID)
+	if len(session.queue) != 2 {
+		t.Fatalf("expected one ASR batch per publisher, got %d", len(session.queue))
 	}
-	if batch.startMs != base.UnixMilli() || batch.endMs != base.Add(2*meetingAudioVADFrameDuration).UnixMilli() {
-		t.Fatalf("capture interval = [%d, %d], want [%d, %d)", batch.startMs, batch.endMs, base.UnixMilli(), base.Add(2*meetingAudioVADFrameDuration).UnixMilli())
-	}
-	got := int16(binary.LittleEndian.Uint16(batch.pcm[len(batch.pcm)-2:]))
-	if got != 3000 {
-		t.Fatalf("mixed late-publisher sample = %d, want 3000", got)
+	for _, expected := range []struct {
+		id     string
+		start  time.Time
+		frames int
+		sample int16
+	}{
+		{"first", base, 2, 1000},
+		{"late", base.Add(meetingAudioVADFrameDuration), 1, 2000},
+	} {
+		batch := <-session.queue
+		if batch.speakerID != expected.id || batch.speakerName != expected.id+" name" || batch.recordingID != "recording-1" {
+			t.Fatalf("batch speaker=%q name=%q recording=%q, want %q in recording-1", batch.speakerID, batch.speakerName, batch.recordingID, expected.id)
+		}
+		if batch.startMs != expected.start.UnixMilli() || batch.endMs != base.Add(2*meetingAudioVADFrameDuration).UnixMilli() {
+			t.Fatalf("%s capture interval = [%d, %d)", expected.id, batch.startMs, batch.endMs)
+		}
+		if len(batch.pcm) != expected.frames*meetingAudioFrameBytes {
+			t.Fatalf("%s has %d PCM bytes", expected.id, len(batch.pcm))
+		}
+		for offset := 0; offset < len(batch.pcm); offset += 2 {
+			if got := int16(binary.LittleEndian.Uint16(batch.pcm[offset:])); got != expected.sample {
+				t.Fatalf("%s PCM contained another participant's audio: got %d, want %d", expected.id, got, expected.sample)
+			}
+		}
 	}
 	if _, consentEntryExists := meta.minutes.Consented["late"]; consentEntryExists {
 		t.Fatal("test setup unexpectedly created a consent entry for the late publisher")
@@ -78,27 +99,26 @@ func TestMeetingAudioMinutesSuppressesSilenceAndFlushesSpeechOnStop(t *testing.T
 	meta.minutes.RecordingID = "recording-2"
 	base := time.Date(2026, 11, 10, 8, 0, 0, 0, time.UTC)
 	session := &meetingAudioMinutesSession{
-		meta: meta, recordingID: "recording-2", vad: newMeetingAudioVAD(),
-		queue: make(chan meetingAudioBatch, 4), decoders: make(map[string]*meetingAudioDecoder),
-		energy: make(map[string]int64),
+		meta: meta, recordingID: "recording-2", queue: make(chan meetingAudioBatch, 4),
+		speakers: make(map[string]*meetingAudioSpeaker),
 	}
+	decoder := &meetingAudioDecoder{ring: make([]int16, meetingAudioRingSample), lastSeen: base}
+	speaker := testMeetingAudioSpeaker("speaker", decoder)
+	session.speakers[speaker.id] = speaker
 	for frame := 0; frame < 100; frame++ {
 		at := base.Add(time.Duration(frame+1) * meetingAudioVADFrameDuration)
-		session.mixTick(at)
+		session.captureTick(at)
 	}
-	if len(session.queue) != 0 || len(session.buffer) != 0 {
-		t.Fatalf("silence entered ASR queue/buffer: queue=%d buffer=%d", len(session.queue), len(session.buffer))
+	if len(session.queue) != 0 || len(speaker.buffer) != 0 {
+		t.Fatalf("silence entered ASR queue/buffer: queue=%d buffer=%d", len(session.queue), len(speaker.buffer))
 	}
 
-	voice := meetingAudioVADPCMFrame(180) // quiet speech below the old fixed threshold
+	voice := repeatedSamples(180, meetingAudioFrameSample) // quiet speech below the old fixed threshold
 	for frame := 100; frame < 105; frame++ {
 		at := base.Add(time.Duration(frame+1) * meetingAudioVADFrameDuration)
-		session.mu.Lock()
-		segments := session.vad.PushFrame(voice, at.Add(-meetingAudioVADFrameDuration))
-		for _, segment := range segments {
-			session.appendSpeechSegmentLocked(segment)
-		}
-		session.mu.Unlock()
+		decoder.lastSeen = at
+		decoder.push(voice)
+		session.captureTick(at)
 	}
 	session.finalFlush()
 	select {
@@ -121,18 +141,16 @@ func TestMeetingAudioMinutesKeepsVADPreRollAcrossBatchBoundary(t *testing.T) {
 	meta.minutes.RecordingID = "recording-boundary"
 	base := time.Now().Truncate(meetingAudioVADFrameDuration)
 	session := &meetingAudioMinutesSession{
-		meta: meta, recordingID: "recording-boundary", vad: newMeetingAudioVAD(),
-		queue: make(chan meetingAudioBatch, 4), decoders: make(map[string]*meetingAudioDecoder),
-		energy: make(map[string]int64), buffer: make([]byte, 0, meetingAudioBatchBytes),
+		meta: meta, recordingID: "recording-boundary", queue: make(chan meetingAudioBatch, 4),
+		speakers: make(map[string]*meetingAudioSpeaker),
 	}
 
-	firstVoice := &meetingAudioDecoder{participantID: "first", ring: make([]int16, meetingAudioRingSample), lastSeen: base}
-	firstVoice.push(repeatedSamples(500, meetingAudioFrameSample))
-	session.decoders["first-track"] = firstVoice
-	session.mixTick(base.Add(meetingAudioVADFrameDuration))
-	delete(session.decoders, "first-track")
+	decoder := &meetingAudioDecoder{ring: make([]int16, meetingAudioRingSample), lastSeen: base}
+	decoder.push(repeatedSamples(500, meetingAudioFrameSample))
+	session.speakers["speaker"] = testMeetingAudioSpeaker("speaker", decoder)
+	session.captureTick(base.Add(meetingAudioVADFrameDuration))
 	for frame := 1; frame < meetingAudioBatchSample/meetingAudioFrameSample; frame++ {
-		session.mixTick(base.Add(time.Duration(frame+1) * meetingAudioVADFrameDuration))
+		session.captureTick(base.Add(time.Duration(frame+1) * meetingAudioVADFrameDuration))
 	}
 	if len(session.queue) != 1 {
 		t.Fatalf("first wall-clock batch count = %d, want 1", len(session.queue))
@@ -144,12 +162,11 @@ func TestMeetingAudioMinutesKeepsVADPreRollAcrossBatchBoundary(t *testing.T) {
 
 	// The next speech frame begins just after the ten-second batch boundary.
 	voiceStart := base.Add(meetingAudioBatchDuration)
-	lateVoice := &meetingAudioDecoder{participantID: "late", ring: make([]int16, meetingAudioRingSample), lastSeen: voiceStart.Add(meetingAudioVADFrameDuration)}
-	lateVoice.push(repeatedSamples(180, meetingAudioFrameSample))
-	session.decoders["late-track"] = lateVoice
-	session.mixTick(voiceStart.Add(meetingAudioVADFrameDuration))
+	decoder.lastSeen = voiceStart.Add(meetingAudioVADFrameDuration)
+	decoder.push(repeatedSamples(180, meetingAudioFrameSample))
+	session.captureTick(voiceStart.Add(meetingAudioVADFrameDuration))
 	for frame := 1; frame <= 5; frame++ {
-		session.mixTick(voiceStart.Add(time.Duration(frame+1) * meetingAudioVADFrameDuration))
+		session.captureTick(voiceStart.Add(time.Duration(frame+1) * meetingAudioVADFrameDuration))
 	}
 	session.finalFlush()
 	secondBatch := <-session.queue
@@ -161,22 +178,17 @@ func TestMeetingAudioMinutesKeepsVADPreRollAcrossBatchBoundary(t *testing.T) {
 
 func TestMeetingAudioMinutesCoalescesSpeechWithBoundedSilencePadding(t *testing.T) {
 	base := time.Date(2026, 11, 10, 8, 0, 0, 0, time.UTC)
-	session := &meetingAudioMinutesSession{
-		recordingID: "recording-3", buffer: make([]byte, 0, meetingAudioBatchBytes),
-		energy: make(map[string]int64),
-	}
+	speaker := &meetingAudioSpeaker{id: "speaker"}
 	oneFrame := meetingAudioVADPCMFrame(500)
 	segmentOne := meetingAudioSpeechSegment{Start: base, End: base.Add(100 * time.Millisecond), PCM: bytes.Repeat(oneFrame, 5)}
 	segmentTwo := meetingAudioSpeechSegment{Start: base.Add(time.Second), End: base.Add(1100 * time.Millisecond), PCM: bytes.Repeat(oneFrame, 5)}
-	session.mu.Lock()
-	if batches := session.appendSpeechSegmentLocked(segmentOne); len(batches) != 0 {
+	if batches := speaker.appendSpeechSegment(segmentOne); len(batches) != 0 {
 		t.Fatalf("first short span flushed early: %d", len(batches))
 	}
-	if batches := session.appendSpeechSegmentLocked(segmentTwo); len(batches) != 0 {
+	if batches := speaker.appendSpeechSegment(segmentTwo); len(batches) != 0 {
 		t.Fatalf("coalesced spans flushed early: %d", len(batches))
 	}
-	batches := session.takeBatchLocked()
-	session.mu.Unlock()
+	batches := speaker.takeBatch()
 	if len(batches) != 1 {
 		t.Fatalf("batches = %d, want 1", len(batches))
 	}
@@ -192,17 +204,18 @@ func TestMeetingAudioMinutesCoalescesSpeechWithBoundedSilencePadding(t *testing.
 
 func TestMeetingAudioMinutesReservesQueueForStopFlush(t *testing.T) {
 	base := time.Date(2026, 11, 10, 8, 0, 0, 0, time.UTC)
+	speaker := &meetingAudioSpeaker{id: "speaker", vad: newMeetingAudioVAD()}
 	session := &meetingAudioMinutesSession{
-		recordingID: "recording-reserve", vad: newMeetingAudioVAD(),
-		queue: make(chan meetingAudioBatch, 4), energy: make(map[string]int64),
+		recordingID: "recording-reserve", queue: make(chan meetingAudioBatch, 4),
+		speakers: map[string]*meetingAudioSpeaker{speaker.id: speaker},
 	}
 	for index := 0; index < 3; index++ {
-		session.enqueue(meetingAudioBatch{recordingID: "recording-reserve", pcm: []byte{1}})
+		session.enqueue(meetingAudioBatch{pcm: []byte{1}}, false)
 	}
 	if len(session.queue) != cap(session.queue)-meetingAudioFinalQueueReserve {
 		t.Fatalf("normal queue use = %d, want to preserve %d final slots", len(session.queue), meetingAudioFinalQueueReserve)
 	}
-	session.vad.PushFrame(meetingAudioVADPCMFrame(500), base)
+	speaker.vad.PushFrame(meetingAudioVADPCMFrame(500), base)
 	session.finalFlush()
 	if len(session.queue) != cap(session.queue)-meetingAudioFinalQueueReserve+1 {
 		t.Fatalf("stop flush was not queued in the reserved slot: queue=%d", len(session.queue))
