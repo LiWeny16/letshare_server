@@ -98,6 +98,7 @@ func (h *WebSocketHandler) minutesStateForRecipient(meta *meetingMeta, uniqID st
 	enabled := minutesSubscriptionEnabledLocked(meta, uniqID)
 	if !enabled {
 		state.Summary = ""
+		state.FinalSummary = ""
 	}
 	return state, enabled
 }
@@ -121,7 +122,7 @@ func (h *WebSocketHandler) broadcastMeetingMinutesState(roomID, kind string, sta
 			continue
 		}
 		personalized, enabled := h.minutesStateForRecipient(meta, member.UniqID)
-		if kind == "summary" && !enabled {
+		if (kind == "summary" || kind == "final-summary") && !enabled {
 			continue
 		}
 		payload := map[string]interface{}{
@@ -154,6 +155,7 @@ func (h *WebSocketHandler) sendMeetingMinutesSubscriptionAck(clientID, roomID, u
 	state, currentEnabled := h.minutesStateForRecipient(meta, uniqID)
 	if !currentEnabled {
 		state.Summary = ""
+		state.FinalSummary = ""
 	}
 	h.sendMeetingToClient(clientID, roomID, model.MessageTypeMeetingMinutes, map[string]interface{}{
 		"kind":                    "subscription",

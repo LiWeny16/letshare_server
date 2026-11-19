@@ -66,10 +66,12 @@ func TestMeetingASRLegacyChunkUsesSomni(t *testing.T) {
 	t.Cleanup(upstream.Close)
 	wsBase := "ws" + strings.TrimPrefix(upstream.URL, "http") + "/stream"
 
-	ts, host, _, _, roomID := meetingChatFlow(t)
-	ts.handler.SetMeetingASRStreamService(NewMeetingASRStreamService(MeetingASRStreamConfig{
-		HTTPBase: upstream.URL, WSBase: wsBase, Email: "test@example.test", Password: "test",
-	}))
+	_, host, _, _, roomID := meetingChatFlowWithSetup(t, func(h *WebSocketHandler) {
+		h.captionsEnabled = true
+		h.SetMeetingASRStreamService(NewMeetingASRStreamService(MeetingASRStreamConfig{
+			HTTPBase: upstream.URL, WSBase: wsBase, Email: "test@example.test", Password: "test",
+		}))
+	})
 	subscribeCaption(t, host, roomID, true)
 	if _, err := waitMinutesKind(host, "captions", 3*time.Second); err != nil {
 		t.Fatal(err)

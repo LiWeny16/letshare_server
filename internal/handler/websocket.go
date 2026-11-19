@@ -172,7 +172,9 @@ type meetingMeta struct {
 	minutesDeliveryMu sync.Mutex
 	// minutesSummaryMu permits only one room-level summary completion at a time.
 	minutesSummaryMu sync.Mutex
-	BreakoutName     string // self-service room name; protected by mu, independent of meeting title
+	// minutesFinalMu coalesces simultaneous requests for the same final summary.
+	minutesFinalMu sync.Mutex
+	BreakoutName   string // self-service room name; protected by mu, independent of meeting title
 	// Protected by meetingLifecycleMu; prevents host reassignment while moving rooms.
 	breakoutHostSwitchID       string
 	breakoutHostSwitchDeadline time.Time
@@ -293,6 +295,8 @@ type meetingMinutesState struct {
 	SummaryProvider string          `json:"summaryProvider,omitempty"`
 	SummaryModel    string          `json:"summaryModel,omitempty"`
 	Summary         string          `json:"summary,omitempty"`
+	FinalSummary    string          `json:"finalSummary,omitempty"`
+	FinalThroughSeq uint64          `json:"finalThroughSeq,omitempty"`
 	Consented       map[string]bool `json:"-"`
 	SeenSegments    map[string]bool `json:"-"`
 }
@@ -1528,6 +1532,7 @@ func (h *WebSocketHandler) sendMeetingInfo(roomID, userID string, meta *meetingM
 	minutesEnabled := minutesSubscriptionEnabledLocked(meta, userID)
 	if !minutesEnabled {
 		minutes.Summary = ""
+		minutes.FinalSummary = ""
 	}
 	minutes.ServerMix = h.meetingASRStream != nil && h.meetingASRStream.Enabled()
 	minutes.AI = h.meetingAIService != nil && h.meetingAIService.Enabled()
@@ -2572,6 +2577,8 @@ func resetMeetingMinutesEpochLocked(meta *meetingMeta) {
 	meta.minutes.SummaryThroughSeq = 0
 	meta.minutes.HistoryStartSeq = 0
 	meta.minutes.Summary = ""
+	meta.minutes.FinalSummary = ""
+	meta.minutes.FinalThroughSeq = 0
 	meta.minutesSegments = nil
 	meta.minutesSegmentsBytes = 0
 	meta.minutesSummaryRequestedRecordingID = ""

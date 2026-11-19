@@ -62,6 +62,9 @@ const (
 	MeetingAITaskLiveNotes = "live-notes"
 	// MeetingAITaskFinalMinutes writes the final copyable Markdown minutes.
 	MeetingAITaskFinalMinutes = "final-minutes"
+	// MeetingAITaskEndMinutes is a host-only request to finalize for recipients
+	// when the host has independently paused their own minutes subscription.
+	MeetingAITaskEndMinutes = "end-minutes"
 	// MeetingAITaskChat answers a short private question about this meeting.
 	MeetingAITaskChat = "chat"
 
@@ -574,8 +577,7 @@ func meetingAISystemPrompt(task, languageName string) string {
 	b.WriteString("You have no tools and cannot browse, call functions, or take any action. ")
 	switch task {
 	case MeetingAITaskSummary:
-		b.WriteString("Task: summarize the meeting data. Return only valid JSON with keys meetingTitle (string), overview (string), timeline (array of objects {id,startMs,speakerName,summary,transcript,kind}), decisions (array {text,timeMs}), actionItems (array {task,owner,deadline,timeMs}), and openQuestions (array {question,timeMs}). Use empty arrays if unknown. Do not invent decisions, owners, dates, names, or quotes. Preserve prior conclusions when supplied. ")
-		b.WriteString("Return exactly one new timeline entry for the entire supplied batch of segments. Synthesize the related remarks into one concise paragraph in the reply language, usually two or three sentences, and mention the shared topic, conclusions, or unresolved points. Do not output a note for each utterance or copy timeline entries from the previous summary. Keep speakerName and transcript empty in the new entry; the app attaches source information. Use neutral phrasing without naming someone as the speaker of a paraphrase. Only name an action owner when explicitly supported by the input. Set kind to speech, decision, action, or question.")
+		b.WriteString("Task: write one live discussion note for the supplied batch of transcript segments. Return only valid JSON with a timeline array containing exactly one object {summary,kind}. Synthesize the batch into one concise paragraph in the reply language, usually two or three sentences. Do not produce a meeting-wide overview, decisions list, or action-items list. Use neutral phrasing and do not attribute paraphrases to a speaker. Do not invent facts, names, owners, dates, or quotations. Set kind to speech, decision, action, or question.")
 	case MeetingAITaskTranslate:
 		b.WriteString("Task: translate the excerpt below into " + languageName +
 			". Preserve meaning and speaker intent; output only the translation.")
@@ -584,7 +586,7 @@ func meetingAISystemPrompt(task, languageName string) string {
 	case MeetingAITaskLiveNotes:
 		b.WriteString("Task: synthesize the latest transcript segments into one short discussion note. The input contains the recorded speaker names. Use neutral phrasing and include the conclusions or next steps supported by the input. Do not invent names, decisions, needs, or facts. Output a single plain-text paragraph.")
 	case MeetingAITaskFinalMinutes:
-		b.WriteString("Task: write the final copyable meeting minutes as Markdown. Use the supplied meeting summary JSON and live notes. Include a title, speakers when present, a theme summary, core conclusions, sections organized by topic, decisions, action items (owner/deadline when present), and open questions. Do not invent facts, names, owners, dates, or quotes. Output only Markdown, with no code fence.")
+		b.WriteString("Task: synthesize the supplied meeting discussion and transcript into complete meeting minutes. Return only valid JSON with keys meetingTitle (string), overview (string), decisions (array {text,timeMs}), actionItems (array {task,owner,deadline,timeMs}), and openQuestions (array {question,timeMs}). Use empty arrays when unknown. Preserve the language requested. Do not invent facts, names, owners, dates, decisions, or quotations. Only use timestamps supported by the supplied transcript; use 0 when unsure.")
 	case MeetingAITaskChat:
 		b.WriteString("Task: answer the user's question about the current meeting in 1-3 short sentences using ONLY the supplied meeting context. If the context does not contain the answer, say so. Do not quote long transcript passages, do not invent names, decisions, owners, or dates, and offer no tools. Output plain text only.")
 	}

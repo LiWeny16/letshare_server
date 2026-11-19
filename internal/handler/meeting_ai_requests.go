@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"letshare-server/internal/model"
@@ -109,9 +110,28 @@ func (h *WebSocketHandler) handleMeetingAIRequest(client *model.Client, roomID s
 			h.sendMeetingAIResult(client, roomID, meta, req, "", false, "")
 			return
 		}
-	case MeetingAITaskLiveNotes, MeetingAITaskFinalMinutes:
-		// These legacy task names launched parallel LLM requests for the same
-		// shared minutes. One coordinator summary per cursor is authoritative.
+	case MeetingAITaskFinalMinutes:
+		if !configured || !minutesEnabled || !h.meetingFinalRequestCurrent(client, roomID, meta, req) {
+			h.sendMeetingAIResult(client, roomID, meta, req, "", false, "")
+			return
+		}
+	case MeetingAITaskEndMinutes:
+		if !configured || !h.isMeetingHost(roomID, client, meta) {
+			h.sendMeetingAIResult(client, roomID, meta, req, "", false, "")
+			return
+		}
+		meta.mu.Lock()
+		seq := meta.minutes.LatestSegmentSeq
+		req.RecordingID = meta.minutes.RecordingID
+		req.ThroughSeq = &seq
+		req.Input = buildMeetingFinalContextLocked(meta)
+		hasRecipients := meta.minutes.SummaryCoordinatorID != ""
+		meta.mu.Unlock()
+		if !hasRecipients || !h.meetingFinalRequestCurrent(client, roomID, meta, req) {
+			h.sendMeetingAIResult(client, roomID, meta, req, "", false, "")
+			return
+		}
+	case MeetingAITaskLiveNotes:
 		h.sendMeetingAIResult(client, roomID, meta, req, "", false, "")
 		return
 	case MeetingAITaskTranslate:
@@ -136,6 +156,10 @@ func (h *WebSocketHandler) handleMeetingAIRequest(client *model.Client, roomID s
 		go h.runMeetingSummaryAIRequest(client, roomID, meta, req)
 		return
 	}
+	if req.Task == MeetingAITaskFinalMinutes || req.Task == MeetingAITaskEndMinutes {
+		go h.runMeetingFinalMinutesRequest(client, roomID, meta, req)
+		return
+	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
@@ -149,6 +173,110 @@ func (h *WebSocketHandler) handleMeetingAIRequest(client *model.Client, roomID s
 		}
 		h.sendMeetingAIResult(client, roomID, meta, req, output, true, "")
 	}()
+}
+
+func (h *WebSocketHandler) meetingFinalRequestCurrent(client *model.Client, roomID string, meta *meetingMeta, req meetingAIRequest) bool {
+	if client == nil || meta == nil || req.ThroughSeq == nil {
+		return false
+	}
+	meta.meetingASRPublishMu.Lock()
+	defer meta.meetingASRPublishMu.Unlock()
+	return h.meetingFinalRequestCurrentLocked(client, roomID, meta, req)
+}
+
+func (h *WebSocketHandler) meetingFinalRequestCurrentLocked(client *model.Client, roomID string, meta *meetingMeta, req meetingAIRequest) bool {
+	current, active := h.activeMeetingRoom(roomID)
+	if !active || current != meta || !h.meetings.owns(roomID, client.UniqID, client.ID) || req.ThroughSeq == nil {
+		return false
+	}
+	meta.mu.Lock()
+	defer meta.mu.Unlock()
+	allowed := minutesSubscriptionEnabledLocked(meta, client.UniqID) || (req.Task == MeetingAITaskEndMinutes && h.isMeetingHost(roomID, client, meta))
+	return allowed &&
+		meta.minutes.RecordingID == sanitizeMeetingRecordingID(req.RecordingID) &&
+		*req.ThroughSeq > 0 && *req.ThroughSeq <= meta.minutes.LatestSegmentSeq
+}
+
+func (h *WebSocketHandler) runMeetingFinalMinutesRequest(client *model.Client, roomID string, meta *meetingMeta, req meetingAIRequest) {
+	meta.minutesFinalMu.Lock()
+	defer meta.minutesFinalMu.Unlock()
+	meta.meetingASRPublishMu.Lock()
+	if !h.meetingFinalRequestCurrentLocked(client, roomID, meta, req) {
+		meta.meetingASRPublishMu.Unlock()
+		h.sendMeetingAIResult(client, roomID, meta, req, "", false, "")
+		return
+	}
+	meta.mu.Lock()
+	if meta.minutes.FinalSummary != "" && meta.minutes.FinalThroughSeq >= *req.ThroughSeq {
+		cached, language := meta.minutes.FinalSummary, meta.minutes.SummaryLanguage
+		if req.Task == MeetingAITaskEndMinutes && !minutesSubscriptionEnabledLocked(meta, client.UniqID) {
+			cached = ""
+		}
+		meta.mu.Unlock()
+		h.sendMeetingAIResultLocked(client, roomID, req, cached, true, language)
+		meta.meetingASRPublishMu.Unlock()
+		return
+	}
+	language := meta.minutes.SummaryLanguage
+	meta.mu.Unlock()
+	meta.meetingASRPublishMu.Unlock()
+	targetLanguage := "zh"
+	if language == "en-US" {
+		targetLanguage = "en"
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	output, err := h.meetingAIService.Complete(ctx, MeetingAITaskFinalMinutes, req.Input, targetLanguage)
+	cancel()
+	if err != nil {
+		logrus.WithFields(logrus.Fields{"room": roomID, "user": client.UniqID, "task": req.Task}).WithError(err).Warn("会议 AI 请求失败")
+		h.sendMeetingAIResult(client, roomID, meta, req, "", false, language)
+		return
+	}
+	cleaned := strings.TrimSpace(output)
+	if strings.HasPrefix(cleaned, "```") {
+		if newline := strings.IndexByte(cleaned, '\n'); newline >= 0 {
+			cleaned = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(cleaned[newline+1:]), "```"))
+		}
+	}
+	var result map[string]interface{}
+	var input struct {
+		ContextTruncated bool `json:"contextTruncated"`
+	}
+	if json.Unmarshal([]byte(cleaned), &result) != nil || result == nil {
+		h.sendMeetingAIResult(client, roomID, meta, req, "", false, language)
+		return
+	}
+	overview, _ := result["overview"].(string)
+	if strings.TrimSpace(overview) == "" {
+		h.sendMeetingAIResult(client, roomID, meta, req, "", false, language)
+		return
+	}
+	if json.Unmarshal([]byte(req.Input), &input) == nil && input.ContextTruncated {
+		result["contextTruncated"] = true
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil || len(encoded) > 128*1024 {
+		h.sendMeetingAIResult(client, roomID, meta, req, "", false, language)
+		return
+	}
+
+	meta.meetingASRPublishMu.Lock()
+	defer meta.meetingASRPublishMu.Unlock()
+	if !h.meetingFinalRequestCurrentLocked(client, roomID, meta, req) {
+		return
+	}
+	meta.mu.Lock()
+	meta.minutes.FinalSummary = string(encoded)
+	meta.minutes.FinalThroughSeq = *req.ThroughSeq
+	response := string(encoded)
+	if req.Task == MeetingAITaskEndMinutes && !minutesSubscriptionEnabledLocked(meta, client.UniqID) {
+		response = ""
+	}
+	state := meetingMinutesWireState(meta.minutes)
+	meta.mu.Unlock()
+	h.broadcastMeetingMinutesState(roomID, "final-summary", state)
+	h.sendMeetingAIResultLocked(client, roomID, req, response, true, language)
 }
 
 func (h *WebSocketHandler) meetingSummaryRequestCurrent(client *model.Client, roomID string, meta *meetingMeta, req meetingAIRequest) bool {
@@ -295,7 +423,7 @@ func (h *WebSocketHandler) sendMeetingAIResultLocked(client *model.Client, roomI
 	payload := map[string]interface{}{
 		"kind": "ai-result", "requestId": req.RequestID, "ok": ok, "output": output,
 	}
-	if req.Task == MeetingAITaskSummary {
+	if req.Task == MeetingAITaskSummary || req.Task == MeetingAITaskFinalMinutes {
 		payload["recordingId"] = sanitizeMeetingRecordingID(req.RecordingID)
 		payload["coordinatorEpoch"] = req.CoordinatorEpoch
 		if req.ThroughSeq != nil {

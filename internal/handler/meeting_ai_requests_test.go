@@ -117,6 +117,127 @@ func TestMeetingAIRequestMembershipPermissionsAndPrivateResponse(t *testing.T) {
 	}
 }
 
+func TestMeetingFinalMinutesAreSharedOnceAndRespectSubscriptions(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	var lastUpstreamBody atomic.Value
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		body, _ := io.ReadAll(r.Body)
+		lastUpstreamBody.Store(string(body))
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"choices":[{"message":{"content":"{\"meetingTitle\":\"Planning\",\"overview\":\"The team discussed the release.\",\"decisions\":[],\"actionItems\":[],\"openQuestions\":[]}"}}]}`)
+	}))
+	defer upstream.Close()
+	_, host, member, _, roomID := meetingChatFlowWithSetup(t, func(h *WebSocketHandler) {
+		h.captionsEnabled = true
+		h.SetMeetingAIService(NewMeetingAIService("test-only", upstream.URL, true, true, upstream.Client()))
+	})
+	configureAndMarkMinutesRunningForRelayTests(t, host, roomID, false, host, member)
+	recordingID := currentMinutesRecordingID(t, host.handler, roomID)
+	sendMixedSegment(host.handler, roomID, "first statement", recordingID)
+	for _, client := range []*wsRPC{host, member} {
+		if _, err := waitMinutesKind(client, "segments", 3*time.Second); err != nil {
+			t.Fatal(err)
+		}
+	}
+	coordinator := currentMinutesCoordinatorRPC(t, host.handler, roomID, host, member)
+	requester := host
+	if coordinator == host {
+		requester = member
+	}
+	request := func(client *wsRPC, id, recording string, seq uint64) {
+		sendMinutes(t, client, roomID, map[string]interface{}{
+			"action": "ai", "requestId": id, "task": MeetingAITaskFinalMinutes,
+			"input":       `{"segments":[{"text":"first statement"}],"contextTruncated":true}`,
+			"recordingId": recording, "coordinatorEpoch": uint64(1), "throughSeq": seq,
+		})
+	}
+	request(requester, "manual-final", recordingID, 1)
+	for _, client := range []*wsRPC{host, member} {
+		message, err := waitMinutesKind(client, "final-summary", 3*time.Second)
+		if err != nil {
+			t.Fatal("receiving member did not get full minutes", err)
+		}
+		state := minutesPayload(t, message)["minutes"].(map[string]interface{})
+		if !strings.Contains(state["finalSummary"].(string), `"contextTruncated":true`) || state["finalThroughSeq"] != float64(1) {
+			t.Fatalf("invalid shared final summary: %#v", state)
+		}
+	}
+	result, err := waitMinutesKind(requester, "ai-result", 3*time.Second)
+	if err != nil || minutesPayload(t, result)["ok"] != true {
+		t.Fatalf("non-coordinator final request failed: %v", err)
+	}
+	request(coordinator, "cached-final", recordingID, 1)
+	result, err = waitMinutesKind(coordinator, "ai-result", 3*time.Second)
+	if err != nil || minutesPayload(t, result)["ok"] != true || upstreamCalls.Load() != 1 {
+		t.Fatalf("same captured speech must reuse shared result: calls=%d, error=%v", upstreamCalls.Load(), err)
+	}
+
+	sendMinutes(t, member, roomID, map[string]interface{}{"action": "stop"})
+	ack, err := waitMinutesKind(member, "subscription", 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state := minutesPayload(t, ack)["minutes"].(map[string]interface{}); state["finalSummary"] != nil {
+		t.Fatalf("paused recipient was sent a final summary: %#v", state)
+	}
+	sendMixedSegment(host.handler, roomID, "second statement", recordingID)
+	if _, err := waitMinutesKind(host, "segments", 3*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	request(host, "final-after-pause", recordingID, 2)
+	if _, err := waitMinutesKind(host, "final-summary", 3*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := waitMinutesKind(host, "ai-result", 3*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := waitMinutesKind(member, "final-summary", 200*time.Millisecond); err == nil {
+		t.Fatal("new final summary leaked to paused recipient")
+	}
+	request(host, "stale-final", "old-recording", 2)
+	result, err = waitMinutesKind(host, "ai-result", 3*time.Second)
+	if err != nil || minutesPayload(t, result)["ok"] != false || upstreamCalls.Load() != 2 {
+		t.Fatalf("stale recording was not rejected: calls=%d error=%v", upstreamCalls.Load(), err)
+	}
+
+	// The host may have paused their own notes while another participant is
+	// still receiving. Ending the room must not re-enable the host's receipt.
+	sendMinutes(t, member, roomID, map[string]interface{}{"action": "receive", "enabled": true, "recordingId": recordingID, "afterSeq": uint64(0)})
+	if _, err := waitMinutesKind(member, "subscription", 3*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	sendMinutes(t, host, roomID, map[string]interface{}{"action": "stop"})
+	if _, err := waitMinutesKind(host, "subscription", 3*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	sendMixedSegment(host.handler, roomID, "third statement", recordingID)
+	sendMinutes(t, member, roomID, map[string]interface{}{"action": "ai", "requestId": "not-host-end", "task": MeetingAITaskEndMinutes, "input": "{}"})
+	result, err = waitMinutesKind(member, "ai-result", 3*time.Second)
+	if err != nil || minutesPayload(t, result)["ok"] != false {
+		t.Fatalf("non-host was allowed to finalize for the room: %v", err)
+	}
+	sendMinutes(t, host, roomID, map[string]interface{}{"action": "ai", "requestId": "paused-host-end", "task": MeetingAITaskEndMinutes, "input": "{}"})
+	message, err := waitMinutesKind(member, "final-summary", 3*time.Second)
+	if err != nil {
+		t.Fatalf("receiving member did not receive end-of-meeting summary: %v", err)
+	}
+	state := minutesPayload(t, message)["minutes"].(map[string]interface{})
+	if state["finalThroughSeq"] != float64(3) {
+		t.Fatalf("end summary missed the latest speech: %#v", state)
+	}
+	result, err = waitMinutesKind(host, "ai-result", 3*time.Second)
+	if err != nil || minutesPayload(t, result)["ok"] != true || minutesPayload(t, result)["output"] != "" || upstreamCalls.Load() != 3 {
+		t.Fatalf("paused host did not receive a private completion-only response: calls=%d error=%v", upstreamCalls.Load(), err)
+	}
+	if body, _ := lastUpstreamBody.Load().(string); !strings.Contains(body, "third statement") {
+		t.Fatal("server-generated end context did not include the latest retained speech")
+	}
+	if _, err := waitMinutesKind(host, "final-summary", 200*time.Millisecond); err == nil {
+		t.Fatal("final minutes were sent to the paused host")
+	}
+}
+
 func TestMeetingSummaryCoordinatorHandoverDropsStaleResultAndSerializesRequests(t *testing.T) {
 	var calls atomic.Int32
 	var active atomic.Int32
